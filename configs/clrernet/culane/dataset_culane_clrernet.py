@@ -1,5 +1,5 @@
 dataset_type = "CulaneDataset"
-data_root = "/work/dataset/CULane"
+data_root = "/exhdd/seungyu/dataset/LaneDataset/CULane"
 crop_bbox = [0, 270, 1640, 590]
 img_scale = (800, 320)
 img_norm_cfg = dict(mean=[0.0, 0.0, 0.0], std=[255.0, 255.0, 255.0], to_rgb=False)

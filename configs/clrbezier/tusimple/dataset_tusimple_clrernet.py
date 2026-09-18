@@ -4,7 +4,7 @@
 # Augmentation is the CLRerNet albumentations translation of the CLRNet list
 # (configs/clrernet/culane/dataset_culane_clrernet.py) with the TuSimple crop.
 dataset_type = "TusimpleDataset"
-data_root = "/work/dataset/Tusimple"
+data_root = "/exhdd/seungyu/dataset/LaneDataset/Tusimple"
 crop_bbox = [0, 160, 1280, 720]
 img_scale = (800, 320)
 img_norm_cfg = dict(mean=[0.0, 0.0, 0.0], std=[255.0, 255.0, 255.0], to_rgb=False)

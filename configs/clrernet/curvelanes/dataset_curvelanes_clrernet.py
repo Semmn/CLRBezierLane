@@ -7,7 +7,7 @@
 # Each image is cropped inside CurvelanesDataset by its resolution; the crop is
 # carried in metainfo (crop_offset, crop_shape) and undone by CurvelanesMetric.
 dataset_type = "CurvelanesDataset"
-data_root = "/work/dataset/CurveLanes"
+data_root = "/exhdd/seungyu/dataset/LaneDataset/CurveLanes"
 img_scale = (800, 320)
 img_norm_cfg = dict(mean=[0.0, 0.0, 0.0], std=[255.0, 255.0, 255.0], to_rgb=False)
 compose_cfg = dict(bboxes=False, keypoints=True, masks=True)

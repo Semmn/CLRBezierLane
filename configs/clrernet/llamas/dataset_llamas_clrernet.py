@@ -6,7 +6,7 @@
 # (class i+1, thickness 15) instead of being written next to the labels.
 # Augmentation: CLRerNet albumentations translation of the CLRNet list, LLAMAS crop.
 dataset_type = "LlamasDataset"
-data_root = "/work/dataset/LLAMAS"
+data_root = "/exhdd/seungyu/dataset/LaneDataset/LLAMAS"
 crop_bbox = [0, 300, 1276, 717]
 img_scale = (800, 320)
 img_norm_cfg = dict(mean=[0.0, 0.0, 0.0], std=[255.0, 255.0, 255.0], to_rgb=False)
