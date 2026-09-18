@@ -26,6 +26,7 @@ from .assigners import build_cost_cache, build_lane_assigner
 from .data_adapters import CLRTargetAdapter
 from .alignment import QualityFocalLoss, ignore_unmatched, quality_targets
 from .gsrc import GSRCModule
+from .lateral import LateralEvidence
 from .query_attention import MaskedQuerySelfAttention
 from .geometry import brr_reference, fit_global_cubic_to_clr_rows, globalize_local_cp, update_brr_state
 from .lane_iou import LaneIoULoss
@@ -102,6 +103,8 @@ class CLRBezierHead(_OfficialHead):
         loss_cfg=None,
         gsrc_cfg=None,
         query_attn_cfg=None,
+        lateral_cfg=None,
+        aux_cls_head=False,
         target_adapter=None,
         train_cfg=None,
         test_cfg=None,
@@ -166,6 +169,23 @@ class CLRBezierHead(_OfficialHead):
         self.reg_layers = nn.Linear(self.fc_hidden_dim, 6 + self.n_offsets)
         self.seg_decoder = SegDecoder(self.img_h, self.img_w,
                                       self.prior_feat_channels * self.refine_layers, seg_num_classes)
+
+        # ---- separate auxiliary classifier ------------------------------------
+        # Only the final layer is separate: the auxiliary gradient still reaches
+        # the shared towers, ROIGather and the backbone, which is where the
+        # one-to-many supervision does its work.
+        self.aux_cls_layers = nn.Linear(self.fc_hidden_dim, 2) if aux_cls_head else None
+
+        # ---- lateral evidence -------------------------------------------------
+        self.lateral = None
+        if lateral_cfg:
+            lateral_cfg = dict(lateral_cfg)
+            self.lateral_stages = [int(v) for v in lateral_cfg.pop("stages", [0, 1, 2])]
+            lateral_cfg.setdefault("in_channels", self.prior_feat_channels)
+            lateral_cfg.setdefault("dim", self.fc_hidden_dim)
+            lateral_cfg.setdefault("sample_points", self.sample_points)
+            self.lateral = nn.ModuleDict(
+                {str(i): LateralEvidence(**lateral_cfg) for i in self.lateral_stages})
 
         # ---- assignment -------------------------------------------------------
         self.main_assigner = build_lane_assigner(main_assigner or dict(
@@ -234,6 +254,11 @@ class CLRBezierHead(_OfficialHead):
         self.cls_target_mode = loss_cfg.get("cls_target_mode", "hard")  # hard | iou | task_aligned
         if self.cls_target_mode not in ("hard", "iou", "task_aligned"):
             raise ValueError(f"Unknown cls_target_mode {self.cls_target_mode!r}")
+        # the auxiliary branch may use a different target mode (its fixed top-k
+        # assignment includes weak pairs, which soft targets down-weight for free)
+        self.aux_cls_target_mode = loss_cfg.get("aux_cls_target_mode", self.cls_target_mode)
+        if self.aux_cls_target_mode not in ("hard", "iou", "task_aligned"):
+            raise ValueError(f"Unknown aux_cls_target_mode {self.aux_cls_target_mode!r}")
         self.task_align_alpha = float(loss_cfg.get("task_align_alpha", 1.0))
         self.task_align_beta = float(loss_cfg.get("task_align_beta", 6.0))
         self.ignore_iou_thr = loss_cfg.get("ignore_iou_thr", None)
@@ -288,6 +313,12 @@ class CLRBezierHead(_OfficialHead):
         if self.query_attn is not None:
             for module in self.query_attn.values():
                 module.zero_init()
+        if self.lateral is not None:
+            for module in self.lateral.values():
+                module.zero_init()
+        if self.aux_cls_layers is not None:
+            for p in self.aux_cls_layers.parameters():
+                nn.init.normal_(p, mean=0.0, std=1.0e-3)
 
     def init_weights(self):
         # Do not call the official head's init_weights (it touches the anchor
@@ -313,7 +344,7 @@ class CLRBezierHead(_OfficialHead):
     # ======================================================================
     # BRR refinement
     # ======================================================================
-    def _refine(self, feats, local_cp, context_tokens=None, num_groups=1):
+    def _refine(self, feats, local_cp, context_tokens=None, num_groups=1, branch="main"):
         batch_size, num_q = local_cp.shape[:2]
         one_row = 1.0 / float(self.n_strips)
         geo = dict(prior_ys=self.prior_ys, sample_x_indices=self.sample_x_indices,
@@ -335,13 +366,23 @@ class CLRBezierHead(_OfficialHead):
                 # geometry of the anchors these RoI features were sampled from
                 anchor_state = torch.cat([y_start.unsqueeze(-1), cp_x], dim=-1)
                 roi = self.query_attn[str(stage)](roi, anchor_state, num_groups)
-            fc = roi.reshape(batch_size * num_q, self.fc_hidden_dim)
-            cls_f, reg_f = fc, fc
+            cls_roi = reg_roi = roi
+            if self.lateral is not None and stage in self.lateral_stages:
+                evidence = self.lateral[str(stage)](feats[stage], prior_xs, self.prior_feat_ys)
+                module = self.lateral[str(stage)]
+                if module.apply_to in ("cls", "both"):
+                    cls_roi = module.fuse(cls_roi, evidence)
+                if module.apply_to in ("reg", "both"):
+                    reg_roi = module.fuse(reg_roi, evidence)
+            cls_f = cls_roi.reshape(batch_size * num_q, self.fc_hidden_dim)
+            reg_f = reg_roi.reshape(batch_size * num_q, self.fc_hidden_dim)
             for m in self.cls_modules:
                 cls_f = m(cls_f)
             for m in self.reg_modules:
                 reg_f = m(reg_f)
-            cls_logits = self.cls_layers(cls_f).view(batch_size, num_q, 2).float()
+            cls_head = (self.aux_cls_layers if (branch == "aux" and self.aux_cls_layers is not None)
+                        else self.cls_layers)
+            cls_logits = cls_head(cls_f).view(batch_size, num_q, 2).float()
             reg = self.reg_layers(reg_f).view(batch_size, num_q, -1).float()
 
             new_x, new_y, _, _ = update_brr_state(cp_x, y_start, reg[..., :6],
@@ -385,7 +426,8 @@ class CLRBezierHead(_OfficialHead):
             aux_feats = [f.repeat_interleave(m, dim=0) for f in feats]
             # tokens are global: computed once, shared by every perturbed group
             aux_tokens = None if tokens is None else tokens.repeat_interleave(m, dim=0)
-            aux_preds, aux_states = self._refine(aux_feats, aux_cp, aux_tokens, num_groups=m)
+            aux_preds, aux_states = self._refine(aux_feats, aux_cp, aux_tokens,
+                                                 num_groups=m, branch="aux")
             out["aux_preds"] = [p.view(batch_size, m * k, -1) for p in aux_preds]
             out["aux_states"] = [s.view(batch_size, m * k, -1) for s in aux_states]
 
@@ -445,17 +487,20 @@ class CLRBezierHead(_OfficialHead):
                                    self._main_pairs, list(range(self.refine_layers)), apply_brr=True)
         cls, iou, sup, cp = main["cls"], main["iou"], main["support"], main["cp"]
         diag = {"main_iou": main["iou"].detach(), "main_num_pos": main["num_pos"],
-                "main_conf_iou_l1": main["conf_iou_l1"]}
+                "main_conf_iou_l1": main["conf_iou_l1"],
+                "main_conf_iou_rank": main["conf_iou_rank"]}
 
         if "aux_preds" in outs:
             aux = self._branch_losses(outs["aux_preds"], outs["aux_states"], valid_targets, gt_cps,
-                                      self._aux_pairs, self.aux_stages, apply_brr=self.aux_apply_brr)
+                                      self._aux_pairs, self.aux_stages, apply_brr=self.aux_apply_brr,
+                                      cls_target_mode=self.aux_cls_target_mode)
             cls = cls + self.aux_cls_loss_weight * aux["cls"]
             iou = iou + self.aux_reg_loss_weight * aux["iou"]
             sup = sup + self.aux_reg_loss_weight * aux["support"]
             cp = cp + self.aux_reg_loss_weight * aux["cp"]
             diag.update(aux_iou=aux["iou"].detach(), aux_num_pos=aux["num_pos"],
-                        aux_conf_iou_l1=aux["conf_iou_l1"])
+                        aux_conf_iou_l1=aux["conf_iou_l1"],
+                        aux_conf_iou_rank=aux["conf_iou_rank"])
 
         losses = dict(
             loss_cls=cls * self.cls_loss_weight,
@@ -516,7 +561,7 @@ class CLRBezierHead(_OfficialHead):
         return sup, cp
 
     def _branch_losses(self, preds_stages, states_stages, valid_targets, gt_cps, pairs_fn,
-                       stages, apply_brr):
+                       stages, apply_brr, cls_target_mode=None):
         device = preds_stages[0].device
         batch_size = preds_stages[0].shape[0]
         zero = preds_stages[0].new_zeros(())
@@ -528,6 +573,7 @@ class CLRBezierHead(_OfficialHead):
         cls_sum, iou_sum, sup_sum, cp_sum = zero, zero, zero, zero
         num_pos = 0
         align_err, align_cnt = 0.0, 0  # mean |confidence - LaneIoU| over matched pairs
+        rank_sum, rank_cnt = 0.0, 0     # Spearman(confidence, LaneIoU): what F1 actually needs
         for stage in active:
             pairs = pairs_fn(stage)
             preds = preds_stages[stage]
@@ -535,7 +581,8 @@ class CLRBezierHead(_OfficialHead):
             required = set()
             for assigner, _ in pairs:
                 required |= set(assigner.required_cache_keys)
-            use_quality = self.cls_target_mode != "hard"
+            mode = cls_target_mode or self.cls_target_mode
+            use_quality = mode != "hard"
             use_ignore = self.ignore_iou_thr is not None
             if use_quality or use_ignore:
                 # narrow-width LaneIoU: the quantity the CULane metric measures
@@ -564,17 +611,26 @@ class CLRBezierHead(_OfficialHead):
                     if "lane_iou_dynamic" in cache:
                         with torch.no_grad():
                             conf = F.softmax(preds[b, rows, :2].detach(), dim=-1)[:, 1]
-                            align_err += float(
-                                (conf - cache["lane_iou_dynamic"][rows, cols]).abs().sum())
+                            pair_q = cache["lane_iou_dynamic"][rows, cols]
+                            align_err += float((conf - pair_q).abs().sum())
                             align_cnt += int(rows.numel())
+                            if rows.numel() > 2:
+                                rc = conf.argsort().argsort().float()
+                                rq = pair_q.argsort().argsort().float()
+                                rc = rc - rc.mean()
+                                rq = rq - rq.mean()
+                                denom = rc.norm() * rq.norm()
+                                if float(denom) > 0:
+                                    rank_sum += float((rc * rq).sum() / denom)
+                                    rank_cnt += 1
                     if use_quality:
                         pair_iou = cache["lane_iou_dynamic"][rows, cols]
                         pair_scores = None
-                        if self.cls_target_mode == "task_aligned":
+                        if mode == "task_aligned":
                             pair_scores = F.softmax(
                                 preds[b, rows, :2].detach(), dim=-1)[:, 1]
                         quality[a, b, rows] = quality_targets(
-                            pair_iou, pair_scores, self.cls_target_mode,
+                            pair_iou, pair_scores, mode,
                             self.task_align_alpha, self.task_align_beta,
                             cols, int(target.shape[0]))
                     num_pos += int(rows.numel())
@@ -592,4 +648,5 @@ class CLRBezierHead(_OfficialHead):
         return dict(cls=cls_sum / normalizer, iou=iou_sum / normalizer,
                     support=sup_sum / normalizer, cp=cp_sum / normalizer,
                     num_pos=torch.tensor(float(num_pos), device=device),
-                    conf_iou_l1=torch.tensor(align_err / max(1, align_cnt), device=device))
+                    conf_iou_l1=torch.tensor(align_err / max(1, align_cnt), device=device),
+                    conf_iou_rank=torch.tensor(rank_sum / max(1, rank_cnt), device=device))
