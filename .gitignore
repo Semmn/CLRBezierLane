@@ -41,3 +41,21 @@ __pycache__/
 
 # Local files
 clrernet_main.tgz
+
+# Node 1 settings (Prevent Local changes to occur collision)
+configs/local
+tools/local_script_history.sh
+requirements/node1_env.txt
+
+# NMS build meta infos
+libs/models/layers/nms/src/nms.egg-info/PKG-INFO
+libs/models/layers/nms/src/nms.egg-info/SOURCES.txt
+libs/models/layers/nms/src/nms.egg-info/dependency_links.txt
+libs/models/layers/nms/src/nms.egg-info/top_level.txt
+libs/models/layers/nms/build/
+
+# Selective Scan Build
+kernels/selective_scan/build/
+kernels/selective_scan/selective_scan.egg-info/
+
+
