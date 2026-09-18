@@ -48,6 +48,7 @@ tools/local_script_history.sh
 requirements/node1_env.txt
 
 # NMS build meta infos
+libs/models/layers/nms/src/nms.egg-info/
 libs/models/layers/nms/src/nms.egg-info/PKG-INFO
 libs/models/layers/nms/src/nms.egg-info/SOURCES.txt
 libs/models/layers/nms/src/nms.egg-info/dependency_links.txt
