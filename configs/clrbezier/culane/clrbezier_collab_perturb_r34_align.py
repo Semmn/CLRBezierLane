@@ -59,6 +59,9 @@ model = dict(
         img_h=img_h,
         roi_mid_channels=48,
         seg_num_classes=5,
+        # separate final classification layer for the auxiliary branch;
+        # the shared towers still receive its gradient
+        aux_cls_head=True,
         prior_cfg=dict(delta_scale=0.1, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),
         brr_cfg=dict(cp_x_margin=0.5),
         main_assigner=dict(
@@ -105,6 +108,7 @@ model = dict(
 
             # "hard" (baseline) | "iou" | "task_aligned"
             cls_target_mode="iou",
+            aux_cls_target_mode="iou",   # "hard" keeps the auxiliary branch binary
             qfl_beta=2.0,
             # task_aligned only: t = s^alpha * u^beta, normalized per GT
             task_align_alpha=1.0,

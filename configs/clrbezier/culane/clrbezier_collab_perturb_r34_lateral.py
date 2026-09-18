@@ -1,23 +1,16 @@
-# CLRBezierLane-R34 + confidence-localization alignment (+ optional masked
-# query-to-query attention).
+# CLRBezierLane-R34 + lateral evidence pooling + IoU-valued classification
+# targets + separate auxiliary classifier.
 #
-# Changes over clrbezier_collab_perturb_r34.py:
-#   * classification target = LaneIoU of the matched pair (quality focal loss),
-#     instead of the binary 1/0 target;
-#   * unmatched anchors above ignore_iou_thr are dropped from the classification
-#     loss, removing the main (one-to-one) vs auxiliary (one-to-many)
-#     contradiction on near-duplicate anchors;
-#   * masked query-to-query attention with anchor-geometry positional bias.
-#
-# Ablate the three independently; the alignment losses are the mechanism, the
-# attention is a precision refinement on top.
-
+# Rationale: pooled features are collected along the predicted curve, so they
+# carry no information about how far the curve is from the lane. Sampling at
+# lateral offsets makes the displacement observable, which is what a confidence
+# score needs in order to rank by metric IoU.
 _base_ = [
     "dataset_culane_clrernet.py",
     "../../_base_/default_runtime.py"
 ]
 
-cfg_name = "clrbezier_collab_perturb_r34_task_align.py"
+cfg_name = "clrbezier_collab_perturb_r34_lateral.py"
 
 img_w, img_h, num_points = 800, 320, 72
 model = dict(
@@ -62,6 +55,14 @@ model = dict(
         # separate final classification layer for the auxiliary branch;
         # the shared towers still receive its gradient
         aux_cls_head=True,
+        lateral_cfg=dict(
+            stages=[0, 1, 2],
+            # normalized image-x; the CULane metric half-width is 7.5/800
+            offsets=(-15.0 / 800, -7.5 / 800, 7.5 / 800, 15.0 / 800),
+            mid_channels=32,
+            apply_to="cls",     # "both" also feeds the regression tower
+            gate_init=0.0,      # 1e-2 to engage from iteration 0
+        ),
         prior_cfg=dict(delta_scale=0.1, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),
         brr_cfg=dict(cp_x_margin=0.5),
         main_assigner=dict(
@@ -107,8 +108,8 @@ model = dict(
             brr_loss_stages=[0, 1, 2],
 
             # "hard" (baseline) | "iou" | "task_aligned"
-            cls_target_mode="task_aligned",
-            aux_cls_target_mode="task_aligned",   # "hard" keeps the auxiliary branch binary
+            cls_target_mode="hard",
+            aux_cls_target_mode="hard",   # "hard" keeps the auxiliary branch binary
             qfl_beta=2.0,
             # task_aligned only: t = s^alpha * u^beta, normalized per GT
             task_align_alpha=1.0,
@@ -126,15 +127,7 @@ model = dict(
             length_unit="auto",
         ),
         gsrc_cfg=None,
-        query_attn_cfg=dict(
-            stages=[0, 1, 2],
-            num_heads=4,
-            use_state_embedding=True,
-            use_pairwise_bias=True,
-            gate_init=0.0,          # 1e-2 to engage it from iteration 0
-            detach_state=True,
-            share_across_stages=False,
-        ), 
+        query_attn_cfg=None
     ),
     test_cfg=dict(
         # Default CLRerNet uses conf_threshold=0.41
@@ -149,6 +142,7 @@ model = dict(
         cut_height=270,
     ),
 )
+
 
 # Number of epochs
 total_epochs = 36
