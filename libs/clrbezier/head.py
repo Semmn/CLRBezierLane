@@ -24,7 +24,9 @@ from mmdet.registry import MODELS
 
 from .assigners import build_cost_cache, build_lane_assigner
 from .data_adapters import CLRTargetAdapter
+from .alignment import QualityFocalLoss, ignore_unmatched, quality_targets
 from .gsrc import GSRCModule
+from .query_attention import MaskedQuerySelfAttention
 from .geometry import brr_reference, fit_global_cubic_to_clr_rows, globalize_local_cp, update_brr_state
 from .lane_iou import LaneIoULoss
 from .modules import ROIGather, SegDecoder, linear_relu, pool_prior_features
@@ -99,6 +101,7 @@ class CLRBezierHead(_OfficialHead):
         perturb_cfg=None,
         loss_cfg=None,
         gsrc_cfg=None,
+        query_attn_cfg=None,
         target_adapter=None,
         train_cfg=None,
         test_cfg=None,
@@ -203,12 +206,38 @@ class CLRBezierHead(_OfficialHead):
                     "features to the head; only 'coarsest' (coarsest FPN level) is supported.")
             self.gsrc = GSRCModule(**gsrc_cfg)
 
+        # ---- query-to-query attention -----------------------------------------
+        # Group-masked (auxiliary groups never mix), anchor-geometry positional
+        # bias, zero-gated: identical to the baseline at initialization.
+        self.query_attn = None
+        if query_attn_cfg:
+            query_attn_cfg = dict(query_attn_cfg)
+            self.query_attn_stages = [int(s) for s in query_attn_cfg.pop("stages", [0, 1, 2])]
+            query_attn_cfg.setdefault("dim", self.fc_hidden_dim)
+            query_attn_cfg.setdefault("state_dim", 5)  # [y_start, P0x..P3x]
+            share = bool(query_attn_cfg.pop("share_across_stages", False))
+            if share:
+                shared = MaskedQuerySelfAttention(**query_attn_cfg)
+                self.query_attn = nn.ModuleDict({str(i): shared for i in self.query_attn_stages})
+            else:
+                self.query_attn = nn.ModuleDict(
+                    {str(i): MaskedQuerySelfAttention(**query_attn_cfg)
+                     for i in self.query_attn_stages})
+
         # ---- losses -----------------------------------------------------------
         self.cls_loss_weight = float(loss_cfg.get("cls_loss_weight", 2.0))
         self.use_focal = bool(loss_cfg.get("use_focal", False))
         self.focal_alpha = float(loss_cfg.get("focal_alpha", 0.25))
         self.focal_gamma = float(loss_cfg.get("focal_gamma", 2.0))
         self.cls_bg_weight = float(loss_cfg.get("cls_bg_weight", 0.4))
+        # Confidence-localization alignment (see alignment.py).
+        self.cls_target_mode = loss_cfg.get("cls_target_mode", "hard")  # hard | iou | task_aligned
+        if self.cls_target_mode not in ("hard", "iou", "task_aligned"):
+            raise ValueError(f"Unknown cls_target_mode {self.cls_target_mode!r}")
+        self.task_align_alpha = float(loss_cfg.get("task_align_alpha", 1.0))
+        self.task_align_beta = float(loss_cfg.get("task_align_beta", 6.0))
+        self.ignore_iou_thr = loss_cfg.get("ignore_iou_thr", None)
+        self.qfl = QualityFocalLoss(float(loss_cfg.get("qfl_beta", 2.0)))
         self.lane_width = float(loss_cfg.get("lane_width", 7.5 / 800))
         self.lane_width_cost = float(loss_cfg.get("lane_width_cost", 30.0 / 800))
         self.iou_loss = LaneIoULoss(loss_cfg.get("iou_loss_weight", 4.0), self.lane_width,
@@ -256,6 +285,9 @@ class CLRBezierHead(_OfficialHead):
         if self.gsrc is not None:
             # restore the identity initialization after the global re-init above
             self.gsrc.zero_init()
+        if self.query_attn is not None:
+            for module in self.query_attn.values():
+                module.zero_init()
 
     def init_weights(self):
         # Do not call the official head's init_weights (it touches the anchor
@@ -281,7 +313,7 @@ class CLRBezierHead(_OfficialHead):
     # ======================================================================
     # BRR refinement
     # ======================================================================
-    def _refine(self, feats, local_cp, context_tokens=None):
+    def _refine(self, feats, local_cp, context_tokens=None, num_groups=1):
         batch_size, num_q = local_cp.shape[:2]
         one_row = 1.0 / float(self.n_strips)
         geo = dict(prior_ys=self.prior_ys, sample_x_indices=self.sample_x_indices,
@@ -299,6 +331,10 @@ class CLRBezierHead(_OfficialHead):
             roi = self.roi_gather(pooled_stages, feats[stage], stage)
             if self.gsrc is not None:
                 roi = self.gsrc.inject(stage, roi, context_tokens)
+            if self.query_attn is not None and stage in self.query_attn_stages:
+                # geometry of the anchors these RoI features were sampled from
+                anchor_state = torch.cat([y_start.unsqueeze(-1), cp_x], dim=-1)
+                roi = self.query_attn[str(stage)](roi, anchor_state, num_groups)
             fc = roi.reshape(batch_size * num_q, self.fc_hidden_dim)
             cls_f, reg_f = fc, fc
             for m in self.cls_modules:
@@ -349,7 +385,7 @@ class CLRBezierHead(_OfficialHead):
             aux_feats = [f.repeat_interleave(m, dim=0) for f in feats]
             # tokens are global: computed once, shared by every perturbed group
             aux_tokens = None if tokens is None else tokens.repeat_interleave(m, dim=0)
-            aux_preds, aux_states = self._refine(aux_feats, aux_cp, aux_tokens)
+            aux_preds, aux_states = self._refine(aux_feats, aux_cp, aux_tokens, num_groups=m)
             out["aux_preds"] = [p.view(batch_size, m * k, -1) for p in aux_preds]
             out["aux_states"] = [s.view(batch_size, m * k, -1) for s in aux_states]
 
@@ -408,7 +444,8 @@ class CLRBezierHead(_OfficialHead):
         main = self._branch_losses(outs["main_preds"], outs["main_states"], valid_targets, gt_cps,
                                    self._main_pairs, list(range(self.refine_layers)), apply_brr=True)
         cls, iou, sup, cp = main["cls"], main["iou"], main["support"], main["cp"]
-        diag = {"main_iou": main["iou"].detach(), "main_num_pos": main["num_pos"]}
+        diag = {"main_iou": main["iou"].detach(), "main_num_pos": main["num_pos"],
+                "main_conf_iou_l1": main["conf_iou_l1"]}
 
         if "aux_preds" in outs:
             aux = self._branch_losses(outs["aux_preds"], outs["aux_states"], valid_targets, gt_cps,
@@ -417,7 +454,8 @@ class CLRBezierHead(_OfficialHead):
             iou = iou + self.aux_reg_loss_weight * aux["iou"]
             sup = sup + self.aux_reg_loss_weight * aux["support"]
             cp = cp + self.aux_reg_loss_weight * aux["cp"]
-            diag.update(aux_iou=aux["iou"].detach(), aux_num_pos=aux["num_pos"])
+            diag.update(aux_iou=aux["iou"].detach(), aux_num_pos=aux["num_pos"],
+                        aux_conf_iou_l1=aux["conf_iou_l1"])
 
         losses = dict(
             loss_cls=cls * self.cls_loss_weight,
@@ -433,11 +471,18 @@ class CLRBezierHead(_OfficialHead):
         losses.update(diag)
         return losses
 
-    def _cls_loss(self, logits, cls_targets, gt_counts):
+    def _cls_loss(self, logits, cls_targets, gt_counts, quality=None, ignore=None):
         """logits [B,N,2]; cls_targets [A,B,N] -> per-assigner-image loss [A,B]."""
         num_a, batch_size, num_q = cls_targets.shape
         flat = logits.unsqueeze(0).expand(num_a, -1, -1, -1).reshape(-1, 2)
         tgt = cls_targets.reshape(-1)
+        if quality is not None:
+            raw = self.qfl(flat, quality.reshape(-1)).view(num_a, batch_size, num_q)
+            w = torch.where(cls_targets == 0, raw.new_tensor(self.cls_bg_weight),
+                            raw.new_tensor(1.0))
+            if ignore is not None:
+                w = w * (~ignore).to(raw.dtype)
+            return (raw * w).sum(-1) / w.sum(-1).clamp_min(1.0)
         if self.use_focal:
             logp = F.log_softmax(flat, dim=-1)
             logp_t = logp.gather(1, tgt.view(-1, 1)).squeeze(1)
@@ -446,6 +491,8 @@ class CLRBezierHead(_OfficialHead):
             return raw.sum(-1) / gt_counts.view(1, -1).clamp_min(1.0)
         raw = F.cross_entropy(flat, tgt, reduction="none").view(num_a, batch_size, num_q)
         w = torch.where(cls_targets == 0, raw.new_tensor(self.cls_bg_weight), raw.new_tensor(1.0))
+        if ignore is not None:
+            w = w * (~ignore).to(raw.dtype)
         return (raw * w).sum(-1) / w.sum(-1).clamp_min(1.0)
 
     def _brr_losses(self, state, target, gt_cp, gt_cp_ok):
@@ -480,6 +527,7 @@ class CLRBezierHead(_OfficialHead):
 
         cls_sum, iou_sum, sup_sum, cp_sum = zero, zero, zero, zero
         num_pos = 0
+        align_err, align_cnt = 0.0, 0  # mean |confidence - LaneIoU| over matched pairs
         for stage in active:
             pairs = pairs_fn(stage)
             preds = preds_stages[stage]
@@ -487,8 +535,17 @@ class CLRBezierHead(_OfficialHead):
             required = set()
             for assigner, _ in pairs:
                 required |= set(assigner.required_cache_keys)
+            use_quality = self.cls_target_mode != "hard"
+            use_ignore = self.ignore_iou_thr is not None
+            if use_quality or use_ignore:
+                # narrow-width LaneIoU: the quantity the CULane metric measures
+                required.add("lane_iou_dynamic")
             cls_targets = torch.zeros((len(pairs), batch_size, preds.shape[1]),
                                       dtype=torch.long, device=device)
+            quality = torch.zeros(cls_targets.shape, dtype=preds.dtype, device=device) \
+                if use_quality else None
+            ignore = torch.zeros(cls_targets.shape, dtype=torch.bool, device=device) \
+                if use_ignore else None
             use_brr = apply_brr and stage in self.brr_loss_stages
             for b in range(batch_size):
                 target = valid_targets[b]
@@ -498,9 +555,28 @@ class CLRBezierHead(_OfficialHead):
                                          self.lane_width, self.lane_width_cost, required)
                 for a, (assigner, weight) in enumerate(pairs):
                     rows, cols = assigner.assign(cache)
+                    if use_ignore:
+                        ignore[a, b] = ignore_unmatched(
+                            cache["lane_iou_dynamic"], rows, self.ignore_iou_thr)
                     if rows.numel() == 0:
                         continue
                     cls_targets[a, b, rows] = 1
+                    if "lane_iou_dynamic" in cache:
+                        with torch.no_grad():
+                            conf = F.softmax(preds[b, rows, :2].detach(), dim=-1)[:, 1]
+                            align_err += float(
+                                (conf - cache["lane_iou_dynamic"][rows, cols]).abs().sum())
+                            align_cnt += int(rows.numel())
+                    if use_quality:
+                        pair_iou = cache["lane_iou_dynamic"][rows, cols]
+                        pair_scores = None
+                        if self.cls_target_mode == "task_aligned":
+                            pair_scores = F.softmax(
+                                preds[b, rows, :2].detach(), dim=-1)[:, 1]
+                        quality[a, b, rows] = quality_targets(
+                            pair_iou, pair_scores, self.cls_target_mode,
+                            self.task_align_alpha, self.task_align_beta,
+                            cols, int(target.shape[0]))
                     num_pos += int(rows.numel())
                     per_lane = self.iou_loss(preds[b, rows, 6:] * scale, target[cols, 6:] / float(self.img_w))
                     iou_sum = iou_sum + weight * per_lane.mean()
@@ -510,8 +586,10 @@ class CLRBezierHead(_OfficialHead):
                         sup_sum = sup_sum + weight * sup
                         cp_sum = cp_sum + weight * cp
             weights = preds.new_tensor([w for _, w in pairs]).view(-1, 1)
-            cls_sum = cls_sum + (self._cls_loss(preds[..., :2], cls_targets, gt_counts) * weights).sum()
+            cls_sum = cls_sum + (self._cls_loss(preds[..., :2], cls_targets, gt_counts,
+                                                quality, ignore) * weights).sum()
 
         return dict(cls=cls_sum / normalizer, iou=iou_sum / normalizer,
                     support=sup_sum / normalizer, cp=cp_sum / normalizer,
-                    num_pos=torch.tensor(float(num_pos), device=device))
+                    num_pos=torch.tensor(float(num_pos), device=device),
+                    conf_iou_l1=torch.tensor(align_err / max(1, align_cnt), device=device))
