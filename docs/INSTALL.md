@@ -9,7 +9,7 @@ sudo apt install docker-compose
 sudo service docker start
 ```
 
-To install NMS extension, nvidia runtime must be enabled during build.
+To install NMS extension, nvidia runtine must be enabled during build.
 Add `default-runtime` to `/etc/docker/daemon.json` as follows:  
 ```
 {

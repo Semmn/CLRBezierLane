@@ -1,8 +1,43 @@
 .idea
-checkpoints
-weights
-work_dirs
+
 *.csv
 *.zip
 *.pyc
 .DS_Store
+
+# Trainig outputs
+work_dirs/
+outputs/
+logs/
+wandb/
+
+# Model weights / checkpoints
+*.pth
+*.pt
+*.ckpt
+
+# Large demo/media files
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Dataset
+data/
+dataset/
+datasets/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local/environment artifacts
+*.whl
+
+# Editors
+.vscode/
+.idea/
+.old/
+
+# Local files
+clrernet_main.tgz

@@ -53,13 +53,13 @@ class Alaug(object):
             transforms = transform['transforms']
             choices = []
             for t in transforms:
-                params = {key: value for key, value in t.items() if key != 'type'}
-                choice = getattr(al, t['type'])(**params)
+                parmas = {key: value for key, value in t.items() if key != 'type'}
+                choice = getattr(al, t['type'])(**parmas)
                 choices.append(choice)
             return getattr(al, 'OneOf')(transforms=choices, p=transform['p'])
 
-        params = {key: value for key, value in transform.items() if key != 'type'}
-        return getattr(al, transform['type'])(**params)
+        parmas = {key: value for key, value in transform.items() if key != 'type'}
+        return getattr(al, transform['type'])(**parmas)
 
     def build(self):
         if len(self.transforms) == 0:

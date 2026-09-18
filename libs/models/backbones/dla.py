@@ -1,3 +1,4 @@
+##%%
 """
 Adapted from:
 https://github.com/Turoad/CLRNet/blob/main/clrnet/models/backbones/dla34.py
@@ -423,7 +424,12 @@ class DLANet(nn.Module):
         x = self.model(x)
         return x
 
+##%%
+#model = dla34(pretrained=True, levels=[1, 1, 1, 2, 2, 1], in_channels=[16, 32, 64, 128, 256, 512])
+#import torchinfo
+#torchinfo.summary(model)
 
+##%%
 class Identity(nn.Module):
     def __init__(self):
         super(Identity, self).__init__()

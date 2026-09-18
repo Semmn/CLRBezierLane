@@ -17,6 +17,7 @@ from nms import nms
 from torch import Tensor
 
 from libs.models.dense_heads.seg_decoder import SegDecoder
+from libs.models.dense_heads.segman_decoder import SegMANDecoder
 from libs.utils.lane_utils import Lane
 
 
@@ -39,6 +40,10 @@ class CLRerHead(BaseDenseHead):
         loss_seg=None,
         train_cfg=None,
         test_cfg=None,
+        use_segman_decoder=False,
+        segman_decoder_params=None,
+        use_assign_regularizer=False,
+        regularizer_ema_beta=0.01
     ):
         super(CLRerHead, self).__init__()
         self.anchor_generator = TASK_UTILS.build(anchor_generator)
@@ -51,7 +56,7 @@ class CLRerHead(BaseDenseHead):
         self.sample_points = attention.sample_points = sample_points
         self.refine_layers = attention.refine_layers = refine_layers
         self.fc_hidden_dim = attention.fc_hidden_dim = fc_hidden_dim
-        self.prior_feat_channels = attention.in_channels = prior_feat_channels
+        self.prior_feat_channels = attention.in_channels = prior_feat_channels # number of feature channels of prior. (defaults to 64 as neck outputs 64 channels)
         self.attention = MODELS.build(attention)
         self.loss_cls = MODELS.build(loss_cls)
         self.loss_bbox = MODELS.build(loss_bbox)
@@ -59,10 +64,29 @@ class CLRerHead(BaseDenseHead):
         self.loss_iou = MODELS.build(loss_iou)
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
+        self.use_segman_decoder = use_segman_decoder # whether to use segman decoder for multi-task segmentation head
+        self.use_assign_regularizer = use_assign_regularizer # whether to use the number of assignment as regularizer for assignment (by loss or matching cost)
+        self.regularizer_ema_beta = regularizer_ema_beta # ema beta for assign regularizer. Only valid when use_assign_regularizer=True
+        if self.use_segman_decoder:
+            if segman_decoder_params is None:
+                self.segman_decoder_params = {'embed_dim': 128,
+                                              'feat_proj_dim': 192,
+                                              'num_classes': 5,
+                                              'dropout_ratio': 0.01,
+                                              'channel_split': False,
+                                              'interpolate_mode': 'bilinear',
+                                              'use_rpb': False}
+            else:
+                self.segman_decoder_params = segman_decoder_params
+        else:
+            self.segman_decoder_params = None # if use_segman_decoder is False, segman_decoder_params is not used
+            
         if self.train_cfg:
             self.assigner = TASK_UTILS.build(train_cfg['assigner'])
+        
 
         # Non-learnable parameters
+        # when sample_points=72, n_strips=sample_points-1=71 this generates the indices [0, 1, ..., 71]
         self.register_buffer(
             name="sample_x_indices",
             tensor=(
@@ -70,15 +94,28 @@ class CLRerHead(BaseDenseHead):
                 * self.n_strips
             ).long(),
         )
+        # this generates the y coordinates starts from 1.0 to 0.0 (normalized coordinates starting from the bottom of the image and increases to the top)
         self.register_buffer(
             name="prior_feat_ys",
             tensor=torch.flip(
                 (self.sample_x_indices.float() / self.n_strips), dims=[-1]
             ),
         )
+        # this also creates the y coordinates for the prior points in the range of [1.0, 0.0]
         self.register_buffer(
             name="prior_ys",
             tensor=torch.linspace(1, 0, steps=self.n_offsets, dtype=torch.float32),
+        )
+        
+        # Exponential moving average of number of assignment by simOTA
+        # initial value for ema_num_assign follows the start value of total number of assignment
+        self.register_buffer(
+            name="ema_num_assign",
+            tensor=torch.tensor(2.0)
+        )
+        self.register_buffer(
+            name="ema_beta",
+            tensor=torch.tensor(0.01)
         )
 
         reg_modules = list()
@@ -100,17 +137,47 @@ class CLRerHead(BaseDenseHead):
 
         # Auxiliary head
         if self.loss_seg:
-            self.seg_decoder = SegDecoder(
-                self.img_h,
-                self.img_w,
-                num_classes=5,
-                prior_feat_channels=self.prior_feat_channels,
-                refine_layers=self.refine_layers,
-            )
+            if self.use_segman_decoder:
+                self.seg_decoder = SegMANDecoder(
+                    image_size=(img_h, img_w),
+                    in_channels=prior_feat_channels,
+                    embed_dim=segman_decoder_params['embed_dim'],
+                    feat_proj_dim=segman_decoder_params['feat_proj_dim'],
+                    num_classes=segman_decoder_params['num_classes'],
+                    dropout_ratio=segman_decoder_params['dropout_ratio'],
+                    channel_split=segman_decoder_params['channel_split'],
+                    interpolate_mode=segman_decoder_params['interpolate_mode'],
+                    use_rpb=segman_decoder_params['use_rpb']
+                )
+            else:
+                self.seg_decoder = SegDecoder(
+                    self.img_h,
+                    self.img_w,
+                    num_classes=5,
+                    prior_feat_channels=self.prior_feat_channels,
+                    refine_layers=self.refine_layers,
+                )
 
         self.init_weights()
 
+    def _init_base(self, m: nn.Module):
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+        elif isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, mean=0.0, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+        elif isinstance(m, (nn.LayerNorm, nn.BatchNorm2d, nn.GroupNorm)):
+            if getattr(m, 'weight', None) is not None:
+                nn.init.constant_(m.weight, 1.0)
+            if getattr(m, 'bias', None) is not None:
+                nn.init.constant_(m.bias, 0.0)
+
     def init_weights(self):
+        self.apply(self._init_base)
+
         # initialize heads
         for m in self.cls_layers.parameters():
             nn.init.normal_(m, mean=0.0, std=1e-3)
@@ -130,24 +197,33 @@ class CLRerHead(BaseDenseHead):
 
         batch_size = batch_features.shape[0]
 
+        # (batch, num_priors, num_points) -> (batch, num_priors, num_points, 1)
         prior_xs = prior_xs.view(batch_size, self.num_priors, -1, 1)
+        # (num_points) -> (batch_size * num_priors, num_points) -> (batch, num_priors, num_points, 1)
         prior_ys = self.prior_feat_ys.repeat(batch_size * self.num_priors).view(
             batch_size, self.num_priors, -1, 1
         )
 
+        # change the range of prior_xs and prior_ys to [-1, 1]
         prior_xs = prior_xs * 2.0 - 1.0
         prior_ys = prior_ys * 2.0 - 1.0
+        # (batch, num_priors, num_points, 2) concatenated
         grid = torch.cat((prior_xs, prior_ys), dim=-1)
+        
+        # torch.nn.functional.grid_sample() do grid-sampling the (B, C, H, W) feature map according to the (batch, num_priors, num_points, 2) grid
+        # output tensors are permuted to (B, C, Ns, 2) (from (B, C, Np, Ns) -> (B, Np, C, Ns))
         feature = F.grid_sample(batch_features, grid, align_corners=True).permute(
             0, 2, 1, 3
         )
+
+        # (B, Np, C, Ns) -> (B* Np, C, Ns, 1)
         feature = feature.reshape(
             batch_size * self.num_priors,
             self.prior_feat_channels,
             self.sample_points,
             1,
         )
-        return feature
+        return feature # this functions samples the values from the feature map at the prior points and returns the sampled values (pooled features)
 
     def forward(self, x, **kwargs):
         """
@@ -170,18 +246,27 @@ class CLRerHead(BaseDenseHead):
         feature_pyramid = list(x[len(x) - self.refine_layers :])
         feature_pyramid.reverse()
         # e.g. [1, 64, 10, 25], [1, 64, 20, 50] [1, 64, 40, 100]
-
+        
+        # creates the anchors from the anchor generator
+        # anchors are the instance of weight of embedding layer which has shape of (num_priors, 3)
+        # from self.prior_ys (normalized y coordinates starting from 1.0 to 0.0), and self.sample_x_indices (indices of sample points starting from 0 to 71)
+        # and img_w, img_h are used to denormalize the coordinates of anchors
+        
+        # it creates the coordinates of anchors (Np, Nr) using the prior of y coordinates and anchor's start x, y coordinates and theta (angle) parameters
+        # and sample_x_indices are used to sample the x coordinates of anchors.
+        # sampled_xs is sampled anchor x sampled at sample_x_indices (but it samples all the points from the anchors -> Nr=Ns by defaults)
         _, sampled_xs = self.anchor_generator.generate_anchors(
-            self.anchor_generator.prior_embeddings.weight,
-            self.prior_ys,
-            self.sample_x_indices,
-            self.img_w,
-            self.img_h,
+            self.anchor_generator.prior_embeddings.weight, # (Np, 3) -> (start of y, start of x, theta)
+            self.prior_ys, # (Nr, ) -> constrained spacing of y coordinates (=priors)
+            self.sample_x_indices, # (Ns, ) -> indices of sample points to sample which points are sampled
+            self.img_w, # original img_w to calculate the x coordinates of anchors (in denormalized coordinates)
+            self.img_h, # original img_h to calculate the y coordinates of anchors (in denormalized coordinates)
         )
 
         anchor_params = self.anchor_generator.prior_embeddings.weight.clone().repeat(
             batch_size, 1, 1
         )  # [B, Np, 3]
+        # (num_priors, num_samples(=num_points by default)) -> (batch, num_priors, num_samples(=num_points by default))
         priors_on_featmap = sampled_xs.repeat(batch_size, 1, 1)
 
         predictions_list = []
@@ -190,8 +275,11 @@ class CLRerHead(BaseDenseHead):
         pooled_features_stages = []
         for stage in range(self.refine_layers):
             prior_xs = priors_on_featmap  # torch.flip(priors_on_featmap, dims=[2])  # [24, 192, 36]
+            
             # 1. anchor ROI pooling
             # [B, C, H, W] X [B, Np, Ns] => [B * Np, C, Ns, 1]
+            # output pooled features by given coordinates of prior points. x coordinates are generated from anchors and y coordinates are fixed which is initialized
+            # as the self.prior_feat_ys (which is normalized y coordinates starting from 1.0 to 0.0 with 72 sample points linearly spaced)
             pooled_features = self.pool_prior_features(feature_pyramid[stage], prior_xs)
             pooled_features_stages.append(pooled_features)
 
@@ -272,6 +360,8 @@ class CLRerHead(BaseDenseHead):
         cls_loss = torch.tensor(0.0).to(device)
         reg_xytl_loss = torch.tensor(0.0).to(device)
         iou_loss = torch.tensor(0.0).to(device)
+        num_assignment = torch.tensor(0.0).to(device)
+        total_assignment = torch.tensor(0.0).to(device)
 
         for stage in range(self.refine_layers):
             for b, img_meta in enumerate(batch_data_samples):
@@ -285,12 +375,15 @@ class CLRerHead(BaseDenseHead):
                     # If there are no targets, all predictions have to be negatives (i.e., 0 confidence)
                     cls_loss = cls_loss + self.loss_cls(cls_pred, cls_target).sum()
                     continue
-
+                
+                # assignment runs here#
                 with torch.no_grad():
-                    (matched_row_inds, matched_col_inds) = self.assigner.assign(
+                    (matched_row_inds, matched_col_inds, num_assignment_, total_assignment_) = self.assigner.assign(
                         pred_dict, target.clone(), img_meta
                     )
-
+                num_assignment = num_assignment + num_assignment_
+                total_assignment = total_assignment + total_assignment_
+                
                 # classification targets
                 cls_target[matched_row_inds] = 1
                 cls_loss = (
@@ -336,9 +429,12 @@ class CLRerHead(BaseDenseHead):
                 iou_loss = iou_loss + self.loss_iou(
                     pred_xs * (self.img_w - 1) / self.img_w, target_xs / self.img_w
                 )
-
+                
+        num_assignment /= batch_size * self.refine_layers
+        total_assignment /= batch_size * self.refine_layers
+        
         cls_loss /= batch_size * self.refine_layers
-
+        
         reg_xytl_loss /= batch_size * self.refine_layers
         iou_loss /= batch_size * self.refine_layers
 
@@ -346,6 +442,9 @@ class CLRerHead(BaseDenseHead):
             "loss_cls": cls_loss,
             "loss_reg_xytl": reg_xytl_loss,
             "loss_iou": iou_loss,
+            # add raw scalars for logging
+            "num_assignment": num_assignment.detach().float(),
+            "total_assignment": total_assignment.detach().float(),
         }
 
         # extra segmentation loss
@@ -371,6 +470,19 @@ class CLRerHead(BaseDenseHead):
             out_dict["seg"] = self.forward_seg(x)
 
         losses = self.loss_by_feat(out_dict, batch_data_samples)
+        
+        # update the ema_value
+        self.ema_num_assign = self.ema_num_assign * (1-self.ema_beta) + losses["total_assignment"] * self.ema_beta
+        
+        if self.use_assign_regularizer:
+            eta = 1e-8
+            ema_weight = torch.log(self.ema_num_assign + eta)
+            weights =  torch.clip(ema_weight * 0.9, 1.0, 2.0)
+
+            loss_str = ["loss_cls", "loss_reg_xytl", "loss_iou", "loss_seg"]
+            for l_str in loss_str:
+                losses[l_str] *= weights
+        
         return losses
 
     def forward_seg(self, x):
@@ -381,21 +493,25 @@ class CLRerHead(BaseDenseHead):
             torch.tensor: segmentation maps, shape (B, C, H, W), where
             B: batch size, C: segmentation channels, H and W: the largest feature's spatial shape.
         """
-        batch_features = list(x[len(x) - self.refine_layers :])
-        batch_features.reverse()
-        seg_features = torch.cat(
-            [
-                F.interpolate(
-                    feature,
-                    size=[batch_features[-1].shape[2], batch_features[-1].shape[3]],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                for feature in batch_features
-            ],
-            dim=1,
-        )
-        seg = self.seg_decoder(seg_features)
+        if self.use_segman_decoder:
+            # backbone feature output order: from bottom to top. (high resolution, low channels to low resolution, high channels)
+            seg = self.seg_decoder(x)
+        else:
+            batch_features = list(x[len(x) - self.refine_layers :])
+            batch_features.reverse()
+            seg_features = torch.cat(
+                [
+                    F.interpolate(
+                        feature,
+                        size=[batch_features[-1].shape[2], batch_features[-1].shape[3]],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    for feature in batch_features
+                ],
+                dim=1,
+            )
+            seg = self.seg_decoder(seg_features)
         return seg
 
     def get_lanes(self, pred_dict, as_lanes=True, extend_bottom=True):

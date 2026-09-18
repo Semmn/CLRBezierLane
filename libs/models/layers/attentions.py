@@ -31,6 +31,7 @@ class ROIGather(nn.Module):
             sample_points (int): Number of pooling sample points (rows).
             fc_hidden_dim (int): FC middle channel number.
             refine_layers (int): The number of refine levels.
+            num_extra_output (int): The number of extra features output provided from gsrc neck.
             mid_channels (int): The number of input channels to catconv.
             cross_attention_weight (float): Weight to fuse cross attention result.
         """
@@ -87,6 +88,7 @@ class ROIGather(nn.Module):
             feat_trans = self.convs[i](feature)
             feats.append(feat_trans)
         cat_feat = torch.cat(feats, dim=1)
+        # layer_index must be -1 for gsrc head.
         cat_feat = self.catconv[layer_index](cat_feat)
         return cat_feat
 

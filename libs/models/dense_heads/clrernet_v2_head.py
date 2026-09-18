@@ -1,0 +1,843 @@
+"""
+Adapted from:
+https://github.com/Turoad/CLRNet/blob/main/clrnet/models/heads/clr_head.py
+"""
+from typing import Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from mmcv.cnn.bricks.transformer import build_attention
+from mmdet.models.dense_heads.base_dense_head import BaseDenseHead
+from mmdet.registry import MODELS
+from mmdet.registry import TASK_UTILS
+from mmdet.structures import SampleList
+from nms import nms
+from torch import Tensor
+
+from libs.models.dense_heads.seg_decoder import SegDecoder
+from libs.models.dense_heads.segman_decoder import SegMANDecoder
+from libs.utils.lane_utils import Lane
+
+
+class Attention(nn.Module):
+    """
+    Compute attentions between anchor and feature map.
+    
+        anchor_cin: input anchor feature channels
+        anchor_cout: output anchor feature channels
+        num_points: number of points in anchor
+        feat_cin: feature map input channels
+        num_heads: number of heads
+    """
+    def __init__(self, model_dim, num_heads):
+        super().__init__()
+        self.model_dim = model_dim
+        self.num_heads = num_heads
+        self.query = nn.Linear(in_features=model_dim, out_features=model_dim, bias=True)
+        self.key = nn.Linear(in_features=model_dim, out_features=model_dim, bias=True)
+        self.value = nn.Linear(in_features=model_dim, out_features=model_dim, bias=True)
+
+        if self.model_dim % num_heads != 0:
+            raise Exception("anchor channel output (=patch_size[0] * patch_size[1] * feature map channels) must be divisible by number of heads!")
+        
+        self.head_dim = self.model_dim // num_heads
+        self.scale = self.head_dim ** 0.5
+        
+        self.out = nn.Linear(self.model_dim, self.model_dim, bias=True)
+        self.softmax = nn.Softmax(dim=-1)
+        
+    def __reorder__(self, feat):
+        """
+            feat: query, key, value token (B, S, D)
+        """
+        QB, QS, QD = feat[0].shape
+        KVB, KVS, KVD = feat[1].shape
+        
+        # (B, S, D) -> (B, S, num_heads, head_dim) -> (B, num_heads, S, head_dim)
+        query = feat[0].reshape(QB, QS, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        
+        # (B, S, D) -> (B, S, num_heads, head_dim) -> (B, num_heads, S, head_dim)
+        key = feat[1].reshape(KVB, KVS, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        value = feat[2].reshape(KVB, KVS, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        
+        return query, key, value
+    
+    def forward(self, query, kvalue):
+        """
+            anchor: anchor feature that has shape of (B, Nr, C)
+            feat_map: feature map that has shape of (B, C, H, W).
+        """
+        B, S, C = query.shape
+         
+        qtoken = self.query(query) # (B, Nr, C)
+        ktoken = self.key(kvalue)
+        vtoken = self.value(kvalue)
+        qtoken, ktoken, vtoken = self.__reorder__([qtoken, ktoken, vtoken])
+        
+        attn_map = qtoken @ ktoken.permute(0, 1, 3, 2) # (B, NH, Nr, head_dim) @ (B, NH, head_dim, N_patch) -> (B, NH, Nr, N_patch)
+        attn_map = self.softmax(attn_map / self.scale) # (B, NH, Nr, N_patch)
+        
+        attn_o = attn_map @ vtoken # (B, NH, Nr, N_patch) @ (B, NH, N_patch, head_dim) -> (B, NH, Nr, head_dim)
+        attn_o = attn_o.permute(0, 2, 1, 3).reshape(B, S, -1) # (B, Nr, model_dim)
+        
+        out = self.out(attn_o) # (B, Nr, dim) -> (B, Nr, dim)
+        return out
+
+class FFN(nn.Module):
+    def __init__(self, in_dim, ffn_dim, ffn_drop, act_layer=nn.ReLU):
+        super(FFN, self).__init__()
+        self.in_dim = in_dim
+        self.ffn_dim = ffn_dim
+        self.ffn_drop = ffn_drop
+        self.act_layer = act_layer
+
+        self.act = act_layer()
+        self.linear1 = nn.Linear(in_dim, ffn_dim)
+        self.drop1 = nn.Dropout(ffn_drop) if ffn_drop > 0 else nn.Identity()
+
+        self.linear2 = nn.Linear(ffn_dim, in_dim)
+        self.drop2 = nn.Dropout(ffn_drop) if ffn_drop > 0 else nn.Identity()
+    
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.linear2(x)
+        x = self.drop2(x)
+        return x
+
+class AttentionBlock(nn.Module):
+    def __init__(self, model_dim, num_heads, ffn_dim, ffn_drop, act_layer=nn.ReLU):
+        super(AttentionBlock, self).__init__()
+        self.self_attn = Attention(model_dim, num_heads)
+        self.cross_attn = Attention(model_dim, num_heads)
+        self.ffn = FFN(model_dim, ffn_dim, ffn_drop, act_layer)
+        self.layer_norm1 = nn.LayerNorm(model_dim)
+        self.layer_norm2 = nn.LayerNorm(model_dim)
+        self.layer_norm3 = nn.LayerNorm(model_dim)
+    def forward(self, x, kv):
+        x = self.layer_norm1(x)
+        x = self.self_attn(x, x) + x
+        x = self.layer_norm2(x)
+        x = self.cross_attn(x, kv) + x
+        x = self.layer_norm3(x)
+        x = self.ffn(x) + x
+        return x
+
+class AttentionLayer(nn.Module):
+    def __init__(self, model_dim, num_heads, ffn_dim, ffn_drop, act_layer=nn.ReLU, num_layers=1):
+        super(AttentionLayer, self).__init__()
+        self.attn_layers = nn.ModuleList()
+        for _ in range(num_layers):
+            attn_blocks = AttentionBlock(model_dim, num_heads, ffn_dim, ffn_drop, act_layer)
+            self.attn_layers.append(attn_blocks)
+
+    def forward(self, x, kv):
+        for i in range(len(self.attn_layers)):
+            x = self.attn_layers[i](x, kv)
+        return x
+
+class AnchorFeatMapLayer(nn.Module):
+    def __init__(self, anchor_cin, num_points, num_anchors, feat_cin, patch_sz, num_heads, ffn_dim, out_dim, num_layers=1):
+        super(AnchorFeatMapLayer, self).__init__()
+        self.num_anchors = num_anchors
+        self.num_layers = num_layers
+        self.out_dim = out_dim
+        self.patch_sz = patch_sz
+
+        self.model_dim = patch_sz[0] * patch_sz[1] * feat_cin
+        self.anchor_feat_encoder = nn.Linear(anchor_cin * num_points, self.model_dim, bias=True)
+        self.attn_layers = AttentionLayer(self.model_dim, num_heads, ffn_dim, ffn_drop=0.1, act_layer=nn.ReLU, num_layers=num_layers)
+        self.out_proj = nn.Linear(self.model_dim, out_dim, bias=True)
+
+    def __patchfy__(self, feat):
+        """
+            feat: key or value (B, C, H, W)
+        """
+        B, C, H, W = feat.shape
+        if self.patch_sz == (1, 1):
+            feat = feat.reshape(B, C, H * W)
+            feat = feat.permute(0, 2, 1)
+        else:
+            PH = self.patch_sz[0]
+            PW = self.patch_sz[1]
+            
+            # 1. reshaping
+            feat = torch.reshape(feat, (B, H//PH, PH, W//PW, PW, C))
+            feat = torch.swapaxes(feat, 2, 3).reshape(B, -1, PH, PW, C)
+            
+            # 2. flattening
+            feat = torch.flatten(feat, start_dim=2, end_dim=4) # (batch_size, N, PH * PW * C)
+            
+        return feat
+    
+    def forward(self, anchor, feat_map):
+        # anchor shape: (B*Nr, C, Ns, 1)
+        B_NR, C, Ns, _ = anchor.shape
+        B, Nr = B_NR // self.num_anchors, self.num_anchors
+        anchor = anchor.squeeze().reshape(B * Nr, C * Ns)
+        anchor = self.anchor_feat_encoder(anchor) # [B * Nr, C * Ns] -> [B * Nr, Cout (=patch_sz[0] * patch_sz[1] * anchor_cin)]
+        anchor_t = anchor.reshape(B, Nr, -1) # [B * Nr, Cout] -> [B, Nr, Cout]
+        feat_t = self.__patchfy__(feat_map) # (B, N_patch, Cout)
+
+        out = self.attn_layers(anchor_t, feat_t) # [B, Nr, Cout]
+        out = self.out_proj(out) # [B, Nr, Cout] -> [B, Nr, out_dim]
+        return out
+        
+
+@MODELS.register_module()
+class CLRerV2Head(BaseDenseHead):
+    """
+    CLRerNet + extra feature map from neck + attention between anchor and extra feature map
+    It expects additional feature map from neck is appended at the end of main feature map list.
+    """
+    def __init__(
+        self,
+        anchor_generator,
+        img_w=800,
+        img_h=320,
+        prior_feat_channels=64,
+        fc_hidden_dim=64,
+        num_fc=2,
+        refine_layers=3,
+        sample_points=36,
+        attention=None,
+        loss_cls=None,
+        loss_bbox=None,
+        loss_iou=None,
+        loss_seg=None,
+        train_cfg=None,
+        test_cfg=None,
+        use_segman_decoder=False,
+        segman_decoder_params=None,
+        num_extra_features=1,
+        extra_feature_dim=64,
+        extra_attn_layers=1,
+    ):
+        super(CLRerV2Head, self).__init__()
+        self.num_extra_features = num_extra_features
+        self.anchor_generator = TASK_UTILS.build(anchor_generator)
+        self.img_w = img_w
+        self.img_h = img_h
+        self.n_offsets = self.anchor_generator.num_offsets
+        self.n_strips = self.n_offsets - 1
+        self.strip_size = self.img_h / self.n_strips
+        self.num_priors = attention.num_priors = self.anchor_generator.num_priors
+        self.sample_points = attention.sample_points = sample_points
+        self.refine_layers = attention.refine_layers = refine_layers # number of fpn passed feature map
+        self.fc_hidden_dim = attention.fc_hidden_dim = fc_hidden_dim
+        self.prior_feat_channels = attention.in_channels = prior_feat_channels # number of feature channels of prior. (defaults to 64 as neck outputs 64 channels)
+        self.attention = MODELS.build(attention)
+        
+        self.loss_cls = MODELS.build(loss_cls)
+        self.loss_bbox = MODELS.build(loss_bbox)
+        self.loss_seg = MODELS.build(loss_seg) if loss_seg["loss_weight"] > 0 else None
+        self.loss_iou = MODELS.build(loss_iou)
+        self.train_cfg = train_cfg
+        self.test_cfg = test_cfg
+        self.use_segman_decoder = use_segman_decoder # whether to use segman decoder for multi-task segmentation head
+
+        # anchor to feature map attention
+        self.a2rc_attns = nn.ModuleList()
+        for _ in range(self.num_extra_features):
+            a2rc_attn = AnchorFeatMapLayer(anchor_cin=prior_feat_channels, num_points=sample_points, 
+                                           num_anchors=self.num_priors, feat_cin=extra_feature_dim,
+                                           patch_sz=(1,1), num_heads=2, ffn_dim=self.prior_feat_channels*4, 
+                                           out_dim=prior_feat_channels, num_layers=extra_attn_layers) # number of decoder style layer is 3
+            self.a2rc_attns.append(a2rc_attn)
+
+        # anchor projection that maps the extra anchor to fc_hidden_dim
+        self.extra_anchor_projection = nn.Linear(in_features=extra_feature_dim * sample_points, out_features=fc_hidden_dim, bias=True)
+
+        if self.use_segman_decoder:
+            if segman_decoder_params is None:
+                self.segman_decoder_params = {'embed_dim': 128,
+                                              'feat_proj_dim': 192,
+                                              'num_classes': 5,
+                                              'dropout_ratio': 0.01,
+                                              'channel_split': False,
+                                              'interpolate_mode': 'bilinear',
+                                              'use_rpb': False}
+            else:
+                self.segman_decoder_params = segman_decoder_params
+        else:
+            self.segman_decoder_params = None # if use_segman_decoder is False, segman_decoder_params is not used
+            
+        if self.train_cfg:
+            self.assigner = TASK_UTILS.build(train_cfg['assigner'])
+        
+
+        # Non-learnable parameters
+        # when sample_points=72, n_strips=sample_points-1=71 this generates the indices [0, 1, ..., 71]
+        self.register_buffer(
+            name="sample_x_indices",
+            tensor=(
+                torch.linspace(0, 1, steps=self.sample_points, dtype=torch.float32)
+                * self.n_strips
+            ).long(),
+        )
+        # this generates the y coordinates starts from 1.0 to 0.0 (normalized coordinates starting from the bottom of the image and increases to the top)
+        self.register_buffer(
+            name="prior_feat_ys",
+            tensor=torch.flip(
+                (self.sample_x_indices.float() / self.n_strips), dims=[-1]
+            ),
+        )
+        # this also creates the y coordinates for the prior points in the range of [1.0, 0.0]
+        self.register_buffer(
+            name="prior_ys",
+            tensor=torch.linspace(1, 0, steps=self.n_offsets, dtype=torch.float32),
+        )
+        
+        reg_modules = list()
+        cls_modules = list()
+        fc_dims = self.fc_hidden_dim + self.num_extra_features * extra_feature_dim
+        for _ in range(num_fc):
+            reg_modules += [
+                nn.Linear(fc_dims, fc_dims),
+                nn.ReLU(inplace=True),
+            ]
+            cls_modules += [
+                nn.Linear(fc_dims, fc_dims),
+                nn.ReLU(inplace=True),
+            ]
+        self.reg_modules = nn.ModuleList(reg_modules)
+        self.cls_modules = nn.ModuleList(cls_modules)
+        self.reg_layers = nn.Linear(fc_dims, self.n_offsets + 4)
+        self.cls_layers = nn.Linear(fc_dims, 2)
+        self.attention = build_attention(attention)
+
+        # Auxiliary head
+        if self.loss_seg:
+            if self.use_segman_decoder:
+                self.seg_decoder = SegMANDecoder(
+                    image_size=(img_h, img_w),
+                    in_channels=prior_feat_channels,
+                    embed_dim=segman_decoder_params['embed_dim'],
+                    feat_proj_dim=segman_decoder_params['feat_proj_dim'],
+                    num_classes=segman_decoder_params['num_classes'],
+                    dropout_ratio=segman_decoder_params['dropout_ratio'],
+                    channel_split=segman_decoder_params['channel_split'],
+                    interpolate_mode=segman_decoder_params['interpolate_mode'],
+                    use_rpb=segman_decoder_params['use_rpb']
+                )
+            else:
+                self.seg_decoder = SegDecoder(
+                    self.img_h,
+                    self.img_w,
+                    num_classes=5,
+                    prior_feat_channels=self.prior_feat_channels,
+                    refine_layers=self.refine_layers,
+                )
+
+        self.init_weights()
+
+    def _init_base(self, m: nn.Module):
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+        elif isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, mean=0.0, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+        elif isinstance(m, (nn.LayerNorm, nn.BatchNorm2d, nn.GroupNorm)):
+            if getattr(m, 'weight', None) is not None:
+                nn.init.constant_(m.weight, 1.0)
+            if getattr(m, 'bias', None) is not None:
+                nn.init.constant_(m.bias, 0.0)
+
+    def init_weights(self):
+        self.apply(self._init_base)
+
+        # initialize heads
+        for m in self.cls_layers.parameters():
+            nn.init.normal_(m, mean=0.0, std=1e-3)
+        for m in self.reg_layers.parameters():
+            nn.init.normal_(m, mean=0.0, std=1e-3)
+
+    def pool_prior_features(self, batch_features, prior_xs):
+        """
+        Pool features from the feature map along the prior points.
+        Args:
+            batch_features (torch.Tensor): Input feature maps, shape: (B, C, H, W)
+            prior_xs (torch.Tensor):. Prior points, shape (B, Np, Ns)
+                where Np is the number of priors and Ns is the number of sample points.
+        Returns:
+            feature (torch.Tensor): Pooled features with shape (B * Np, C, Ns, 1).
+        """
+
+        batch_size = batch_features.shape[0]
+
+        # (batch, num_priors, num_points) -> (batch, num_priors, num_points, 1)
+        prior_xs = prior_xs.view(batch_size, self.num_priors, -1, 1)
+        # (num_points) -> (batch_size * num_priors, num_points) -> (batch, num_priors, num_points, 1)
+        prior_ys = self.prior_feat_ys.repeat(batch_size * self.num_priors).view(
+            batch_size, self.num_priors, -1, 1
+        )
+
+        # change the range of prior_xs and prior_ys to [-1, 1]
+        prior_xs = prior_xs * 2.0 - 1.0
+        prior_ys = prior_ys * 2.0 - 1.0
+        # (batch, num_priors, num_points, 2) concatenated
+        grid = torch.cat((prior_xs, prior_ys), dim=-1)
+        
+        # torch.nn.functional.grid_sample() do grid-sampling the (B, C, H, W) feature map according to the (batch, num_priors, num_points, 2) grid
+        # output tensors are permuted to (B, C, Ns, 2) (from (B, C, Np, Ns) -> (B, Np, C, Ns))
+        feature = F.grid_sample(batch_features, grid, align_corners=True).permute(
+            0, 2, 1, 3
+        )
+
+        # (B, Np, C, Ns) -> (B* Np, C, Ns, 1)
+        feature = feature.reshape(
+            batch_size * self.num_priors,
+            self.prior_feat_channels,
+            self.sample_points,
+            1,
+        )
+        return feature # this functions samples the values from the feature map at the prior points and returns the sampled values (pooled features)
+
+    def forward(self, x, **kwargs):
+        """
+        Take pyramid features as input to perform Cross Layer Refinement and finally output the prediction lanes.
+        Each feature is a 4D tensor.
+        Args:
+            x: Input features (list[Tensor]). Each tensor has a shape (B, C, H_i, W_i),
+                where i is the pyramid level.
+                Example of shapes: ([1, 64, 40, 100], [1, 64, 20, 50], [1, 64, 10, 25], [extra feature map output (different path from fpn)], ...).
+        Returns:
+            pred_dict (List[dict]): List of prediction dicts each of which containins multiple lane predictions.
+                cls_logits (torch.Tensor): 2-class logits with shape (B, Np, 2).
+                anchor_params (torch.Tensor): anchor parameters with shape (B, Np, 3).
+                lengths (torch.Tensor): lane lengths in row numbers with shape (B, Np, 1).
+                xs (torch.Tensor): x coordinates of the lane points with shape (B, Np, Nr).
+
+        B: batch size, Np: number of priors (anchors), Nr: num_points (rows).
+        """
+        batch_size = x[0].shape[0]
+        num_feat_pyrd = len(x)-self.num_extra_features
+        # e.g. [[1, 64, 10, 25], [1, 64, 20, 50] [1, 64, 40, 100], [Row-Column Feature Map]]
+        feature_pyramid = list(x[num_feat_pyrd-self.refine_layers:num_feat_pyrd])
+        feature_pyramid.reverse()
+        extra_features = list(x[num_feat_pyrd:]) # extra feature maps from neck
+        
+        _, sampled_xs = self.anchor_generator.generate_anchors(
+            self.anchor_generator.prior_embeddings.weight, # (Np, 3) -> (start of y, start of x, theta)
+            self.prior_ys, # (Nr, ) -> constrained spacing of y coordinates (=priors)
+            self.sample_x_indices, # (Ns, ) -> indices of sample points to sample which points are sampled
+            self.img_w, # original img_w to calculate the x coordinates of anchors (in denormalized coordinates)
+            self.img_h, # original img_h to calculate the y coordinates of anchors (in denormalized coordinates)
+        )
+        # [B, Np, 3]
+        anchor_params = self.anchor_generator.prior_embeddings.weight.clone().repeat(
+            batch_size, 1, 1
+        )
+        # (num_priors, num_samples) -> (batch, num_priors, num_samples)
+        priors_on_featmap = sampled_xs.repeat(batch_size, 1, 1)
+        predictions_list = []
+
+        # iterative refine
+        pooled_features_stages = []
+        for stage in range(self.refine_layers):
+            prior_xs = priors_on_featmap
+            
+            # 1. anchor ROI pooling
+            # [B, C, H, W] X [B, Np, Ns] => [B * Np, C, Ns, 1]
+            # output pooled features by given coordinates of prior points. x coordinates are generated from anchors and y coordinates are fixed which is initialized
+            # as the self.prior_feat_ys (which is normalized y coordinates starting from 1.0 to 0.0 with 72 sample points linearly spaced)
+            pooled_features = self.pool_prior_features(feature_pyramid[stage], prior_xs)
+            pooled_features_stages.append(pooled_features)
+
+            # create anchor feature from extra provided feature map
+            extra_fc_features = []
+            for extra_i in range(self.num_extra_features):
+                extra_pooled = self.pool_prior_features(extra_features[extra_i], prior_xs) # [B * Np, C, Ns, 1]
+                extra_pooled = extra_pooled.reshape(batch_size, self.num_priors, -1) # [B, Np, C * Ns]
+                extra_pooled = self.extra_anchor_projection(extra_pooled) # [B, Np, fc_hidden_dim]
+                extra_fc_features.append(extra_pooled)
+            extra_fc_features = torch.cat(extra_fc_features, dim=-1) # [B, Np, num_extra_features * fc_hidden_dim]
+
+            # 2. ROI gather
+            # pooled features [B * Np, C, Ns, 1] * stages
+            # feature pyramid: [B, C, Hs, Ws] (s = 0, 1, 2)
+            fc_features = self.attention(
+                pooled_features_stages, feature_pyramid, stage
+            )  # [B, Np, Ch], Ch: fc_hidden_dim
+            
+            fc_features = torch.cat((fc_features, extra_fc_features), dim=-1) # [B, Np, Ch + num_extra_features * fc_hidden_dim]
+
+            # # 3. attention between extra feature map from neck and anchor features
+            # for extra_i in range(self.num_extra_features):
+            #     # [B * Np, C, Ns, 1], [B, extra_feature_dim, H_extra, W_extra] -> (Batch, num_prior, dim)
+            #     attn_o = self.a2rc_attns[extra_i](pooled_features, extra_features[extra_i])
+            #     fc_features = torch.cat((fc_features, attn_o), dim=-1) # [B, Np, Ch + num_extra_features * extra_feature_dim]
+            
+            fc_features = fc_features.view(self.num_priors, batch_size, -1).reshape(
+                batch_size * self.num_priors, -1
+            )  # [B * Np, Ch + num_extra_features * extra_feature_dim]
+
+            # 3. cls and reg heads
+            cls_features = fc_features.clone()
+            reg_features = fc_features.clone()
+            for cls_layer in self.cls_modules:
+                cls_features = cls_layer(cls_features)
+            for reg_layer in self.reg_modules:
+                reg_features = reg_layer(reg_features)
+
+            cls_logits = self.cls_layers(cls_features)
+            cls_logits = cls_logits.reshape(
+                batch_size, -1, cls_logits.shape[1]
+            )  # (B, Np, 2)
+
+            reg = self.reg_layers(reg_features)
+            reg = reg.reshape(batch_size, -1, reg.shape[1])  # (B, Np, 4 + Nr)
+
+            # 4. reg processing
+            anchor_params += reg[:, :, :3]  # y0, x0, theta
+            updated_anchor_xs, _ = self.anchor_generator.generate_anchors(
+                anchor_params.view(-1, 3),
+                self.prior_ys,
+                self.sample_x_indices,
+                self.img_w,
+                self.img_h,
+            )
+            updated_anchor_xs = updated_anchor_xs.view(batch_size, self.num_priors, -1)
+            reg_xs = updated_anchor_xs + reg[..., 4:]
+
+            pred_dict = {
+                "cls_logits": cls_logits,
+                "anchor_params": anchor_params,
+                "lengths": reg[:, :, 3:4],
+                "xs": reg_xs,
+            }
+
+            predictions_list.append(pred_dict)
+
+            if stage != self.refine_layers - 1:
+                anchor_params = anchor_params.detach().clone()
+                priors_on_featmap = updated_anchor_xs.detach().clone()[
+                    ..., self.sample_x_indices
+                ]
+
+        return predictions_list
+
+    def loss_by_feat(self, out_dict, batch_data_samples):
+        """Loss calculation from the network output.
+
+        Args:
+            out_dict (dict[torch.Tensor]): Output dict from the network containing:
+                predictions (List[dict]): 3-layer prediction dicts each of which contains:
+                    cls_logits: shape (B, Np, 2), anchor_params: shape (B, Np, 3),
+                    lengths: shape (B, Np, 1) and xs: shape (B, Np, Nr).
+                seg (torch.Tensor): segmentation maps, shape (B, C, H, W).
+                where
+                B: batch size, Np: number of priors (anchors), Nr: number of rows,
+                C: segmentation channels, H and W: the largest feature's spatial shape.
+            batch_data_samples: (List[:obj:`DetDataSample`]): The data samples
+                that include meta information.
+        Returns:
+            dict[str, Tensor]: A dictionary of loss components.
+        """
+        batch_size = len(batch_data_samples)
+        device = out_dict["predictions"][0]["cls_logits"].device
+        cls_loss = torch.tensor(0.0).to(device)
+        reg_xytl_loss = torch.tensor(0.0).to(device)
+        iou_loss = torch.tensor(0.0).to(device)
+        num_assignment = torch.tensor(0.0).to(device)
+        total_assignment = torch.tensor(0.0).to(device)
+
+        for stage in range(self.refine_layers):
+            for b, img_meta in enumerate(batch_data_samples):
+                pred_dict = {k: v[b] for k, v in out_dict["predictions"][stage].items()}
+                cls_pred = pred_dict["cls_logits"]
+                target = img_meta.lanes.clone().to(device)  # [n_lanes, 78]
+                target = target[target[:, 1] == 1]
+                cls_target = cls_pred.new_zeros(cls_pred.shape[0]).long()
+
+                if len(target) == 0:
+                    # If there are no targets, all predictions have to be negatives (i.e., 0 confidence)
+                    cls_loss = cls_loss + self.loss_cls(cls_pred, cls_target).sum()
+                    continue
+                
+                # assignment runs here#
+                with torch.no_grad():
+                    (matched_row_inds, matched_col_inds, num_assignment_, total_assignment_) = self.assigner.assign(
+                        pred_dict, target.clone(), img_meta
+                    )
+                num_assignment = num_assignment + num_assignment_
+                total_assignment = total_assignment + total_assignment_
+                
+                # classification targets
+                cls_target[matched_row_inds] = 1
+                cls_loss = (
+                    cls_loss
+                    + self.loss_cls(cls_pred, cls_target).sum() / target.shape[0]
+                )
+
+                # regression targets -> [start_y, start_x, theta]
+                # (all transformed to absolute values), only on matched pairs
+                reg_yxtl = torch.cat(
+                    (pred_dict["anchor_params"], pred_dict["lengths"]), dim=1
+                )
+                reg_yxtl = reg_yxtl[matched_row_inds]
+                reg_yxtl[:, 0] *= self.n_strips
+                reg_yxtl[:, 1] *= self.img_w - 1
+                reg_yxtl[:, 2] *= 180
+                reg_yxtl[:, 3] *= self.n_strips
+
+                target_yxtl = target[matched_col_inds, 2:6].clone()
+
+                # regression targets -> S coordinates (all transformed to absolute values)
+                pred_xs = pred_dict["xs"][matched_row_inds]
+                target_xs = target[matched_col_inds, 6:].clone()
+
+                # adjust target length by start point difference
+                with torch.no_grad():
+                    predictions_starts = torch.clamp(
+                        reg_yxtl[:, 0].round().long(), 0, self.n_strips
+                    )  # ensure the predictions starts is valid
+                    target_starts = (
+                        (target[matched_col_inds, 2] * self.n_strips).round().long()
+                    )
+                    target_yxtl[:, -1] -= predictions_starts - target_starts
+
+                # Loss calculation
+                target_yxtl[:, 0] *= self.n_strips
+                target_yxtl[:, 2] *= 180
+
+                reg_xytl_loss = (
+                    reg_xytl_loss + self.loss_bbox(reg_yxtl, target_yxtl).mean()
+                )
+
+                iou_loss = iou_loss + self.loss_iou(
+                    pred_xs * (self.img_w - 1) / self.img_w, target_xs / self.img_w
+                )
+                
+        num_assignment /= batch_size * self.refine_layers
+        total_assignment /= batch_size * self.refine_layers
+        
+        cls_loss /= batch_size * self.refine_layers
+        
+        reg_xytl_loss /= batch_size * self.refine_layers
+        iou_loss /= batch_size * self.refine_layers
+
+        loss_dict = {
+            "loss_cls": cls_loss,
+            "loss_reg_xytl": reg_xytl_loss,
+            "loss_iou": iou_loss,
+            # add raw scalars for logging
+            "num_assignment": num_assignment.detach().float(),
+            "total_assignment": total_assignment.detach().float(),
+        }
+
+        # extra segmentation loss
+        if self.loss_seg:
+            tgt_masks = np.array([t.gt_masks[0] for t in batch_data_samples])
+            tgt_masks = torch.tensor(tgt_masks).long().to(device)  # (B, H, W)
+            loss_dict["loss_seg"] = self.loss_seg(out_dict["seg"], tgt_masks)
+
+        return loss_dict
+
+    def loss(self, x: Tuple[Tensor], batch_data_samples: SampleList) -> dict:
+        """Forward function for training mode.
+        Args:
+            x (list[Tensor]): Features from backbone.
+            batch_data_samples (List[:obj:`DetDataSample`]): The data samples
+                that include meta information.
+        Returns:
+            dict[str, Tensor]: A dictionary of loss components.
+        """
+        predictions = self(x)
+        out_dict = {"predictions": predictions}
+        if self.loss_seg:
+            out_dict["seg"] = self.forward_seg(x[:self.refine_layers])
+
+        losses = self.loss_by_feat(out_dict, batch_data_samples)
+        
+        return losses
+
+    def forward_seg(self, x):
+        """Forward function for training mode.
+        Args:
+            x (list[torch.tensor]): Features from backbone.
+        Returns:
+            torch.tensor: segmentation maps, shape (B, C, H, W), where
+            B: batch size, C: segmentation channels, H and W: the largest feature's spatial shape.
+        """
+        if self.use_segman_decoder:
+            # backbone feature output order: from bottom to top. (high resolution, low channels to low resolution, high channels)
+            seg = self.seg_decoder(x)
+        else:
+            batch_features = list(x[len(x) - self.refine_layers :])
+            batch_features.reverse()
+            seg_features = torch.cat(
+                [
+                    F.interpolate(
+                        feature,
+                        size=[batch_features[-1].shape[2], batch_features[-1].shape[3]],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    for feature in batch_features
+                ],
+                dim=1,
+            )
+            seg = self.seg_decoder(seg_features)
+        return seg
+
+    def get_lanes(self, pred_dict, as_lanes=True, extend_bottom=True):
+        """
+        Convert model output to lane instances.
+        Args:
+            pred_dict (dict): prediction dict containing multiple lanes.
+                cls_logits (torch.Tensor): 2-class logits with shape (B, Np, 2).
+                anchor_params (torch.Tensor): anchor parameters with shape (B, Np, 3).
+                lengths (torch.Tensor): lane lengths in row numbers with shape (B, Np, 1).
+                xs (torch.Tensor): x coordinates of the lane points with shape (B, Np, Nr).
+            as_lanes (bool): transform to the Lane instance for interpolation.
+        Returns:
+            pred (List[torch.Tensor]): List of lane tensors (shape: (N, 2))
+                or `Lane` objects, where N is the number of rows.
+            scores (torch.Tensor): Confidence scores of the lanes.
+
+        B: batch size, Np: num_priors, Nr: num_points (rows).
+        """
+        softmax = nn.Softmax(dim=2)
+        threshold = self.test_cfg.conf_threshold
+        all_scores = softmax(pred_dict["cls_logits"])[:, :, 1]
+        all_keep_inds = all_scores >= threshold  # [64, 192]
+        out_preds = []
+        out_scores = []
+        for scores, xs, lengths, anchor_params, keep_inds in zip(
+            all_scores, pred_dict["xs"], pred_dict["lengths"],
+            pred_dict["anchor_params"], all_keep_inds):
+            scores = scores[keep_inds]
+            xs = xs[keep_inds]
+            lengths = lengths[keep_inds]
+            anchor_params = anchor_params[keep_inds]
+            if xs.shape[0] == 0:
+                out_preds.append([])
+                out_scores.append([])
+                continue
+
+            if self.test_cfg.use_nms:
+                nms_anchor_params = anchor_params[..., :2].detach().clone()
+                nms_anchor_params[..., 0] = 1 - nms_anchor_params[..., 0]
+                nms_predictions = torch.cat(
+                    [
+                        pred_dict["cls_logits"][0, keep_inds].detach().clone(),
+                        nms_anchor_params[..., :2],
+                        lengths.detach().clone() * self.n_strips,
+                        xs.detach().clone() * (self.img_w - 1),
+                    ],
+                    dim=-1,
+                )  # [N, 77]
+                keep, num_to_keep, _ = nms(
+                    nms_predictions,
+                    scores,
+                    overlap=self.test_cfg.nms_thres,
+                    top_k=self.test_cfg.nms_topk,
+                )
+                keep = keep[:num_to_keep]
+                xs = xs[keep]
+                scores = scores[keep]
+                lengths = lengths[keep]
+                anchor_params = anchor_params[keep]
+
+            lengths = torch.round(lengths * self.n_strips)
+            pred = self.predictions_to_lanes(xs, anchor_params, lengths, scores, as_lanes, extend_bottom)
+            out_preds.append(pred)
+            out_scores.append(scores)
+
+        return out_preds, out_scores
+
+    def predictions_to_lanes(
+        self, pred_xs, anchor_params, lengths, scores, as_lanes=True, extend_bottom=True
+    ):
+        """
+        Convert predictions to the lane segment instances.
+        Args:
+            pred_xs (torch.Tensor): x coordinates of the lane points with shape (Nl, Nr).
+            anchor_params (torch.Tensor): anchor parameters with shape (Nl, 3).
+            lengths (torch.Tensor): lane lengths in row numbers with shape (Nl, 1).
+            scores (torch.Tensor): confidence scores with shape (Nl,).
+            as_lanes (bool): transform to the Lane instance for interpolation.
+            extend_bottom (bool): if the prediction does not start at the bottom of the image,
+                extend its prediction until the x is outside the image.
+        Returns:
+            lanes (List[torch.Tensor]): List of lane tensors (shape: (N, 2))
+                or `Lane` objects, where N is the number of rows.
+
+        B: batch size, Nl: number of lanes after NMS, Nr: num_points (rows).
+        """
+        prior_ys = self.prior_ys.double()
+        lanes = []
+        for lane_xs, lane_param, length, score in zip(
+            pred_xs, anchor_params, lengths, scores
+        ):
+            start = min(
+                max(0, int(round((1 - lane_param[0].item()) * self.n_strips))),
+                self.n_strips,
+            )
+            length = int(round(length.item()))
+            end = start + length - 1
+            end = min(end, len(prior_ys) - 1)
+            if extend_bottom:
+                edge = (lane_xs[:start] >= 0.0) & (lane_xs[:start] <= 1.0)
+                start -= edge.flip(0).cumprod(dim=0).sum()
+            lane_ys = prior_ys[start : end + 1]
+            lane_xs = lane_xs[start : end + 1]
+            lane_xs = lane_xs.flip(0).double()
+            lane_ys = lane_ys.flip(0)
+
+            lane_ys = (
+                lane_ys * (self.test_cfg.ori_img_h - self.test_cfg.cut_height)
+                + self.test_cfg.cut_height
+            ) / self.test_cfg.ori_img_h
+            if len(lane_xs) <= 1:
+                continue
+            points = torch.stack(
+                (lane_xs.reshape(-1, 1), lane_ys.reshape(-1, 1)), dim=1
+            ).squeeze(2)
+            if as_lanes:
+                lane = Lane(
+                    points=points.cpu().numpy(),
+                    metadata={
+                        "start_x": lane_param[1],
+                        "start_y": lane_param[0],
+                        "conf": score,
+                    },
+                )
+            else:
+                lane = points
+            lanes.append(lane)
+        return lanes
+
+    def predict(self, feats, data_samples, rescale=False):
+        """Test function without test-time augmentation.
+        Args:
+            feats (tuple[torch.Tensor]): Multi-level features from the FPN.
+            data_samples (List[:obj:`DetDataSample`]): The data samples
+                that include meta information.
+            rescale (bool, optional): Whether to rescale the results.
+        Returns:
+            result_dict (dict): Inference result containing
+                lanes (List[torch.Tensor]): List of lane tensors (shape: (N, 2))
+                    or `Lane` objects, where N is the number of rows.
+                scores (torch.Tensor): Confidence scores of the lanes.
+        """
+        pred_dict = self(feats)[-1]
+        all_lanes, all_scores = self.get_lanes(
+            pred_dict,
+            as_lanes=self.test_cfg.as_lanes,
+            extend_bottom=self.test_cfg.extend_bottom
+            )
+        result_dict = [{
+            "lanes": lanes,
+            "scores": scores,
+            "metainfo": ds.metainfo,
+        }
+        for lanes, scores, ds in zip(all_lanes, all_scores, data_samples)]
+        return result_dict

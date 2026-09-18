@@ -4,6 +4,8 @@ https://github.com/aliyun/conditional-lane-detection/blob/master/tools/condlanen
 """
 import argparse
 
+import datetime
+import time
 import cv2
 import mmengine
 import torch
@@ -71,11 +73,21 @@ def main():
 
     # forward the model
     with torch.no_grad():
+        
+        warm_start_t = time.time()
         # warm up
         print(f"Warming up for {args.n_iter_warmup} iterations.")
         for i in range(args.n_iter_warmup):
             _ = model.predict(data_preprocessed["inputs"], data_preprocessed["data_samples"])
-
+        warm_end_t = time.time()
+        
+        warm_sec = warm_end_t - warm_start_t
+        result = datetime.timedelta(seconds=warm_sec)
+        result_ = str(result).split('.')
+        print("warmup time: ", result_[0])
+        
+        
+        test_start_t = time.time()
         # test
         print(f"Speed test for {args.n_iter_test} iterations.")
         timer = mmengine.Timer()
@@ -83,6 +95,13 @@ def main():
             _ = model.predict(data_preprocessed["inputs"], data_preprocessed["data_samples"])
         t = timer.since_last_check()
         fps = args.n_iter_test / t
+        
+        test_end_t = time.time()
+        test_sec = test_end_t - test_start_t
+        test_result = datetime.timedelta(seconds=test_sec)
+        result_ = str(test_result).split('.')
+        print("test time: ", result_[0])
+        
         print("##########################")
         print(f" Elapsed time = {t:.2f}")
         print(f" total number of frames = {args.n_iter_test}")

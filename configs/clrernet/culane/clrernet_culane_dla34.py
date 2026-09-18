@@ -1,5 +1,5 @@
 _base_ = [
-    "../base_clrernet.py",
+    "../base_clrernet_dla34.py",
     "dataset_culane_clrernet.py",
     "../../_base_/default_runtime.py",
 ]
@@ -19,7 +19,7 @@ custom_imports = dict(
 
 cfg_name = "clrernet_culane_dla34.py"
 
-model = dict(test_cfg=dict(conf_threshold=0.41))
+model = dict(test_cfg=dict(conf_threshold=0.50))
 
 total_epochs = 15
 checkpoint_config = dict(interval=total_epochs)
@@ -29,7 +29,7 @@ val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
 train_dataloader=dict(
-    batch_size=24
+    batch_size=32
  ) # single GPU setting
 
 # seed

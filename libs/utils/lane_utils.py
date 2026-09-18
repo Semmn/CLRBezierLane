@@ -82,7 +82,7 @@ def sample_lane(points, sample_ys, img_w):
     points = np.array([points[0::2], points[1::2]]).transpose(1, 0)
     if not np.all(points[1:, 1] < points[:-1, 1]):
         print(points)
-        raise Exception("Annotation points have to be sorted")
+        raise Exception("Annotaion points have to be sorted")
     x, y = points[:, 0], points[:, 1]
 
     # interpolate points inside domain

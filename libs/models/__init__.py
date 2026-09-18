@@ -1,4 +1,5 @@
 from .backbones import DLA  # noqa: F401
+from .backbones import SegMANEncoder_t, SegMANEncoder_s, SegMANEncoder_b, SegMANEncoder_l
 from .dense_heads import CLRerHead  # noqa: F401
 from .detectors import CLRerNet  # noqa: F401
 from .layers import ROIGather  # noqa: F401

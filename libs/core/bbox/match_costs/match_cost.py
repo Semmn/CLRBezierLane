@@ -178,21 +178,22 @@ class LaneIoUCost(CLRNetIoUCost, LaneIoULoss):
             torch.Tensor: calculated union, shape (Nlp, Nlt, Nr).
         Nlp, Nlt: number of prediction and target lanes, Nr: number of rows.
         """
-        num_gt = target.shape[0]
-        pred_mask = pred.repeat(num_gt, 1, 1).permute(1, 0, 2)
-        invalid_mask_pred = (pred_mask < 0) | (pred_mask >= 1.0)
-        target_mask = target.repeat(pred.shape[0], 1, 1)
+        # filter the invalid values
+        num_gt = target.shape[0] # (Nlt, Nr) -> Nlt
+        pred_mask = pred.repeat(num_gt, 1, 1).permute(1, 0, 2) # (Nlt, Nlp, Nr) -> (Nlp, Nlt, Nr)
+        invalid_mask_pred = (pred_mask < 0) | (pred_mask >= 1.0) # (Nlp, Nlt, Nr)
+        target_mask = target.repeat(pred.shape[0], 1, 1) # (Nlp, Nlt, Nr)
         invalid_mask_gt = (target_mask < 0) | (target_mask >= 1.0)
 
         # set invalid-pred region using start and end
         assert start is not None and end is not None
-        yind = torch.ones_like(invalid_mask_pred) * torch.arange(
+        yind = torch.ones_like(invalid_mask_pred) * torch.arange( # (Nlp, Nlt, Nr) * [0, ..., Nr-1]
             0, pred.shape[-1]
         ).float().to(pred.device)
-        h = pred.shape[-1] - 1
-        start_idx = (start * h).long().view(-1, 1, 1)
-        end_idx = (end * h).long().view(-1, 1, 1)
-        invalid_mask_pred = invalid_mask_pred | (yind < start_idx) | (yind >= end_idx)
+        h = pred.shape[-1] - 1 # h=Nr-1
+        start_idx = (start * h).long().view(-1, 1, 1) # start: (Nlp, ), h: Nr-1 -> (Nlp, 1, 1)
+        end_idx = (end * h).long().view(-1, 1, 1) # end: (Nlp, ), h: Nr-1 -> (Nlp, 1, 1)
+        invalid_mask_pred = invalid_mask_pred | (yind < start_idx) | (yind >= end_idx) # (Nlp, Nlt, Nr)
 
         # set ovr and union to zero at horizon lines where either pred or gt is missing
         invalid_mask_pred_gt = invalid_mask_pred | invalid_mask_gt
@@ -200,8 +201,8 @@ class LaneIoUCost(CLRNetIoUCost, LaneIoULoss):
         union[invalid_mask_pred_gt] = 0
 
         # calculate virtual unions for pred-only or target-only horizon lines
-        union_sep_target = target_width.repeat(pred.shape[0], 1, 1) * 2
-        union_sep_pred = pred_width.repeat(num_gt, 1, 1).permute(1, 0, 2) * 2
+        union_sep_target = target_width.repeat(pred.shape[0], 1, 1) * 2 # (Nlp, Nlt, Nr) * 2
+        union_sep_pred = pred_width.repeat(num_gt, 1, 1).permute(1, 0, 2) * 2 # (Nlt, Nlp, Nr) => (Nlp, Nlt, Nr) * 2
         union[invalid_mask_pred_gt & ~invalid_mask_pred] += union_sep_pred[
             invalid_mask_pred_gt & ~invalid_mask_pred
         ]

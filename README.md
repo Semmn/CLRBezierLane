@@ -47,19 +47,6 @@ docker compose run --rm dev
 
 See [Installation Tips](docs/INSTALL.md) for more details.
 
-## Model Preparation
-
-Download our pretrained weights:
-
-CLRerNet
-```bash
-wget https://github.com/hirotomusiker/CLRerNet/releases/download/v0.1.0/clrernet_culane_dla34.pth
-```
-CLRerNet&#8902; (w/ EMA)
-```bash
-wget https://github.com/hirotomusiker/CLRerNet/releases/download/v0.1.0/clrernet_culane_dla34_ema.pth
-```
-
 ## Inference
 
 Run the following command to detect the lanes from the image and visualize them:

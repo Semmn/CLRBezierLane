@@ -48,7 +48,7 @@ def inference_one_image(model, img_path):
 
     lanes = results[0]['lanes']
     preds = get_prediction(lanes, ori_shape[0], ori_shape[1])
-
+    
     return img, preds
 
 

@@ -4,6 +4,7 @@
 import argparse
 import os
 import os.path as osp
+import torch
 
 from mmengine.config import Config, DictAction
 from mmengine.registry import RUNNERS
@@ -60,6 +61,7 @@ def parse_args():
 
 
 def main():
+    
     args = parse_args()
 
     # Reduce the number of repeated compilations and improve
@@ -114,6 +116,9 @@ def main():
         # build customized runner from the registry
         # if 'runner_type' is set in the cfg
         runner = RUNNERS.build(cfg)
+    
+    # does not use deterministic algorithms
+    torch.use_deterministic_algorithms(False)
 
     # start training
     runner.train()

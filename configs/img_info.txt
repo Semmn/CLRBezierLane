@@ -1,0 +1,11 @@
+culane dataset img setting
+x_min = 0, x_max = 1640, y_min=270, y_max=590
+-> y cutting height: 270
+-> cutted image shape: (320, 1640)
+-> ratio between height and width: 5.125 (width/height)
+
+demo/korean_highway_noon.mp4
+x_min=0, x_max=2044, y_min=680, y_max=1080
+-> y cutting height: 680
+-> cutted image shape: (400, 2044)
+-> ratio between height and width: ? (width/height) (to ensure ratio of 5.125, cutted height should be about 400)
