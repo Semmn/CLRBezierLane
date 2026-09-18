@@ -310,3 +310,20 @@ MMEngine        0.10.3
 MMDetection     3.3.0
 NATTEN          0.17.3
 ```
+
+## 10. Install LaneMetricCore for Curvelane evaluation
+Install noah-vega==1.8.5 with no dependencies.
+```bash
+pip install --no-deps noah-vega==1.8.5
+```
+
+## 11. CurveLanes dataset setup
+1. Images need .lines.txt annotations next to them (train/images/*.lines.txt), as the curvelane branch reads. If your copy only has labels/*.lines.json, run curvelanes_json_to_txt.py.
+```bash
+python3 tools/clrbezier/curvelanes_json_to_txt.py your_curvelane_dataset_root
+```
+
+2. To write segmentation mask and file list (train/train_seg.txt) run below command
+```bash
+python3 tools/clrbezier/make_curvelanes_seg.py configs/clrernet/curvelanes/clrernet_curvelanes_r34.py
+```
