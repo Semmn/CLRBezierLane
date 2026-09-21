@@ -10,6 +10,22 @@ _base_ = [
     "../../_base_/default_runtime.py"
 ]
 
+default_scope = 'mmdet'
+
+# Lists are replaced (not merged) by mmengine: copy the official import list
+# from configs/clrernet/culane/clrernet_culane_dla34.py and append libs.clrbezier.
+custom_imports = dict(
+    imports=[
+        "libs.models",
+        "libs.datasets",
+        "libs.core.bbox",
+        "libs.core.anchor",
+        "libs.core.hook",
+        "libs.clrbezier",
+    ],
+    allow_failed_imports=False,
+)
+
 cfg_name = "clrbezier_collab_perturb_r34_evidence.py"
 
 img_w, img_h, num_points = 800, 320, 72
@@ -92,8 +108,7 @@ model = dict(
             clamp_x=True, clamp_y=True,
         ),
         loss_cfg=dict(
-            cls_loss_weight=2.0,
-            use_focal=False,
+            use_focal=True,
             cls_bg_weight=0.4,
             iou_loss_weight=4.0,
             lane_width=7.5 / 800,        # half-width, paper w_lane = 15/800
@@ -139,7 +154,7 @@ model = dict(
     ),
     test_cfg=dict(
         # Default CLRerNet uses conf_threshold=0.41
-        conf_threshold=0.40,
+        conf_threshold=0.45,
         use_nms=True,
         as_lanes=True,
         extend_bottom=True,

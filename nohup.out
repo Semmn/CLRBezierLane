@@ -1,0 +1,104 @@
+/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/torch/distributed/launch.py:181: FutureWarning: The module torch.distributed.launch is deprecated
+and will be removed in future. Use torchrun.
+Note that --use-env is set by default in torchrun.
+If your script expects `--local-rank` argument to be set, please
+change it to read from `os.environ['LOCAL_RANK']` instead. See 
+https://pytorch.org/docs/stable/distributed.html#launch-utility for 
+further instructions
+
+  warnings.warn(
+[2026-09-19 13:21:37,217] torch.distributed.run: [WARNING] 
+[2026-09-19 13:21:37,217] torch.distributed.run: [WARNING] *****************************************
+[2026-09-19 13:21:37,217] torch.distributed.run: [WARNING] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+[2026-09-19 13:21:37,217] torch.distributed.run: [WARNING] *****************************************
+Traceback (most recent call last):
+Traceback (most recent call last):
+  File "/exhdd/seungyu/CLRBezierLane/tools/train.py", line 128, in <module>
+  File "/exhdd/seungyu/CLRBezierLane/tools/train.py", line 128, in <module>
+        main()main()
+
+  File "/exhdd/seungyu/CLRBezierLane/tools/train.py", line 72, in main
+  File "/exhdd/seungyu/CLRBezierLane/tools/train.py", line 72, in main
+        cfg = Config.fromfile(args.config)cfg = Config.fromfile(args.config)
+
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/mmengine/config/config.py", line 459, in fromfile
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/mmengine/config/config.py", line 459, in fromfile
+        cfg_dict, cfg_text, env_variables = Config._file2dict(cfg_dict, cfg_text, env_variables = Config._file2dict(
+
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/mmengine/config/config.py", line 943, in _file2dict
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/mmengine/config/config.py", line 943, in _file2dict
+        raise eraise e
+
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/mmengine/config/config.py", line 916, in _file2dict
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/mmengine/config/config.py", line 916, in _file2dict
+        codeobj = compile(parsed_codes, filename, mode='exec')codeobj = compile(parsed_codes, filename, mode='exec')
+
+  File "/exhdd/seungyu/CLRBezierLane/configs/clrbezier/culane/clrbezier_collab_perturb_r34_evidence.py", line 121
+  File "/exhdd/seungyu/CLRBezierLane/configs/clrbezier/culane/clrbezier_collab_perturb_r34_evidence.py", line 121
+        cls_loss_weight=2.0,
+cls_loss_weight=2.0,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+SyntaxErrorSyntaxError: : keyword argument repeated: cls_loss_weightkeyword argument repeated: cls_loss_weight
+
+Traceback (most recent call last):
+  File "/exhdd/seungyu/CLRBezierLane/tools/train.py", line 128, in <module>
+    main()
+  File "/exhdd/seungyu/CLRBezierLane/tools/train.py", line 72, in main
+    cfg = Config.fromfile(args.config)
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/mmengine/config/config.py", line 459, in fromfile
+    cfg_dict, cfg_text, env_variables = Config._file2dict(
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/mmengine/config/config.py", line 943, in _file2dict
+    raise e
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/mmengine/config/config.py", line 916, in _file2dict
+    codeobj = compile(parsed_codes, filename, mode='exec')
+  File "/exhdd/seungyu/CLRBezierLane/configs/clrbezier/culane/clrbezier_collab_perturb_r34_evidence.py", line 121
+    cls_loss_weight=2.0,
+    ^^^^^^^^^^^^^^^^^^^
+SyntaxError: keyword argument repeated: cls_loss_weight
+Traceback (most recent call last):
+  File "/exhdd/seungyu/CLRBezierLane/tools/train.py", line 128, in <module>
+    main()
+  File "/exhdd/seungyu/CLRBezierLane/tools/train.py", line 72, in main
+    cfg = Config.fromfile(args.config)
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/mmengine/config/config.py", line 459, in fromfile
+    cfg_dict, cfg_text, env_variables = Config._file2dict(
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/mmengine/config/config.py", line 943, in _file2dict
+    raise e
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/mmengine/config/config.py", line 916, in _file2dict
+    codeobj = compile(parsed_codes, filename, mode='exec')
+  File "/exhdd/seungyu/CLRBezierLane/configs/clrbezier/culane/clrbezier_collab_perturb_r34_evidence.py", line 121
+    cls_loss_weight=2.0,
+    ^^^^^^^^^^^^^^^^^^^
+SyntaxError: keyword argument repeated: cls_loss_weight
+[2026-09-19 13:21:41,015] torch.distributed.elastic.agent.server.api: [WARNING] Received Signals.SIGINT death signal, shutting down workers
+[2026-09-19 13:21:41,015] torch.distributed.elastic.multiprocessing.api: [WARNING] Sending process 1259745 closing signal SIGINT
+[2026-09-19 13:21:41,016] torch.distributed.elastic.multiprocessing.api: [WARNING] Sending process 1259746 closing signal SIGINT
+[2026-09-19 13:21:41,016] torch.distributed.elastic.multiprocessing.api: [WARNING] Sending process 1259747 closing signal SIGINT
+[2026-09-19 13:21:41,016] torch.distributed.elastic.multiprocessing.api: [WARNING] Sending process 1259748 closing signal SIGINT
+Traceback (most recent call last):
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/torch/distributed/launch.py", line 196, in <module>
+    main()
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/torch/distributed/launch.py", line 192, in main
+    launch(args)
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/torch/distributed/launch.py", line 177, in launch
+    run(args)
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/torch/distributed/run.py", line 797, in run
+    elastic_launch(
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 134, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 255, in launch_agent
+    result = agent.run()
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/torch/distributed/elastic/metrics/api.py", line 124, in wrapper
+    result = f(*args, **kwargs)
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py", line 736, in run
+    result = self._invoke_run(role)
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py", line 877, in _invoke_run
+    time.sleep(monitor_interval)
+  File "/exhdd/seungyu/.conda/envs/clrbezierlane/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/api.py", line 62, in _terminate_process_handler
+    raise SignalException(f"Process {os.getpid()} got signal: {sigval}", sigval=sigval)
+torch.distributed.elastic.multiprocessing.api.SignalException: Process 1259630 got signal: 2

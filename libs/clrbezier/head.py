@@ -25,6 +25,8 @@ from mmdet.registry import MODELS
 from .assigners import build_cost_cache, build_lane_assigner
 from .data_adapters import CLRTargetAdapter
 from .alignment import QualityFocalLoss, ignore_unmatched, quality_targets
+from .cascade import QualityGate, ReferenceReprojector, sampling_xs
+from .geometry import eval_global_cubic
 from .gsrc import GSRCModule
 from .lateral import LateralEvidence
 from .query_attention import MaskedQuerySelfAttention
@@ -98,6 +100,9 @@ class CLRBezierHead(_OfficialHead):
         prior_cfg=None,
         brr_cfg=None,
         main_assigner=None,
+        main_stage_assigners=None,
+        main_quality_gate=None,
+        reproject_cfg=None,
         aux_cfg=None,
         perturb_cfg=None,
         loss_cfg=None,
@@ -119,6 +124,7 @@ class CLRBezierHead(_OfficialHead):
 
         prior_cfg = dict(prior_cfg or {})
         brr_cfg = dict(brr_cfg or {})
+        aux_given = aux_cfg is not None  # aux_cfg=None disables the collaborative branch
         aux_cfg = dict(aux_cfg or {})
         perturb_cfg = dict(perturb_cfg or {})
         loss_cfg = dict(loss_cfg or {})
@@ -191,7 +197,14 @@ class CLRBezierHead(_OfficialHead):
         self.main_assigner = build_lane_assigner(main_assigner or dict(
             type="HungarianLaneAssigner", cls_weight=1.0, point_weight=2.0, iou_weight=3.0))
 
-        self.aux_enabled = bool(aux_cfg.get("enabled", True))
+        # Stage-wise main assigners (default: main_assigner for every stage).
+        self.main_stage_assigners = {
+            int(k): build_lane_assigner(v) for k, v in dict(main_stage_assigners or {}).items()}
+        # Stage-increasing positive quality (Cascade R-CNN), per branch.
+        self.main_gate = QualityGate(**dict(main_quality_gate)) if main_quality_gate else None
+        aux_gate_cfg = aux_cfg.get("quality_gate") if aux_given else None
+        self.aux_gate = QualityGate(**dict(aux_gate_cfg)) if aux_gate_cfg else None
+        self.aux_enabled = aux_given and bool(aux_cfg.get("enabled", True))
         self.aux_num_groups = int(aux_cfg.get("num_groups", 3))
         self.aux_stages = [int(s) for s in aux_cfg.get("stages", [0, 1, 2])]
         self.aux_assigners = [build_lane_assigner(a) for a in aux_cfg.get("assigners", [
@@ -209,6 +222,21 @@ class CLRBezierHead(_OfficialHead):
         self.aux_random_t = bool(aux_cfg.get("random_t", True))
         self.aux_apply_brr = bool(aux_cfg.get("apply_brr_loss", True))
         self.perturbation = StructuredPriorPerturbation(eps=self.eps, **perturb_cfg)
+
+        # ---- reference re-projection -----------------------------------------
+        self.reproject = None
+        self.reproject_stages = []
+        if reproject_cfg:
+            reproject_cfg = dict(reproject_cfg)
+            self.reproject_stages = [int(v) for v in reproject_cfg.pop("stages", [0, 1])]
+            reproject_cfg.setdefault("margin", self.cp_x_margin)
+            self.reproject = ReferenceReprojector(self.prior_ys, self.img_w, self.n_strips,
+                                                  **reproject_cfg)
+        # training-step counter for warmups (saved with checkpoints for resume)
+        self.register_buffer("_train_step", torch.zeros((), dtype=torch.long))
+        self._step_cache = 0  # python mirror, refreshed once per training iteration
+        self._need_input_xs = any(
+            g is not None and g.gate_on == "input" for g in (self.main_gate, self.aux_gate))
 
         # ---- global context (GSRC) --------------------------------------------
         # Zero-initialized injection: with gsrc_cfg set, the model still starts
@@ -267,6 +295,8 @@ class CLRBezierHead(_OfficialHead):
         self.lane_width_cost = float(loss_cfg.get("lane_width_cost", 30.0 / 800))
         self.iou_loss = LaneIoULoss(loss_cfg.get("iou_loss_weight", 4.0), self.lane_width,
                                     self.img_w, self.img_h)
+        # aligned narrow LaneIoU for the quality gate (1 - loss with weight 1)
+        self.gate_iou_fn = LaneIoULoss(1.0, self.lane_width, self.img_w, self.img_h)
         self.seg_loss_weight = float(loss_cfg.get("seg_loss_weight", 1.0))
         seg_weights = torch.ones(seg_num_classes)
         seg_weights[0] = float(loss_cfg.get("seg_bg_weight", 0.4))
@@ -345,6 +375,7 @@ class CLRBezierHead(_OfficialHead):
     # BRR refinement
     # ======================================================================
     def _refine(self, feats, local_cp, context_tokens=None, num_groups=1, branch="main"):
+        """Returns (preds, states, extras); extras holds input_xs and re-projection stats."""
         batch_size, num_q = local_cp.shape[:2]
         one_row = 1.0 / float(self.n_strips)
         geo = dict(prior_ys=self.prior_ys, sample_x_indices=self.sample_x_indices,
@@ -354,7 +385,12 @@ class CLRBezierHead(_OfficialHead):
         _, on_map = brr_reference(cp_x, y_start, y_start + one_row, **geo)
 
         pooled_stages, preds, states = [], [], []
+        input_xs, reproj_stats = [], []
+        step = self._step_cache
         for stage in range(self.refine_layers):
+            if self._need_input_xs:
+                # full-row x of the reference this stage samples from (gate_on="input")
+                input_xs.append(eval_global_cubic(cp_x.detach(), self.prior_ys.to(cp_x.dtype)))
             prior_xs = torch.flip(on_map, dims=[2])
             pooled = pool_prior_features(feats[stage], prior_xs, self.prior_feat_ys,
                                          self.prior_feat_channels)
@@ -398,8 +434,14 @@ class CLRBezierHead(_OfficialHead):
             preds.append(pred)
 
             if stage != self.refine_layers - 1:
-                cp_x, y_start, on_map = new_x.detach(), new_y.detach(), ref_on_map.detach()
-        return preds, states
+                next_x, next_map = new_x, ref_on_map
+                if self.reproject is not None and stage in self.reproject_stages:
+                    next_x, stats = self.reproject.project(pred.detach(), new_x.detach(),
+                                                           step, self.training)
+                    next_map = sampling_xs(next_x, self.prior_ys, self.sample_x_indices)
+                    reproj_stats.append(stats)
+                cp_x, y_start, on_map = next_x.detach(), new_y.detach(), next_map.detach()
+        return preds, states, dict(input_xs=input_xs or None, reproj=reproj_stats)
 
     def gsrc_tokens(self, feats):
         """Global context tokens from the coarsest FPN level ([B, H*W, C])."""
@@ -409,8 +451,9 @@ class CLRBezierHead(_OfficialHead):
         batch_size = feats[-1].shape[0]
         clean_cp = self.prior_bank(batch_size)
         tokens = self.gsrc_tokens(feats)
-        main_preds, main_states = self._refine(feats, clean_cp, tokens)
-        out = dict(main_preds=main_preds, main_states=main_states)
+        main_preds, main_states, main_extra = self._refine(feats, clean_cp, tokens)
+        out = dict(main_preds=main_preds, main_states=main_states,
+                   main_input_xs=main_extra["input_xs"], reproj=main_extra["reproj"])
 
         if self.aux_enabled and self.aux_num_groups > 0:
             m = self.aux_num_groups
@@ -426,8 +469,10 @@ class CLRBezierHead(_OfficialHead):
             aux_feats = [f.repeat_interleave(m, dim=0) for f in feats]
             # tokens are global: computed once, shared by every perturbed group
             aux_tokens = None if tokens is None else tokens.repeat_interleave(m, dim=0)
-            aux_preds, aux_states = self._refine(aux_feats, aux_cp, aux_tokens,
-                                                 num_groups=m, branch="aux")
+            aux_preds, aux_states, aux_extra = self._refine(aux_feats, aux_cp, aux_tokens,
+                                                            num_groups=m, branch="aux")
+            if aux_extra["input_xs"] is not None:
+                out["aux_input_xs"] = [x.view(batch_size, m * k, -1) for x in aux_extra["input_xs"]]
             out["aux_preds"] = [p.view(batch_size, m * k, -1) for p in aux_preds]
             out["aux_states"] = [s.view(batch_size, m * k, -1) for s in aux_states]
 
@@ -438,7 +483,7 @@ class CLRBezierHead(_OfficialHead):
         return out
 
     def forward_test(self, feats):
-        preds, _ = self._refine(feats, self.prior_bank(feats[-1].shape[0]),
+        preds, _, _ = self._refine(feats, self.prior_bank(feats[-1].shape[0]),
                                 self.gsrc_tokens(feats))
         return StagePredictions([self.to_official_pred_dict(p) for p in preds])
 
@@ -461,6 +506,9 @@ class CLRBezierHead(_OfficialHead):
     # Losses
     # ======================================================================
     def loss(self, x, batch_data_samples, *args, **kwargs):
+        if self.training:
+            self._train_step += 1
+            self._step_cache = int(self._train_step)  # one host sync per iteration
         feats = self._select_features(x)
         outs = self.forward_train(feats)
         device = feats[0].device
@@ -475,7 +523,7 @@ class CLRBezierHead(_OfficialHead):
                 for i in self.aux_stage_assigner_ids.get(stage, [])]
 
     def _main_pairs(self, stage):
-        return [(self.main_assigner, 1.0)]
+        return [(self.main_stage_assigners.get(stage, self.main_assigner), 1.0)]
 
     def loss_by_outputs(self, outs, lanes, seg_gt=None):
         valid_targets = [t[t[:, 1] == 1] for t in lanes]
@@ -484,16 +532,27 @@ class CLRBezierHead(_OfficialHead):
                   for t in valid_targets]
 
         main = self._branch_losses(outs["main_preds"], outs["main_states"], valid_targets, gt_cps,
-                                   self._main_pairs, list(range(self.refine_layers)), apply_brr=True)
+                                   self._main_pairs, list(range(self.refine_layers)), apply_brr=True,
+                                   gate=self.main_gate, input_xs=outs.get("main_input_xs"))
         cls, iou, sup, cp = main["cls"], main["iou"], main["support"], main["cp"]
         diag = {"main_iou": main["iou"].detach(), "main_num_pos": main["num_pos"],
                 "main_conf_iou_l1": main["conf_iou_l1"],
                 "main_conf_iou_rank": main["conf_iou_rank"]}
+        for st, count in enumerate(main["pos_stage"]):
+            diag[f"main_pos_s{st}"] = count
+        if outs.get("reproj"):
+            dev = main["num_pos"].device
+            diag["reproj_ok_frac"] = torch.tensor(
+                sum(r["ok_frac"] for r in outs["reproj"]) / len(outs["reproj"]), device=dev)
+            diag["reproj_shift_px"] = torch.tensor(
+                sum(r["shift_px"] for r in outs["reproj"]) / len(outs["reproj"]), device=dev)
+            diag["reproj_blend"] = torch.tensor(outs["reproj"][0]["blend"], device=dev)
 
         if "aux_preds" in outs:
             aux = self._branch_losses(outs["aux_preds"], outs["aux_states"], valid_targets, gt_cps,
                                       self._aux_pairs, self.aux_stages, apply_brr=self.aux_apply_brr,
-                                      cls_target_mode=self.aux_cls_target_mode)
+                                      cls_target_mode=self.aux_cls_target_mode,
+                                      gate=self.aux_gate, input_xs=outs.get("aux_input_xs"))
             cls = cls + self.aux_cls_loss_weight * aux["cls"]
             iou = iou + self.aux_reg_loss_weight * aux["iou"]
             sup = sup + self.aux_reg_loss_weight * aux["support"]
@@ -561,7 +620,7 @@ class CLRBezierHead(_OfficialHead):
         return sup, cp
 
     def _branch_losses(self, preds_stages, states_stages, valid_targets, gt_cps, pairs_fn,
-                       stages, apply_brr, cls_target_mode=None):
+                       stages, apply_brr, cls_target_mode=None, gate=None, input_xs=None):
         device = preds_stages[0].device
         batch_size = preds_stages[0].shape[0]
         zero = preds_stages[0].new_zeros(())
@@ -574,6 +633,8 @@ class CLRBezierHead(_OfficialHead):
         num_pos = 0
         align_err, align_cnt = 0.0, 0  # mean |confidence - LaneIoU| over matched pairs
         rank_sum, rank_cnt = 0.0, 0     # Spearman(confidence, LaneIoU): what F1 actually needs
+        pos_stage = [0] * self.refine_layers  # classification positives per stage (after gating)
+        step = self._step_cache
         for stage in active:
             pairs = pairs_fn(stage)
             preds = preds_stages[stage]
@@ -584,7 +645,8 @@ class CLRBezierHead(_OfficialHead):
             mode = cls_target_mode or self.cls_target_mode
             use_quality = mode != "hard"
             use_ignore = self.ignore_iou_thr is not None
-            if use_quality or use_ignore:
+            gate_thr = gate.threshold(stage, step, self.training) if gate is not None else 0.0
+            if use_quality or use_ignore or gate_thr > 0.0:
                 # narrow-width LaneIoU: the quantity the CULane metric measures
                 required.add("lane_iou_dynamic")
             cls_targets = torch.zeros((len(pairs), batch_size, preds.shape[1]),
@@ -602,43 +664,59 @@ class CLRBezierHead(_OfficialHead):
                                          self.lane_width, self.lane_width_cost, required)
                 for a, (assigner, weight) in enumerate(pairs):
                     rows, cols = assigner.assign(cache)
+                    reg_rows, reg_cols = rows, cols
+                    if gate_thr > 0.0 and rows.numel() > 0:
+                        if gate.gate_on == "output":
+                            gate_iou = cache["lane_iou_dynamic"][rows, cols]
+                        else:
+                            with torch.no_grad():
+                                gate_iou = 1.0 - self.gate_iou_fn(
+                                    input_xs[stage][b, rows] * scale,
+                                    target[cols, 6:] / float(self.img_w))
+                        keep = gate.keep_mask(gate_iou, cols, int(target.shape[0]), gate_thr)
+                        rows, cols = rows[keep], cols[keep]
+                        if gate.mode == "cls_and_reg":
+                            reg_rows, reg_cols = rows, cols
                     if use_ignore:
                         ignore[a, b] = ignore_unmatched(
                             cache["lane_iou_dynamic"], rows, self.ignore_iou_thr)
-                    if rows.numel() == 0:
+                    pos_stage[stage] += int(rows.numel())
+                    if rows.numel() > 0:
+                        cls_targets[a, b, rows] = 1
+                        num_pos += int(rows.numel())
+                        if "lane_iou_dynamic" in cache:
+                            with torch.no_grad():
+                                conf = F.softmax(preds[b, rows, :2].detach(), dim=-1)[:, 1]
+                                pair_q = cache["lane_iou_dynamic"][rows, cols]
+                                align_err += float((conf - pair_q).abs().sum())
+                                align_cnt += int(rows.numel())
+                                if rows.numel() > 2:
+                                    rc = conf.argsort().argsort().float()
+                                    rq = pair_q.argsort().argsort().float()
+                                    rc = rc - rc.mean()
+                                    rq = rq - rq.mean()
+                                    denom = rc.norm() * rq.norm()
+                                    if float(denom) > 0:
+                                        rank_sum += float((rc * rq).sum() / denom)
+                                        rank_cnt += 1
+                        if use_quality:
+                            pair_iou = cache["lane_iou_dynamic"][rows, cols]
+                            pair_scores = None
+                            if mode == "task_aligned":
+                                pair_scores = F.softmax(
+                                    preds[b, rows, :2].detach(), dim=-1)[:, 1]
+                            quality[a, b, rows] = quality_targets(
+                                pair_iou, pair_scores, mode,
+                                self.task_align_alpha, self.task_align_beta,
+                                cols, int(target.shape[0]))
+                    if reg_rows.numel() == 0:
                         continue
-                    cls_targets[a, b, rows] = 1
-                    if "lane_iou_dynamic" in cache:
-                        with torch.no_grad():
-                            conf = F.softmax(preds[b, rows, :2].detach(), dim=-1)[:, 1]
-                            pair_q = cache["lane_iou_dynamic"][rows, cols]
-                            align_err += float((conf - pair_q).abs().sum())
-                            align_cnt += int(rows.numel())
-                            if rows.numel() > 2:
-                                rc = conf.argsort().argsort().float()
-                                rq = pair_q.argsort().argsort().float()
-                                rc = rc - rc.mean()
-                                rq = rq - rq.mean()
-                                denom = rc.norm() * rq.norm()
-                                if float(denom) > 0:
-                                    rank_sum += float((rc * rq).sum() / denom)
-                                    rank_cnt += 1
-                    if use_quality:
-                        pair_iou = cache["lane_iou_dynamic"][rows, cols]
-                        pair_scores = None
-                        if mode == "task_aligned":
-                            pair_scores = F.softmax(
-                                preds[b, rows, :2].detach(), dim=-1)[:, 1]
-                        quality[a, b, rows] = quality_targets(
-                            pair_iou, pair_scores, mode,
-                            self.task_align_alpha, self.task_align_beta,
-                            cols, int(target.shape[0]))
-                    num_pos += int(rows.numel())
-                    per_lane = self.iou_loss(preds[b, rows, 6:] * scale, target[cols, 6:] / float(self.img_w))
+                    per_lane = self.iou_loss(preds[b, reg_rows, 6:] * scale,
+                                             target[reg_cols, 6:] / float(self.img_w))
                     iou_sum = iou_sum + weight * per_lane.mean()
                     if use_brr:
-                        sup, cp = self._brr_losses(states[b, rows], target[cols],
-                                                   gt_cps[b][0][cols], gt_cps[b][1][cols])
+                        sup, cp = self._brr_losses(states[b, reg_rows], target[reg_cols],
+                                                   gt_cps[b][0][reg_cols], gt_cps[b][1][reg_cols])
                         sup_sum = sup_sum + weight * sup
                         cp_sum = cp_sum + weight * cp
             weights = preds.new_tensor([w for _, w in pairs]).view(-1, 1)
@@ -649,4 +727,5 @@ class CLRBezierHead(_OfficialHead):
                     support=sup_sum / normalizer, cp=cp_sum / normalizer,
                     num_pos=torch.tensor(float(num_pos), device=device),
                     conf_iou_l1=torch.tensor(align_err / max(1, align_cnt), device=device),
-                    conf_iou_rank=torch.tensor(rank_sum / max(1, rank_cnt), device=device))
+                    conf_iou_rank=torch.tensor(rank_sum / max(1, rank_cnt), device=device),
+                    pos_stage=[torch.tensor(float(c), device=device) for c in pos_stage])

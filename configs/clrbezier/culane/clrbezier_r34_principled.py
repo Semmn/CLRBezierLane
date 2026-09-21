@@ -1,22 +1,11 @@
-# CLRBezierLane-R34 + confidence-localization alignment (+ optional masked
-# query-to-query attention).
+# CLRBezierLane-R34: port of UnLaneDet resnet_v11_brr_collab_perturb_simota_lanewidth.py
 #
-# Changes over clrbezier_collab_perturb_r34.py:
-#   * classification target = LaneIoU of the matched pair (quality focal loss),
-#     instead of the binary 1/0 target;
-#   * unmatched anchors above ignore_iou_thr are dropped from the classification
-#     loss, removing the main (one-to-one) vs auxiliary (one-to-many)
-#     contradiction on near-duplicate anchors;
-#   * masked query-to-query attention with anchor-geometry positional bias.
-#
-# Ablate the three independently; the alignment losses are the mechanism, the
-# attention is a precision refinement on top.
-
+# Backbone, neck, data pipeline, schedule, and evaluation are the CLRerNet-R34
+# baseline's. Only the head is replaced.
 _base_ = [
     "dataset_culane_clrernet.py",
     "../../_base_/default_runtime.py"
 ]
-
 default_scope = 'mmdet'
 
 # Lists are replaced (not merged) by mmengine: copy the official import list
@@ -32,9 +21,7 @@ custom_imports = dict(
     ],
     allow_failed_imports=False,
 )
-
-
-cfg_name = "clrbezier_collab_perturb_r34_align.py"
+cfg_name = "clrbezier_r34_principled.py"
 
 img_w, img_h, num_points = 800, 320, 72
 model = dict(
@@ -68,7 +55,7 @@ model = dict(
         num_points=num_points,
         prior_feat_channels=64,
         fc_hidden_dim=64,
-        num_priors=35, # Number of priors
+        num_priors=192, # Number of priors
         num_fc=2,
         refine_layers=3,
         sample_points=36,
@@ -76,22 +63,19 @@ model = dict(
         img_h=img_h,
         roi_mid_channels=48,
         seg_num_classes=5,
-        # separate final classification layer for the auxiliary branch;
-        # the shared towers still receive its gradient
-        aux_cls_head=True,
         prior_cfg=dict(delta_scale=0.1, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),
         brr_cfg=dict(cp_x_margin=0.5),
-        main_assigner=dict(
-            type="HungarianLaneAssigner", cls_weight=1.0, point_weight=2.0, iou_weight=3.0),
+        main_assigner=dict( # One-to-Many assigner as main branch
+            type="SimOTALaneAssigner", candidate_topk=4, min_dynamic_k=1, cls_weight=2.0, point_weight=0.0, iou_weight=3.0),
         aux_cfg=dict(
-            enabled=True,
+            enabled=False, # Disable auxiliary branch by setting the enabled=False (Setting it to None won't disable it)
             num_groups=3,
             stages=[0, 1, 2],
             assigners=[
                 dict(type="TopKLaneAssigner", topk=4,
-                     cls_weight=0.0, point_weight=2.0, iou_weight=3.0),
+                        cls_weight=0.0, point_weight=2.0, iou_weight=3.0),
                 dict(type="SimOTALaneAssigner", candidate_topk=10, min_dynamic_k=1,
-                     cls_weight=0.25, point_weight=1.0, iou_weight=3.0),
+                        cls_weight=0.25, point_weight=1.0, iou_weight=3.0),
             ],
             assigner_weights=[1.0, 1.0],
             stage_assigner_ids={"0": [0], "1": [0], "2": [1]},
@@ -108,7 +92,8 @@ model = dict(
             clamp_x=True, clamp_y=True,
         ),
         loss_cfg=dict(
-            use_focal=False,
+            cls_loss_weight=2.0,
+            use_focal=True,
             cls_bg_weight=0.4,
             iou_loss_weight=4.0,
             lane_width=7.5 / 800,        # half-width, paper w_lane = 15/800
@@ -116,24 +101,11 @@ model = dict(
             seg_loss_weight=1.0,
             seg_bg_weight=0.4,
             brr_support_loss_weight=0.2,
-            brr_cp_loss_weight=0.05,
+            brr_cp_loss_weight=0.1,
             brr_support_smooth_l1_beta=1.0,
             brr_cp_smooth_l1_beta=1.0,
             brr_cp_fit_ridge=1e-2,
             brr_loss_stages=[0, 1, 2],
-
-            # "hard" (baseline) | "iou" | "task_aligned"
-            cls_target_mode="iou",
-            aux_cls_target_mode="iou",   # "hard" keeps the auxiliary branch binary
-            qfl_beta=2.0,
-            # task_aligned only: t = s^alpha * u^beta, normalized per GT
-            task_align_alpha=1.0,
-            task_align_beta=6.0,
-            # None disables; 0.7-0.8 is a reasonable starting band
-            ignore_iou_thr=None,
-            # NOTE: quality focal loss is smaller in scale than the weighted CE.
-            # Retune cls_loss_weight after the first run (try 2.0 -> 4.0).
-            cls_loss_weight=2.0,
         ),
         target_adapter=dict(
             lane_keys=None,             # pin after running the probe, e.g. ["lanes"]
@@ -141,16 +113,6 @@ model = dict(
             start_y_convention="auto",  # verified against x validity, locked on batch 1
             length_unit="auto",
         ),
-        gsrc_cfg=None,
-        query_attn_cfg=dict(
-            stages=[0, 1, 2],
-            num_heads=4,
-            use_state_embedding=True,
-            use_pairwise_bias=True,
-            gate_init=0.0,          # 1e-2 to engage it from iteration 0
-            detach_state=True,
-            share_across_stages=False,
-        ), 
     ),
     test_cfg=dict(
         # Default CLRerNet uses conf_threshold=0.41
