@@ -29,7 +29,7 @@ custom_imports = dict(
     allow_failed_imports=False,
 )
 
-cfg_name = "clrbezier_cascade_o2m_r34.py"
+cfg_name = "clrbezier_reproject_cascade_o2m_r34.py"
 
 img_w, img_h, num_points = 800, 320, 72
 _o2m = dict(type="SimOTALaneAssigner", candidate_topk=4, min_dynamic_k=1,
@@ -87,10 +87,17 @@ model = dict(
             min_iou=[0.0, 0.3, 0.5],
             keep_best=True,        # every GT keeps its best pair
             mode="cls_and_reg",    # "cls_only": gated pairs still get regression
-            gate_on="output",      # "input": Cascade R-CNN definition (pair with re-projection)
+            gate_on="input",      # "input": Cascade R-CNN definition (pair with re-projection)
             warmup_iters=1500,     # thresholds ramp from 0
         ),
-        reproject_cfg=None,
+        reproject_cfg=dict(
+            stages=[0, 1],         # stages whose output becomes the next reference
+            ridge=1e-2,            # same ridge as the GT control-point fit
+            min_rows=4,            # fewer visible predicted rows -> keep Bezier reference
+            blend=1.0,             # final weight of the refit
+            warmup_iters=1500,     # blend ramps from 0
+            max_shift_px=20.0,     # per-control-point trust region (None disables)
+        ),
         aux_cfg=dict(
             enabled=False, # Disable Auxiliary branch
             num_groups=3,
