@@ -16,7 +16,9 @@ from .lane_iou import pairwise_lane_iou
 @torch.no_grad()
 def build_cost_cache(pred, target, img_w, img_h, lane_width, lane_width_cost,
                      required=("cls_cost", "point_cost", "iou_cost_assign", "lane_iou_dynamic"),
-                     cls_eps=1e-6):
+                     cls_eps=1e-6, iou_fns=None):
+    """iou_fns: optional {"dynamic": fn(pred, target),
+    "cost": fn(pred, target, start, end)} to replace LaneIoU (e.g. GLIoU)."""
     """pred: [N, 6+R]; target: [M, 6+R] (valid lanes only)."""
     required = set(required)
     cache = {}
@@ -41,15 +43,20 @@ def build_cost_cache(pred, target, img_w, img_h, lane_width, lane_width_cost,
         m = t_valid[None].float()
         cache["point_cost"] = (diff * m).sum(-1) / m.sum(-1).clamp(min=1.0)
 
+    iou_fns = iou_fns or {}
     if "lane_iou_dynamic" in required:
-        iou = pairwise_lane_iou(pred_geo, target_geo, lane_width, img_w, img_h)
+        fn = iou_fns.get("dynamic")
+        iou = (fn(pred_geo, target_geo) if fn is not None
+               else pairwise_lane_iou(pred_geo, target_geo, lane_width, img_w, img_h))
         cache["lane_iou_dynamic"] = torch.nan_to_num(iou, nan=0.0, posinf=0.0, neginf=0.0)
 
     if "iou_cost_assign" in required:
         # Official start_y is image y; LaneIoU start/end are row fractions from the bottom.
         start = (1.0 - pred[:, 2]).clamp(0.0, 1.0)
         end = (start + pred[:, 5].clamp(0.0, 1.0)).clamp(0.0, 1.0)
-        iou = pairwise_lane_iou(pred_geo, target_geo, lane_width_cost, img_w, img_h, start, end)
+        fn = iou_fns.get("cost")
+        iou = (fn(pred_geo, target_geo, start, end) if fn is not None
+               else pairwise_lane_iou(pred_geo, target_geo, lane_width_cost, img_w, img_h, start, end))
         cache["iou_cost_assign"] = 1.0 - torch.nan_to_num(iou, nan=0.0, posinf=0.0, neginf=0.0)
     return cache
 

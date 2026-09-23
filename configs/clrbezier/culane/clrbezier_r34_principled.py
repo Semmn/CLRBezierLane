@@ -66,7 +66,7 @@ model = dict(
         prior_cfg=dict(delta_scale=0.1, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),
         brr_cfg=dict(cp_x_margin=0.5),
         main_assigner=dict( # One-to-Many assigner as main branch
-            type="SimOTALaneAssigner", candidate_topk=4, min_dynamic_k=1, cls_weight=2.0, point_weight=0.0, iou_weight=3.0),
+            type="SimOTALaneAssigner", candidate_topk=4, min_dynamic_k=1, cls_weight=1.0, point_weight=0.0, iou_weight=3.0),
         aux_cfg=dict(
             enabled=False, # Disable auxiliary branch by setting the enabled=False (Setting it to None won't disable it)
             num_groups=3,
@@ -116,7 +116,7 @@ model = dict(
     ),
     test_cfg=dict(
         # Default CLRerNet uses conf_threshold=0.41
-        conf_threshold=0.40,
+        conf_threshold=0.54,
         use_nms=True,
         as_lanes=True,
         extend_bottom=True,

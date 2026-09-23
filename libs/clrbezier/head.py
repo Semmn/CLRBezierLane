@@ -32,6 +32,9 @@ from .lateral import LateralEvidence
 from .query_attention import MaskedQuerySelfAttention
 from .geometry import brr_reference, fit_global_cubic_to_clr_rows, globalize_local_cp, update_brr_state
 from .lane_iou import LaneIoULoss
+from .curve_deformable_roi_gather import (CurveAlignedDeformableROIGather,
+                                            build_clr_curve_reference_points)
+from .gliou import GeneralizedLaneIoULoss, pairwise_generalized_lane_iou
 from .modules import ROIGather, SegDecoder, linear_relu, pool_prior_features
 from .priors import BezierPriorBank, StructuredPriorPerturbation
 
@@ -96,6 +99,8 @@ class CLRBezierHead(_OfficialHead):
         img_w=800,
         img_h=320,
         roi_mid_channels=48,
+        roi_gather_cfg=None,
+        look_forward_twice=False,
         seg_num_classes=5,
         prior_cfg=None,
         brr_cfg=None,
@@ -162,8 +167,27 @@ class CLRBezierHead(_OfficialHead):
         self.cp_x_margin = float(brr_cfg.get("cp_x_margin", 0.5))
 
         # ---- network ----------------------------------------------------------
-        self.roi_gather = ROIGather(self.prior_feat_channels, self.num_priors, self.sample_points,
-                                    self.fc_hidden_dim, self.refine_layers, roi_mid_channels)
+        rg_cfg = dict(roi_gather_cfg or {})
+        rg_type = rg_cfg.pop("type", "ROIGather")
+        rg_common = dict(in_channels=self.prior_feat_channels, num_priors=self.num_priors,
+                         sample_points=self.sample_points, fc_hidden_dim=self.fc_hidden_dim,
+                         refine_layers=self.refine_layers)
+        self.roi_gather_deformable = rg_type == "CurveAlignedDeformableROIGather"
+        if rg_type == "ROIGather":
+            self.roi_gather = ROIGather(mid_channels=roi_mid_channels, **rg_common)
+        elif self.roi_gather_deformable:
+            rg_cfg.setdefault("mid_channels", self.prior_feat_channels)
+            # catconv expects mid_channels * (stage + 1) inputs from convs, which
+            # emit in_channels, so the two must match.
+            if int(rg_cfg["mid_channels"]) != self.prior_feat_channels:
+                raise ValueError("CurveAlignedDeformableROIGather needs "
+                                 "mid_channels == prior_feat_channels")
+            self.deform_curve_samples = int(rg_cfg.get("deform_num_curve_samples", 18))
+            self.zero_init_deformable = bool(rg_cfg.pop("zero_init_outputs", True))
+            self.roi_gather = CurveAlignedDeformableROIGather(**rg_common, **rg_cfg)
+        else:
+            raise ValueError(f"Unknown roi_gather type {rg_type!r}")
+        self.look_forward_twice = bool(look_forward_twice)
         cls_modules, reg_modules = [], []
         for _ in range(num_fc):
             cls_modules += linear_relu(self.fc_hidden_dim)
@@ -293,8 +317,29 @@ class CLRBezierHead(_OfficialHead):
         self.qfl = QualityFocalLoss(float(loss_cfg.get("qfl_beta", 2.0)))
         self.lane_width = float(loss_cfg.get("lane_width", 7.5 / 800))
         self.lane_width_cost = float(loss_cfg.get("lane_width_cost", 30.0 / 800))
-        self.iou_loss = LaneIoULoss(loss_cfg.get("iou_loss_weight", 4.0), self.lane_width,
-                                    self.img_w, self.img_h)
+        self.iou_loss_type = loss_cfg.get("iou_loss_type", "laneiou")  # laneiou | gliou
+        if self.iou_loss_type == "gliou":
+            self.iou_loss = GeneralizedLaneIoULoss(
+                loss_weight=float(loss_cfg.get("iou_loss_weight", 4.0)),
+                lane_width=self.lane_width, img_h=self.img_h, img_w=self.img_w)
+        elif self.iou_loss_type == "laneiou":
+            self.iou_loss = LaneIoULoss(loss_cfg.get("iou_loss_weight", 4.0), self.lane_width,
+                                        self.img_w, self.img_h)
+        else:
+            raise ValueError(f"Unknown iou_loss_type {self.iou_loss_type!r}")
+        # assignment costs may use GLIoU independently of the loss
+        self.cost_iou_type = loss_cfg.get("cost_iou_type", "laneiou")
+        if self.cost_iou_type == "gliou":
+            self.iou_fns = dict(
+                dynamic=lambda p, t: pairwise_generalized_lane_iou(
+                    p, t, self.lane_width, self.img_h, self.img_w),
+                cost=lambda p, t, s, e: pairwise_generalized_lane_iou(
+                    p, t, self.lane_width_cost, self.img_h, self.img_w,
+                    use_pred_start_end=True, pred_start=s, pred_end=e))
+        elif self.cost_iou_type == "laneiou":
+            self.iou_fns = None
+        else:
+            raise ValueError(f"Unknown cost_iou_type {self.cost_iou_type!r}")
         # aligned narrow LaneIoU for the quality gate (1 - loss with weight 1)
         self.gate_iou_fn = LaneIoULoss(1.0, self.lane_width, self.img_w, self.img_h)
         self.seg_loss_weight = float(loss_cfg.get("seg_loss_weight", 1.0))
@@ -335,8 +380,21 @@ class CLRBezierHead(_OfficialHead):
                 nn.init.constant_(m.bias, 0.0)
         for p in list(self.cls_layers.parameters()) + list(self.reg_layers.parameters()):
             nn.init.normal_(p, mean=0.0, std=1.0e-3)
-        nn.init.constant_(self.roi_gather.attention.W.weight, 0.0)
-        nn.init.constant_(self.roi_gather.attention.W.bias, 0.0)
+        if not self.roi_gather_deformable:
+            nn.init.constant_(self.roi_gather.attention.W.weight, 0.0)
+            nn.init.constant_(self.roi_gather.attention.W.bias, 0.0)
+        elif self.zero_init_deformable:
+            # the global init above overwrites the module's own zero-init, which
+            # is what keeps the added branches identity at iteration 0
+            nn.init.zeros_(self.roi_gather.global_output_projection.weight)
+            nn.init.zeros_(self.roi_gather.global_output_projection.bias)
+            sampler = getattr(self.roi_gather, "curve_deformable_sampler", None)
+            for name in ("output_projection", "out_projection", "output_proj"):
+                proj = getattr(sampler, name, None) if sampler is not None else None
+                if isinstance(proj, (nn.Linear, nn.Conv1d, nn.Conv2d)):
+                    nn.init.zeros_(proj.weight)
+                    if proj.bias is not None:
+                        nn.init.zeros_(proj.bias)
         if self.gsrc is not None:
             # restore the identity initialization after the global re-init above
             self.gsrc.zero_init()
@@ -395,7 +453,13 @@ class CLRBezierHead(_OfficialHead):
             pooled = pool_prior_features(feats[stage], prior_xs, self.prior_feat_ys,
                                          self.prior_feat_channels)
             pooled_stages.append(pooled)
-            roi = self.roi_gather(pooled_stages, feats[stage], stage)
+            if self.roi_gather_deformable:
+                ref_pts, ref_mask = build_clr_curve_reference_points(
+                    prior_xs, self.prior_feat_ys, self.deform_curve_samples)
+                roi = self.roi_gather(pooled_stages, feats[stage], stage,
+                                      reference_points=ref_pts, reference_valid_mask=ref_mask)
+            else:
+                roi = self.roi_gather(pooled_stages, feats[stage], stage)
             if self.gsrc is not None:
                 roi = self.gsrc.inject(stage, roi, context_tokens)
             if self.query_attn is not None and stage in self.query_attn_stages:
@@ -436,11 +500,21 @@ class CLRBezierHead(_OfficialHead):
             if stage != self.refine_layers - 1:
                 next_x, next_map = new_x, ref_on_map
                 if self.reproject is not None and stage in self.reproject_stages:
-                    next_x, stats = self.reproject.project(pred.detach(), new_x.detach(),
-                                                           step, self.training)
+                    projected, stats = self.reproject.project(pred.detach(), new_x.detach(),
+                                                              step, self.training)
+                    # keep the gradient path through new_x when LFT is on: the
+                    # re-projection correction itself is a constant
+                    next_x = new_x + (projected - new_x.detach()) if self.look_forward_twice \
+                        else projected
                     next_map = sampling_xs(next_x, self.prior_ys, self.sample_x_indices)
                     reproj_stats.append(stats)
-                cp_x, y_start, on_map = next_x.detach(), new_y.detach(), next_map.detach()
+                if self.look_forward_twice:
+                    # DINO: the next stage's reference keeps the graph, so this
+                    # stage's parameters also receive the next stage's gradient.
+                    # State supervision still uses the detached input state.
+                    cp_x, y_start, on_map = next_x, new_y, next_map
+                else:
+                    cp_x, y_start, on_map = next_x.detach(), new_y.detach(), next_map.detach()
         return preds, states, dict(input_xs=input_xs or None, reproj=reproj_stats)
 
     def gsrc_tokens(self, feats):
@@ -661,7 +735,8 @@ class CLRBezierHead(_OfficialHead):
                 if target.shape[0] == 0:
                     continue
                 cache = build_cost_cache(preds[b].detach(), target, self.img_w, self.img_h,
-                                         self.lane_width, self.lane_width_cost, required)
+                                         self.lane_width, self.lane_width_cost, required,
+                                         iou_fns=self.iou_fns)
                 for a, (assigner, weight) in enumerate(pairs):
                     rows, cols = assigner.assign(cache)
                     reg_rows, reg_cols = rows, cols

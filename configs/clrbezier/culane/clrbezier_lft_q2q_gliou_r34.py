@@ -1,6 +1,9 @@
-# CLRBezierLane-R34 (current Hungarian + collaborative setup) with only
-# reference re-projection added. Isolates the refinement change from the
-# assignment change.
+# (17) HM + CA + SP + LFT + Q2Q Attention + GLIoU
+#
+# Base = clrbezier_collab_perturb_r34.py (HM + CA + SP).
+# Note: the UnLaneDet ablation that ranked these modules used the one-to-one
+# main branch. Re-check them against a one-to-many main branch before
+# concluding they transfer.
 _base_ = [
     "dataset_culane_clrernet.py",
     "../../_base_/default_runtime.py"
@@ -21,8 +24,7 @@ custom_imports = dict(
     ],
     allow_failed_imports=False,
 )
-
-cfg_name = "clrbezier_reproject_r34.py"
+cfg_name = "clrbezier_lft_q2q_gliou_r34.py"
 
 img_w, img_h, num_points = 800, 320, 72
 model = dict(
@@ -68,27 +70,23 @@ model = dict(
         # the shared towers still receive its gradient
         aux_cls_head=True,
         lateral_cfg=None,
+        look_forward_twice=True,
         prior_cfg=dict(delta_scale=0.1, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),
         brr_cfg=dict(cp_x_margin=0.5),
-        reproject_cfg=dict(
-            stages=[0, 1],
-            ridge=1e-2,
-            min_rows=4,
-            blend=1.0,
-            warmup_iters=1500,
-            max_shift_px=20.0,
-        ),
-        main_assigner=dict(
-            type="HungarianLaneAssigner", cls_weight=1.0, point_weight=2.0, iou_weight=3.0),
+        main_assigner=dict(type="HungarianLaneAssigner", cls_weight=1.0, point_weight=2.0, iou_weight=3.0),
+        # per-stage override; stages not listed use main_assigner
+        main_stage_assigners=None,
+        main_quality_gate=None,
+        reproject_cfg=None,
         aux_cfg=dict(
-            enabled=True,
+            enabled=True, # Disable Auxiliary branch
             num_groups=3,
             stages=[0, 1, 2],
             assigners=[
                 dict(type="TopKLaneAssigner", topk=4,
-                     cls_weight=0.0, point_weight=2.0, iou_weight=3.0),
+                        cls_weight=0.0, point_weight=2.0, iou_weight=3.0),
                 dict(type="SimOTALaneAssigner", candidate_topk=10, min_dynamic_k=1,
-                     cls_weight=0.25, point_weight=1.0, iou_weight=3.0),
+                        cls_weight=0.25, point_weight=1.0, iou_weight=3.0),
             ],
             assigner_weights=[1.0, 1.0],
             stage_assigner_ids={"0": [0], "1": [0], "2": [1]},
@@ -105,7 +103,9 @@ model = dict(
             clamp_x=True, clamp_y=True,
         ),
         loss_cfg=dict(
-            use_focal=True,
+            use_focal=False,
+            iou_loss_type="gliou",     # regression loss = 1 - GLIoU
+            cost_iou_type="gliou",     # "laneiou" or "gliou"
             cls_bg_weight=0.4,
             iou_loss_weight=4.0,
             lane_width=7.5 / 800,        # half-width, paper w_lane = 15/800
@@ -139,11 +139,18 @@ model = dict(
             length_unit="auto",
         ),
         gsrc_cfg=None,
-        query_attn_cfg=None
+        query_attn_cfg=dict(
+            stages=[0, 1, 2],
+            num_heads=4,
+            use_state_embedding=True,
+            use_pairwise_bias=True,
+            gate_init=0.0,
+            detach_state=True,
+        ),
     ),
     test_cfg=dict(
         # Default CLRerNet uses conf_threshold=0.41
-        conf_threshold=0.40,
+        conf_threshold=0.80,
         use_nms=True,
         as_lanes=True,
         extend_bottom=True,
@@ -175,3 +182,4 @@ log_config = dict(
         dict(type="TensorboardLoggerHookEpoch"),
     ]
 )
+
