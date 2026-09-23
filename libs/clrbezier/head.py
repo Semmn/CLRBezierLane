@@ -176,12 +176,7 @@ class CLRBezierHead(_OfficialHead):
         if rg_type == "ROIGather":
             self.roi_gather = ROIGather(mid_channels=roi_mid_channels, **rg_common)
         elif self.roi_gather_deformable:
-            rg_cfg.setdefault("mid_channels", self.prior_feat_channels)
-            # catconv expects mid_channels * (stage + 1) inputs from convs, which
-            # emit in_channels, so the two must match.
-            if int(rg_cfg["mid_channels"]) != self.prior_feat_channels:
-                raise ValueError("CurveAlignedDeformableROIGather needs "
-                                 "mid_channels == prior_feat_channels")
+            rg_cfg.setdefault("mid_channels", roi_mid_channels)
             self.deform_curve_samples = int(rg_cfg.get("deform_num_curve_samples", 18))
             self.zero_init_deformable = bool(rg_cfg.pop("zero_init_outputs", True))
             self.roi_gather = CurveAlignedDeformableROIGather(**rg_common, **rg_cfg)
