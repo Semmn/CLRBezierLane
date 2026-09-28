@@ -179,6 +179,14 @@ class CLRBezierHead(_OfficialHead):
             rg_cfg.setdefault("mid_channels", roi_mid_channels)
             self.deform_curve_samples = int(rg_cfg.get("deform_num_curve_samples", 18))
             self.zero_init_deformable = bool(rg_cfg.pop("zero_init_outputs", True))
+            # With look_forward_twice the stage reference keeps its graph, so the
+            # deformable sampling grid (18 x 4 grid_sample points per query, plus
+            # the tangent/normal frame built from the same points) would send a
+            # feature-gradient back into the previous stage's control points on
+            # top of the 36 pooling points. V11 never had that path: it ran
+            # deformable sampling without LFT. Detaching keeps the branch's
+            # behaviour identical and removes the extra path.
+            self.deform_detach_reference = bool(rg_cfg.pop("detach_reference", True))
             self.roi_gather = CurveAlignedDeformableROIGather(**rg_common, **rg_cfg)
         else:
             raise ValueError(f"Unknown roi_gather type {rg_type!r}")
@@ -379,17 +387,14 @@ class CLRBezierHead(_OfficialHead):
             nn.init.constant_(self.roi_gather.attention.W.weight, 0.0)
             nn.init.constant_(self.roi_gather.attention.W.bias, 0.0)
         elif self.zero_init_deformable:
-            # the global init above overwrites the module's own zero-init, which
-            # is what keeps the added branches identity at iteration 0
-            nn.init.zeros_(self.roi_gather.global_output_projection.weight)
-            nn.init.zeros_(self.roi_gather.global_output_projection.bias)
-            sampler = getattr(self.roi_gather, "curve_deformable_sampler", None)
-            for name in ("output_projection", "out_projection", "output_proj"):
-                proj = getattr(sampler, name, None) if sampler is not None else None
-                if isinstance(proj, (nn.Linear, nn.Conv1d, nn.Conv2d)):
-                    nn.init.zeros_(proj.weight)
-                    if proj.bias is not None:
-                        nn.init.zeros_(proj.bias)
+            # The loop above re-initializes every Linear/Conv the head owns,
+            # which destroys the deformable module's own zero-inits: not only
+            # the two output gates, but offset_head, weight_head,
+            # curve_pointwise_conv and point_pooling_score, i.e. everything
+            # that makes the branch start by sampling on the current curve.
+            # (V11 avoided this by running the official init immediately after
+            # CLRHead.__init__, before the research modules were built.)
+            self.roi_gather.zero_init()
         if self.gsrc is not None:
             # restore the identity initialization after the global re-init above
             self.gsrc.zero_init()
@@ -449,8 +454,9 @@ class CLRBezierHead(_OfficialHead):
                                          self.prior_feat_channels)
             pooled_stages.append(pooled)
             if self.roi_gather_deformable:
+                deform_xs = prior_xs.detach() if self.deform_detach_reference else prior_xs
                 ref_pts, ref_mask = build_clr_curve_reference_points(
-                    prior_xs, self.prior_feat_ys, self.deform_curve_samples)
+                    deform_xs, self.prior_feat_ys, self.deform_curve_samples)
                 roi = self.roi_gather(pooled_stages, feats[stage], stage,
                                       reference_points=ref_pts, reference_valid_mask=ref_mask)
             else:

@@ -1,13 +1,11 @@
-# CLRBezierLane-R34, one-to-many main branch with stage-increasing positive
-# quality (Cascade R-CNN) and reference re-projection.
+# Parity + look-forward-twice, one variable at a time.
 #
-# Main branch: SimOTA dynamic-k at every stage (close to CLRerNet's dynamic-k:
-# candidate_topk=4, no point cost), with a per-stage minimum LaneIoU for
-# positives. The collaborative branch is unchanged.
-#
-# Variants from this file:
-#   gate only          -> reproject_cfg=None
-#   re-projection only -> main_quality_gate=None
+# Run this only after clrbezier_deform_parity_r34.py reproduces ~80. It adds
+# back the single change that the port introduced and V11 never had: LFT over a
+# deformable reference. detach_reference=True keeps LFT's gradient on the
+# pooling path (as with the plain ROIGather) and keeps it off the 18 x 4
+# deformable sampling grid. Set detach_reference=False to measure that path on
+# purpose.
 _base_ = [
     "dataset_culane_clrernet.py",
     "../../_base_/default_runtime.py"
@@ -29,11 +27,9 @@ custom_imports = dict(
     allow_failed_imports=False,
 )
 
-cfg_name = "clrbezier_collab_cascade_o2m_r34.py"
+cfg_name = "clrbezier_deform_r34_ep24.py"
 
 img_w, img_h, num_points = 800, 320, 72
-_o2m = dict(type="SimOTALaneAssigner", candidate_topk=4, min_dynamic_k=1,
-            cls_weight=1.0, point_weight=0.0, iou_weight=3.0)
 model = dict(
     type="CLRerNet",
     data_preprocessor=dict(
@@ -65,7 +61,7 @@ model = dict(
         num_points=num_points,
         prior_feat_channels=64,
         fc_hidden_dim=64,
-        num_priors=192, # Number of priors
+        num_priors=35, # Number of priors
         num_fc=2,
         refine_layers=3,
         sample_points=36,
@@ -77,30 +73,44 @@ model = dict(
         # the shared towers still receive its gradient
         aux_cls_head=True,
         lateral_cfg=None,
+        look_forward_twice=False,
+        roi_gather_cfg=dict(
+            type="CurveAlignedDeformableROIGather",
+            mid_channels=64,          # V11 value (= prior_feat_channels)
+            use_conv_activation=True,  # V11: conv -> BN, no ReLU
+            norm_type="BN",
+            global_pool_size=(10, 25),
+            global_dropout=0.1,
+            use_deformable_curve_sampling=True,
+            deformable_stages=None,
+            deform_num_curve_samples=18,
+            deform_num_offsets=4,
+            deform_offset_mode="normal",
+            deform_max_normal_offset=2.0,
+            deform_max_tangent_offset=0.0,
+            use_curve_point_query_interaction=False,
+            zero_init_outputs=True,   # restores the module's full zero-init
+            detach_reference=True,    # no effect while look_forward_twice=False
+        ),
         prior_cfg=dict(delta_scale=0.1, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),
         brr_cfg=dict(cp_x_margin=0.5),
-        main_assigner=_o2m,
+        main_assigner=dict(type="HungarianLaneAssigner", cls_weight=1.0, point_weight=2.0, iou_weight=3.0),
         # per-stage override; stages not listed use main_assigner
-        main_stage_assigners={"0": _o2m, "1": _o2m, "2": _o2m},
-        main_quality_gate=dict(
-            # narrow LaneIoU (~CULane metric IoU); 0.5 = already a metric TP
-            min_iou=[0.0, 0.3, 0.5],
-            keep_best=True,        # every GT keeps its best pair
-            mode="cls_and_reg",    # "cls_only": gated pairs still get regression
-            gate_on="output",      # "input": Cascade R-CNN definition (pair with re-projection)
-            warmup_iters=1500,     # thresholds ramp from 0
-        ),
+        main_stage_assigners=None,
+        main_quality_gate=None,
         reproject_cfg=None,
         aux_cfg=dict(
             enabled=True, # Disable Auxiliary branch
             num_groups=3,
             stages=[0, 1, 2],
             assigners=[
-                dict(type="SimOTALaneAssigner", candidate_topk=4, min_dynamic_k=1,
-                     cls_weight=1.0, point_weight=0.0, iou_weight=3.0),
+                dict(type="TopKLaneAssigner", topk=4,
+                        cls_weight=0.0, point_weight=2.0, iou_weight=3.0),
+                dict(type="SimOTALaneAssigner", candidate_topk=10, min_dynamic_k=1,
+                        cls_weight=0.25, point_weight=1.0, iou_weight=3.0),
             ],
-            assigner_weights=[1.0],
-            stage_assigner_ids={"0": [0], "1": [0], "2": [0]},
+            assigner_weights=[1.0, 1.0],
+            stage_assigner_ids={"0": [0], "1": [0], "2": [1]},
             cls_loss_weight=0.5,
             reg_loss_weight=0.5,
             noise_t=50,
@@ -114,7 +124,9 @@ model = dict(
             clamp_x=True, clamp_y=True,
         ),
         loss_cfg=dict(
-            use_focal=True,
+            use_focal=False,
+            iou_loss_type="laneiou",     # regression loss = 1 - GLIoU
+            cost_iou_type="laneiou",     # "laneiou" or "gliou"
             cls_bg_weight=0.4,
             iou_loss_weight=4.0,
             lane_width=7.5 / 800,        # half-width, paper w_lane = 15/800
@@ -148,11 +160,11 @@ model = dict(
             length_unit="auto",
         ),
         gsrc_cfg=None,
-        query_attn_cfg=None
+        query_attn_cfg=None,
     ),
     test_cfg=dict(
         # Default CLRerNet uses conf_threshold=0.41
-        conf_threshold=0.60,
+        conf_threshold=0.85,
         use_nms=True,
         as_lanes=True,
         extend_bottom=True,
@@ -164,9 +176,8 @@ model = dict(
     ),
 )
 
-
 # Number of epochs
-total_epochs = 36
+total_epochs = 24
 checkpoint_config = dict(interval=total_epochs)
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=total_epochs, val_interval=3)
 val_cfg = dict(type='ValLoop')
@@ -184,4 +195,12 @@ log_config = dict(
         dict(type="TextLoggerHook"),
         dict(type="TensorboardLoggerHookEpoch"),
     ]
+)
+default_hooks = dict(
+    checkpoint=dict(
+        type="CheckpointHook",
+        interval=1,
+        save_begin=max(1, total_epochs - 10),
+        max_keep_ckpts=11,
+    ),
 )

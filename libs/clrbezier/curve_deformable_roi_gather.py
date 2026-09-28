@@ -151,6 +151,7 @@ class CurvePointQueryInteraction(nn.Module):
                                                     dropout=float(dropout), batch_first=True)
         self.attention_dropout = nn.Dropout(float(dropout))
 
+        self.zero_init_residual = bool(zero_init_residual)
         self.residual_scale = nn.Parameter(torch.tensor(float(residual_scale_init), dtype=torch.float32))
 
         if self.use_ffn:
@@ -169,15 +170,25 @@ class CurvePointQueryInteraction(nn.Module):
             self.ffn_dropout = None
             self.register_parameter("ffn_scale", None)
 
-        if zero_init_residual:
-            nn.init.zeros_(self.self_attention.out_proj.weight)
+        self.zero_init()
 
-            if self.self_attention.out_proj.bias is not None:
-                nn.init.zeros_(self.self_attention.out_proj.bias)
+    def zero_init(self):
+        """Re-apply the identity initialization.
 
-            if self.use_ffn:
-                nn.init.zeros_(self.ffn[-1].weight)
-                nn.init.zeros_(self.ffn[-1].bias)
+        A parent head that re-initializes every ``nn.Linear`` / ``nn.Conv*``
+        it owns (the official CLRerNet policy) destroys these zeros, so it
+        must call this afterwards.
+        """
+        if not self.zero_init_residual:
+            return
+        nn.init.zeros_(self.self_attention.out_proj.weight)
+
+        if self.self_attention.out_proj.bias is not None:
+            nn.init.zeros_(self.self_attention.out_proj.bias)
+
+        if self.use_ffn:
+            nn.init.zeros_(self.ffn[-1].weight)
+            nn.init.zeros_(self.ffn[-1].bias)
 
     def forward(self, point_features, geometry_features, valid_mask):
         if point_features.ndim != 4:
@@ -329,14 +340,6 @@ class CurveAlignedDeformableSampler(nn.Module):
         self.offset_head = nn.Linear(hidden_dim, max_feature_levels * self.num_learned_offsets * offset_dimension)
         self.weight_head = nn.Linear(hidden_dim, max_feature_levels * num_offsets)
 
-        # Begin exactly on the current curve.
-        nn.init.zeros_(self.offset_head.weight)
-        nn.init.zeros_(self.offset_head.bias)
-
-        # Initially assign equal weights to coincident samples.
-        nn.init.zeros_(self.weight_head.weight)
-        nn.init.zeros_(self.weight_head.bias)
-
         self.use_point_query_interaction = bool(use_point_query_interaction)
 
         if self.use_point_query_interaction:
@@ -353,10 +356,6 @@ class CurveAlignedDeformableSampler(nn.Module):
             self.curve_encoder_norm = nn.LayerNorm(hidden_dim)
             self.curve_depthwise_conv = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim)
             self.curve_pointwise_conv = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1)
-
-            # Pointwise encoder starts as identity.
-            nn.init.zeros_(self.curve_pointwise_conv.weight)
-            nn.init.zeros_(self.curve_pointwise_conv.bias)
         else:
             self.curve_encoder_norm = None
             self.curve_depthwise_conv = None
@@ -368,16 +367,49 @@ class CurveAlignedDeformableSampler(nn.Module):
             nn.Linear(hidden_dim, 1)
         )
 
-        # Uniform curve-point pooling at initialization.
+        self.output_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.output_dropout = nn.Dropout(float(dropout))
+        self.zero_init_output = bool(zero_init_output)
+
+        self.zero_init()
+
+    def zero_init(self):
+        """Re-apply every identity / uniform initialization this module needs.
+
+        ``offset_head``, ``weight_head``, ``curve_pointwise_conv`` and
+        ``point_pooling_score`` are what make the deformable branch start as
+        "sample exactly on the current curve, weight the samples uniformly,
+        pool the curve uniformly". They are ordinary ``nn.Linear`` / ``nn.Conv1d``
+        layers, so a parent head applying the official CLRerNet
+        ``trunc_normal_`` / ``kaiming_normal_`` policy over ``self.modules()``
+        silently replaces all four with random weights: the branch then samples
+        up to ``max_normal_offset`` feature-map pixels off the lane from the
+        first iteration, with a non-uniform attention over those samples.
+        Re-calling this after such a re-init restores the intended start point.
+        """
+        # Begin exactly on the current curve.
+        nn.init.zeros_(self.offset_head.weight)
+        nn.init.zeros_(self.offset_head.bias)
+
+        # Initially assign equal weights to coincident samples.
+        nn.init.zeros_(self.weight_head.weight)
+        nn.init.zeros_(self.weight_head.bias)
+
+        # Pointwise encoder starts as identity.
+        if self.use_curve_encoder:
+            nn.init.zeros_(self.curve_pointwise_conv.weight)
+            nn.init.zeros_(self.curve_pointwise_conv.bias)
+
+        # Uniform curve-point pooling.
         nn.init.zeros_(self.point_pooling_score[-1].weight)
         nn.init.zeros_(self.point_pooling_score[-1].bias)
 
-        self.output_projection = nn.Linear(hidden_dim, hidden_dim)
-        self.output_dropout = nn.Dropout(float(dropout))
-
-        if zero_init_output:
+        if self.zero_init_output:
             nn.init.zeros_(self.output_projection.weight)
             nn.init.zeros_(self.output_projection.bias)
+
+        if self.point_query_interaction is not None:
+            self.point_query_interaction.zero_init()
 
     @staticmethod
     def _build_curve_frame(
@@ -736,9 +768,6 @@ class CurveAlignedDeformableROIGather(nn.Module):
 
         self.resize = FeatureResize(size=global_pool_size, align_corners=False)
 
-        nn.init.zeros_(self.global_output_projection.weight)
-        nn.init.zeros_(self.global_output_projection.bias)
-
         # -------------------------------------------------------------------------------------
         # Cross-layer prior-feature aggregation
         # -------------------------------------------------------------------------------------
@@ -808,6 +837,20 @@ class CurveAlignedDeformableROIGather(nn.Module):
             )
         else:
             self.curve_deformable_sampler = None
+
+        self.zero_init()
+
+    def zero_init(self):
+        """Restore the zero-initialized output gates of both added branches.
+
+        Equivalent to the official ROIGather's ``attention.W`` zero-init, plus
+        the deformable sampler's internal identity initialization. Call this
+        after any parent-level re-initialization of the head's parameters.
+        """
+        nn.init.zeros_(self.global_output_projection.weight)
+        nn.init.zeros_(self.global_output_projection.bias)
+        if self.curve_deformable_sampler is not None:
+            self.curve_deformable_sampler.zero_init()
 
     def roi_fea(self, roi_features, layer_index):
         if len(roi_features) != layer_index + 1:

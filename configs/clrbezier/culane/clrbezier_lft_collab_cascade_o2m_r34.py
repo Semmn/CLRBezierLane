@@ -29,7 +29,7 @@ custom_imports = dict(
     allow_failed_imports=False,
 )
 
-cfg_name = "clrbezier_collab_cascade_o2m_r34.py"
+cfg_name = "clrbezier_lft_collab_cascade_o2m_r34.py"
 
 img_w, img_h, num_points = 800, 320, 72
 _o2m = dict(type="SimOTALaneAssigner", candidate_topk=4, min_dynamic_k=1,
@@ -73,6 +73,7 @@ model = dict(
         img_h=img_h,
         roi_mid_channels=48,
         seg_num_classes=5,
+        look_forward_twice=True,
         # separate final classification layer for the auxiliary branch;
         # the shared towers still receive its gradient
         aux_cls_head=True,
@@ -152,7 +153,7 @@ model = dict(
     ),
     test_cfg=dict(
         # Default CLRerNet uses conf_threshold=0.41
-        conf_threshold=0.60,
+        conf_threshold=0.59,
         use_nms=True,
         as_lanes=True,
         extend_bottom=True,
