@@ -59,4 +59,5 @@ libs/models/layers/nms/build/
 kernels/selective_scan/build/
 kernels/selective_scan/selective_scan.egg-info/
 
-
+# Lane Visualization Local Script
+lanevis/local_script.sh

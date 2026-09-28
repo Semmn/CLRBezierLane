@@ -31,7 +31,9 @@ from .gsrc import GSRCModule
 from .lateral import LateralEvidence
 from .query_attention import MaskedQuerySelfAttention
 from .geometry import brr_reference, fit_global_cubic_to_clr_rows, globalize_local_cp, update_brr_state
-from .lane_iou import LaneIoULoss
+from .lane_iou import LaneIoULoss, pairwise_lane_iou
+from .preconditioner import ControlPointPreconditioner
+from .ranking import batch_cluster_rank_loss
 from .curve_deformable_roi_gather import (CurveAlignedDeformableROIGather,
                                             build_clr_curve_reference_points)
 from .gliou import GeneralizedLaneIoULoss, pairwise_generalized_lane_iou
@@ -101,6 +103,8 @@ class CLRBezierHead(_OfficialHead):
         roi_mid_channels=48,
         roi_gather_cfg=None,
         look_forward_twice=False,
+        cp_precond_cfg=None,
+        rank_loss_cfg=None,
         seg_num_classes=5,
         prior_cfg=None,
         brr_cfg=None,
@@ -191,6 +195,16 @@ class CLRBezierHead(_OfficialHead):
         else:
             raise ValueError(f"Unknown roi_gather type {rg_type!r}")
         self.look_forward_twice = bool(look_forward_twice)
+        # Control-point preconditioning (off unless configured).
+        self.cp_precond = (ControlPointPreconditioner(n_strips=self.n_strips,
+                                                      **dict(cp_precond_cfg))
+                           if cp_precond_cfg else None)
+        # Pairwise ranking inside NMS duplicate clusters (off unless configured).
+        rank_cfg = dict(rank_loss_cfg or {})
+        self.rank_loss_enabled = bool(rank_loss_cfg) and rank_cfg.pop('enabled', True)
+        self.rank_loss_weight = float(rank_cfg.pop('loss_weight', 1.0))
+        self.rank_loss_stages = set(rank_cfg.pop('stages', [self.refine_layers - 1]))
+        self.rank_loss_kwargs = rank_cfg
         cls_modules, reg_modules = [], []
         for _ in range(num_fc):
             cls_modules += linear_relu(self.fc_hidden_dim)
@@ -443,7 +457,7 @@ class CLRBezierHead(_OfficialHead):
         _, on_map = brr_reference(cp_x, y_start, y_start + one_row, **geo)
 
         pooled_stages, preds, states = [], [], []
-        input_xs, reproj_stats = [], []
+        input_xs, reproj_stats, precond_stats = [], [], []
         step = self._step_cache
         for stage in range(self.refine_layers):
             if self._need_input_xs:
@@ -486,6 +500,15 @@ class CLRBezierHead(_OfficialHead):
             cls_logits = cls_head(cls_f).view(batch_size, num_q, 2).float()
             reg = self.reg_layers(reg_f).view(batch_size, num_q, -1).float()
 
+            if self.cp_precond is not None:
+                # Equalize the per-control-point step over the lane's own
+                # visible span before it is applied; everything downstream,
+                # including the state supervision, sees the corrected delta.
+                gains = self.cp_precond.gains(y_start, reg[..., 1])
+                reg = torch.cat(
+                    [reg[..., :2], reg[..., 2:6] * gains, reg[..., 6:]], dim=-1)
+                precond_stats.append(self.cp_precond.diagnostics(y_start, reg[..., 1]))
+
             new_x, new_y, _, _ = update_brr_state(cp_x, y_start, reg[..., :6],
                                                   self.n_strips, self.cp_x_margin)
             length = reg[..., 1]
@@ -516,7 +539,8 @@ class CLRBezierHead(_OfficialHead):
                     cp_x, y_start, on_map = next_x, new_y, next_map
                 else:
                     cp_x, y_start, on_map = next_x.detach(), new_y.detach(), next_map.detach()
-        return preds, states, dict(input_xs=input_xs or None, reproj=reproj_stats)
+        return preds, states, dict(input_xs=input_xs or None, reproj=reproj_stats,
+                                   precond=precond_stats)
 
     def gsrc_tokens(self, feats):
         """Global context tokens from the coarsest FPN level ([B, H*W, C])."""
@@ -528,7 +552,8 @@ class CLRBezierHead(_OfficialHead):
         tokens = self.gsrc_tokens(feats)
         main_preds, main_states, main_extra = self._refine(feats, clean_cp, tokens)
         out = dict(main_preds=main_preds, main_states=main_states,
-                   main_input_xs=main_extra["input_xs"], reproj=main_extra["reproj"])
+                   main_input_xs=main_extra["input_xs"], reproj=main_extra["reproj"],
+                   precond=main_extra["precond"])
 
         if self.aux_enabled and self.aux_num_groups > 0:
             m = self.aux_num_groups
@@ -622,6 +647,12 @@ class CLRBezierHead(_OfficialHead):
             diag["reproj_shift_px"] = torch.tensor(
                 sum(r["shift_px"] for r in outs["reproj"]) / len(outs["reproj"]), device=dev)
             diag["reproj_blend"] = torch.tensor(outs["reproj"][0]["blend"], device=dev)
+        if outs.get("precond"):
+            # Averaged over stages. Watch precond_clipped: if it sits near 1.0
+            # the max_gain clamp is doing all the work and the correction is
+            # saturated rather than adaptive.
+            for key in outs["precond"][0]:
+                diag[key] = torch.stack([st[key] for st in outs["precond"]]).mean()
 
         if "aux_preds" in outs:
             aux = self._branch_losses(outs["aux_preds"], outs["aux_states"], valid_targets, gt_cps,
@@ -636,12 +667,20 @@ class CLRBezierHead(_OfficialHead):
                         aux_conf_iou_l1=aux["conf_iou_l1"],
                         aux_conf_iou_rank=aux["conf_iou_rank"])
 
+        if self.rank_loss_enabled:
+            rank, rank_stats = self._rank_loss(outs["main_preds"], valid_targets)
+            diag.update(rank_stats)
+        else:
+            rank = None
+
         losses = dict(
             loss_cls=cls * self.cls_loss_weight,
             loss_iou=iou,  # LaneIoULoss already applies iou_loss_weight
             loss_brr_support=sup * self.brr_support_weight,
             loss_brr_cp=cp * self.brr_cp_weight,
         )
+        if rank is not None:
+            losses["loss_rank"] = rank * self.rank_loss_weight
         if seg_gt is not None:
             seg_loss = F.nll_loss(F.log_softmax(outs["seg"], dim=1), seg_gt,
                                   weight=self.seg_class_weights, ignore_index=self.seg_ignore_label)
@@ -649,6 +688,47 @@ class CLRBezierHead(_OfficialHead):
         # Keys without "loss" are logged but not summed by mmengine.
         losses.update(diag)
         return losses
+
+    def _rank_loss(self, preds, valid_targets):
+        """Pairwise ranking over the candidates NMS will compare.
+
+        Quality is the narrow LaneIoU (the width the CULane metric
+        approximates) against the best GT, computed without gradient: this loss
+        supervises the score, never the geometry.
+        """
+        device = preds[0].device
+        total = preds[0].new_zeros(())
+        stats = {"rank_pairs": preds[0].new_zeros(()),
+                 "rank_pair_acc": preds[0].new_zeros(())}
+        counted = 0
+        for stage in sorted(self.rank_loss_stages):
+            if stage >= len(preds):
+                continue
+            pred = preds[stage]
+            score = F.softmax(pred[..., :2].float(), dim=-1)[..., 1]
+            pred_xs = pred[..., 6:].float()
+            with torch.no_grad():
+                quality = torch.zeros_like(score)
+                for b, target in enumerate(valid_targets):
+                    if target.numel() == 0 or target.shape[0] == 0:
+                        continue
+                    geo_p = pred_xs[b] * (float(self.img_w - 1) / float(self.img_w))
+                    geo_t = target[:, 6:] / float(self.img_w)
+                    iou = pairwise_lane_iou(geo_p, geo_t, self.lane_width,
+                                            self.img_w, self.img_h)
+                    quality[b] = torch.nan_to_num(iou, nan=0.0).max(dim=1).values
+            loss, agg = batch_cluster_rank_loss(
+                score, pred_xs, quality,
+                lane_width=self.lane_width, img_w=self.img_w, img_h=self.img_h,
+                **self.rank_loss_kwargs)
+            total = total + loss
+            stats["rank_pairs"] = stats["rank_pairs"] + agg["rank_pairs"]
+            stats["rank_pair_acc"] = stats["rank_pair_acc"] + agg["rank_pair_acc"]
+            counted += 1
+        if counted:
+            total = total / counted
+            stats = {k: v / counted for k, v in stats.items()}
+        return total, stats
 
     def _cls_loss(self, logits, cls_targets, gt_counts, quality=None, ignore=None):
         """logits [B,N,2]; cls_targets [A,B,N] -> per-assigner-image loss [A,B]."""
