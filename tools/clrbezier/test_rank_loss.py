@@ -2,96 +2,161 @@
 
 A ranking loss is exactly the kind of thing that silently trains the wrong
 direction: flip one sign and it still decreases, still looks healthy, and
-degrades the model. These are the checks that catch that, on synthetic data
-with a known answer.
+quietly degrades the model. These are the checks that catch that, on synthetic
+data with a known answer.
+
+Every expectation here is *derived* from the LaneIoU geometry rather than
+hardcoded. The first version of this file asserted a pair count of 3 from
+eyeballing the lane offsets, and the real answer was 2 — the test failed
+against correct code. Deriving it keeps the test honest when the width or the
+threshold changes.
 
     python tools/clrbezier/test_rank_loss.py
 """
+import itertools
+import math
+
 import torch
 
+from libs.clrbezier.lane_iou import pairwise_lane_iou
 from libs.clrbezier.ranking import batch_cluster_rank_loss, cluster_rank_loss
+
+LANE_WIDTH = 7.5 / 800
+IMG_W, IMG_H = 800, 320
 
 
 def straight_lane(x0, slope=0.0, rows=72):
-    """x per row, bottom -> top, normalized."""
+    """x per row, bottom -> top, normalized by img_w - 1."""
     t = torch.linspace(0.0, 1.0, rows)
     return (x0 + slope * t).clamp(0.0, 0.999)
+
+
+def mutual_iou(xs):
+    with torch.no_grad():
+        m = pairwise_lane_iou(xs, xs, LANE_WIDTH, IMG_W, IMG_H)
+    return torch.nan_to_num(m, nan=0.0)
+
+
+def expected_pairs(xs, quality, cluster_iou_thr, margin):
+    """The pairs the rule should select, computed independently of the loss."""
+    m = mutual_iou(xs)
+    out = []
+    for i, j in itertools.permutations(range(xs.shape[0]), 2):
+        if i < j or True:  # oriented: i beats j
+            if m[i, j] > cluster_iou_thr and (quality[i] - quality[j]) > margin:
+                out.append((i, j))
+    return out
+
+
+def report(name, ok):
+    print(("  ok   " if ok else "  FAIL ") + name)
+    return ok
 
 
 def main():
     torch.manual_seed(0)
     ok = True
 
-    # Three near-duplicates of one lane (they will cluster) plus one far away.
-    xs = torch.stack([
-        straight_lane(0.50), straight_lane(0.505), straight_lane(0.495),
-        straight_lane(0.90),
-    ])
+    # Two vertical lanes separated by d, each of half-width w, have
+    # IoU = (2w - d) / (2w + d). At w = 7.5/800 that crosses 0.35 at d = 7.8 px,
+    # so lanes 8 px apart do NOT cluster and lanes 4 px apart do.
+    w = LANE_WIDTH
+    print(f"half-width {w * 800:.1f} px; IoU 0.35 at separation "
+          f"{(1.35 / 1.3) * w * 800:.1f} px\n")
+
+    # Three near-duplicates of one lane plus one far away.
+    xs = torch.stack([straight_lane(0.50), straight_lane(0.505),
+                      straight_lane(0.495), straight_lane(0.90)])
     quality = torch.tensor([0.90, 0.60, 0.30, 0.80])
+    m = mutual_iou(xs)
+    print("mutual LaneIoU:")
+    for row in m.tolist():
+        print("   " + "  ".join(f"{v:5.3f}" for v in row))
+    print()
 
     # 1. Correct ordering must cost less than the reversed one.
     good = torch.tensor([3.0, 2.0, 1.0, 2.5])
     bad = torch.tensor([1.0, 2.0, 3.0, 2.5])
     loss_good, stats_good = cluster_rank_loss(good, xs, quality)
     loss_bad, stats_bad = cluster_rank_loss(bad, xs, quality)
-    print(f"correct order  loss={loss_good:.4f}  pair_acc={stats_good['rank_pair_acc']:.2f}  "
-          f"pairs={int(stats_good['rank_pairs'])}")
-    print(f"reversed order loss={loss_bad:.4f}  pair_acc={stats_bad['rank_pair_acc']:.2f}")
-    if not loss_good < loss_bad:
-        print("FAIL: reversed ordering is not penalized — check the sign of diff")
-        ok = False
-    if not (stats_good["rank_pair_acc"] > 0.99 and stats_bad["rank_pair_acc"] < 0.01):
-        print("FAIL: pair accuracy does not track the ordering")
-        ok = False
+    print(f"correct order  loss={float(loss_good):.4f} "
+          f"pair_acc={float(stats_good['rank_pair_acc']):.2f}")
+    print(f"reversed order loss={float(loss_bad):.4f} "
+          f"pair_acc={float(stats_bad['rank_pair_acc']):.2f}")
+    ok &= report("reversed ordering is penalized", float(loss_good) < float(loss_bad))
+    ok &= report("pair accuracy tracks the ordering",
+                 float(stats_good["rank_pair_acc"]) > 0.99
+                 and float(stats_bad["rank_pair_acc"]) < 0.01)
 
-    # 2. Monotone rescaling must not change the loss. This is the property the
-    #    whole design rests on: the confidence threshold must not move.
-    for transform in (lambda s: s * 7.0, lambda s: s + 5.0, lambda s: torch.sigmoid(s)):
-        rescaled, _ = cluster_rank_loss(transform(good), xs, quality, tau=1e9)
-        base, _ = cluster_rank_loss(good, xs, quality, tau=1e9)
-        if abs(float(rescaled) - float(base)) > 5e-3:
-            print(f"NOTE: loss moved {float(base):.5f} -> {float(rescaled):.5f} under "
-                  "rescaling (expected at finite tau; the *ordering* is what is invariant)")
+    # Closed form, so a silent change to the weighting or temperature shows up.
+    softplus = lambda z: math.log1p(math.exp(z))
+    gaps = [0.90 - 0.60, 0.90 - 0.30]
+    total = sum(gaps)
+    want = sum((g / total) * softplus(-d / 0.5) for g, d in zip(gaps, [1.0, 2.0]))
+    ok &= report(f"loss matches closed form ({want:.4f})",
+                 abs(float(loss_good) - want) < 1e-4)
 
-    # 3. The far-away lane must not be compared with the cluster.
+    # 2. Cluster membership, derived rather than assumed.
+    want_pairs = expected_pairs(xs, quality, 0.35, 0.05)
     _, stats = cluster_rank_loss(good, xs, quality, cluster_iou_thr=0.35)
-    # cluster of 3 -> pairs with quality gap > margin: (0,1), (0,2), (1,2) = 3
-    print(f"pairs formed: {int(stats['rank_pairs'])} (expected 3: the cluster only)")
-    if int(stats["rank_pairs"]) != 3:
-        print("FAIL: cluster membership is wrong — check cluster_iou_thr / pairwise IoU")
-        ok = False
+    print(f"\npairs formed {int(stats['rank_pairs'])}, derived {len(want_pairs)}: "
+          f"{want_pairs}")
+    ok &= report("pair set matches the geometry",
+                 int(stats["rank_pairs"]) == len(want_pairs))
+    ok &= report("the distant lane never joins the cluster",
+                 all(3 not in pair for pair in want_pairs))
 
-    # 4. Near-equal qualities must be skipped rather than supervised as noise.
+    # 3. The threshold is what gates membership: lanes 8 px apart join at 0.25.
+    _, loose = cluster_rank_loss(good, xs, quality, cluster_iou_thr=0.25)
+    ok &= report("lowering cluster_iou_thr admits the 8 px pair",
+                 int(loose["rank_pairs"]) > int(stats["rank_pairs"]))
+
+    # 4. A genuine three-member cluster gives three pairs.
+    tight = torch.stack([straight_lane(0.500), straight_lane(0.503),
+                         straight_lane(0.506)])
+    tight_q = torch.tensor([0.90, 0.60, 0.30])
+    _, tstats = cluster_rank_loss(torch.tensor([3.0, 2.0, 1.0]), tight, tight_q)
+    print(f"\nthree mutually-clustered lanes -> {int(tstats['rank_pairs'])} pairs")
+    ok &= report("a 3-member cluster yields 3 pairs", int(tstats["rank_pairs"]) == 3)
+
+    # 5. Invariance. The loss reads score *differences*, so an additive shift
+    #    leaves it exactly unchanged — that is what keeps the confidence
+    #    threshold from moving. A multiplicative rescale is a sharpness change,
+    #    not a level change, so it does move the loss; only the ordering (and
+    #    hence pair accuracy) is invariant under both.
+    shifted, _ = cluster_rank_loss(good + 5.0, xs, quality)
+    ok &= report("loss is invariant to an additive shift",
+                 abs(float(shifted) - float(loss_good)) < 1e-6)
+    _, scaled_stats = cluster_rank_loss(good * 7.0, xs, quality)
+    ok &= report("pair accuracy is invariant to a positive rescale",
+                 abs(float(scaled_stats["rank_pair_acc"])
+                     - float(stats_good["rank_pair_acc"])) < 1e-6)
+
+    # 6. Near-equal qualities are noise and must be skipped.
     flat = torch.tensor([0.90, 0.89, 0.91, 0.80])
-    _, stats = cluster_rank_loss(good, xs, flat, margin=0.05)
-    print(f"pairs with near-equal quality: {int(stats['rank_pairs'])} (expected 0)")
-    if int(stats["rank_pairs"]) != 0:
-        print("FAIL: the margin is not filtering uninformative pairs")
-        ok = False
+    _, fstats = cluster_rank_loss(good, xs, flat, margin=0.05)
+    ok &= report("the margin filters uninformative pairs",
+                 int(fstats["rank_pairs"]) == 0)
 
-    # 5. Gradient must push the better candidate's score up, the worse one down.
+    # 7. Gradient direction: up for the better candidate, down for the worse.
     scores = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
     loss, _ = cluster_rank_loss(scores, xs[:3], quality[:3])
     loss.backward()
     grad = scores.grad
-    print(f"grad: {grad.tolist()}  (best candidate index 0 should be negative)")
-    if not (grad[0] < 0 and grad[2] > 0):
-        print("FAIL: gradient direction is wrong")
-        ok = False
+    print(f"\ngrad {[round(g, 4) for g in grad.tolist()]}")
+    ok &= report("gradient raises the best candidate and lowers the worst",
+                 bool(grad[0] < 0 and grad[2] > 0))
 
-    # 6. Batch wrapper, and the degenerate cases that occur in real batches.
+    # 8. Batch wrapper and the degenerate cases real batches contain.
     batch_xs = xs.unsqueeze(0).expand(2, -1, -1).contiguous()
-    batch_scores = good.unsqueeze(0).expand(2, -1).contiguous()
-    batch_quality = quality.unsqueeze(0).expand(2, -1).contiguous()
-    loss, agg = batch_cluster_rank_loss(batch_scores, batch_xs, batch_quality)
-    print(f"batch loss={float(loss):.4f} pairs/img={float(agg['rank_pairs']):.1f}")
-
-    empty, agg = batch_cluster_rank_loss(
-        torch.zeros(2, 4), batch_xs, torch.zeros(2, 4))
-    print(f"all-zero quality -> loss={float(empty):.4f} (expected 0, no pairs)")
-    if float(empty) != 0.0:
-        print("FAIL: an image with no usable pairs should contribute nothing")
-        ok = False
+    loss, agg = batch_cluster_rank_loss(
+        good.unsqueeze(0).expand(2, -1).contiguous(), batch_xs,
+        quality.unsqueeze(0).expand(2, -1).contiguous())
+    ok &= report("batch loss matches the per-image loss",
+                 abs(float(loss) - float(loss_good)) < 1e-6)
+    empty, _ = batch_cluster_rank_loss(torch.zeros(2, 4), batch_xs, torch.zeros(2, 4))
+    ok &= report("an image with no usable pairs contributes nothing",
+                 float(empty) == 0.0)
 
     print("\nPASS" if ok else "\nFAILURES ABOVE")
     return 0 if ok else 1

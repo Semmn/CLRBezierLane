@@ -1,41 +1,49 @@
 """Is the localization-quality information in the features at all?
 
+Epistemic vs aleatoric
+----------------------
 The oracle experiment says a perfect scorer would reach ~98 F1 where the model
-reaches ~80. That gap has two very different halves:
+reaches ~80. Either the features contain enough to rank a good lane above a bad
+one and the head fails to extract it (epistemic — fixable by a better scoring
+objective), or the evidence is not there at all (aleatoric — a lane behind a
+bus, a marking too faint to see, an annotation the labeller extrapolated from
+road context; no head recovers that).
 
-* **epistemic** — the features contain enough to tell a good lane from a bad
-  one, but the scoring head does not extract it. Architecture and loss design
-  can recover this.
-* **aleatoric** — the evidence genuinely is not there. A lane behind a bus, a
-  marking too faint to see, an annotation the labeller extrapolated from road
-  context. No head can recover this, and no amount of architecture search will.
+This freezes the trained model, captures the exact vector the classifier sees
+for every prediction, and trains a deliberately over-parameterized probe on it
+with nothing to do but this one task. If the probe cannot out-rank the model's
+own score, the information is not there.
 
-This script measures the split without retraining the detector. It freezes the
-trained model, captures the exact feature vector the classifier sees for every
-prediction, and fits a deliberately over-parameterized quality regressor on it
-with nothing to do but this one task. Then it compares, on held-out *sequences*:
+Two things this version fixes, both of which invalidated the first one
+----------------------------------------------------------------------
+1. **The probe is fitted on the training split, not on validation.** Fitting on
+   val gave the probe a few thousand images from ~19 sequences while the score
+   it was being compared against had been trained on 88k images. That is not a
+   test of what the features contain, it is a test of sample size, and the
+   probe loses it by construction.
 
-    Spearman(model score, true LaneIoU)   vs   Spearman(probe, true LaneIoU)
+2. **The probe is trained on the pairwise objective it is evaluated on.**
+   Training it to regress absolute LaneIoU and then scoring it on within-cluster
+   ordering is exactly the calibration-versus-ranking mistake this whole line of
+   work is about: absolute-IoU regression spends its capacity on the easy global
+   axis (lane vs background) and none on the hard local one (which of these
+   near-identical duplicates is better). ``--objective absolute`` keeps the old
+   behaviour for comparison.
 
-and the same restricted to NMS duplicate clusters, which is the ordering F1
-actually depends on.
+Two controls run by default, because a probe result with no control is not
+evidence:
 
-Reading the result
-------------------
-* Probe clearly beats the model's own score -> epistemic. The information is
-  in the features and a better scoring objective can reach it. The cluster-
-  restricted number tells you how much is reachable where it matters.
-* Probe barely beats it -> aleatoric. The ceiling is the dataset, not the
-  head. That is a reportable finding, and a reason to stop adding modules.
-
-Sequence-grouped splitting matters: CULane frames are consecutive, so a random
-per-image split leaks near-duplicate frames into the holdout and the probe
-scores itself on data it has effectively seen.
+* **shuffled** — the same probe on permuted targets. Must land at 0.5. Anything
+  else means sequence leakage between fit and evaluation.
+* **score-as-feature** — the probe with the model's own score appended to its
+  input. Must be at least as good as the score alone. If it is worse, the probe
+  is underfit and its headline number means nothing.
 
 Usage:
-    python tools/clrbezier/probe_information.py \
-        configs/clrbezier/culane/clrbezier_collab_perturb_r34.py \
-        work_dirs/.../epoch_15.pth --max-images 4000
+    python tools/clrbezier/probe_information.py \\
+        configs/clrbezier/culane/clrbezier_collab_perturb_r34.py \\
+        work_dirs/.../epoch_15.pth \\
+        --max-fit-images 12000 --max-eval-images 4000
 """
 from __future__ import annotations
 
@@ -46,6 +54,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mmengine.config import Config
 from mmengine.registry import init_default_scope
 from mmengine.runner import Runner
@@ -67,8 +76,7 @@ def spearman(a, b):
 
 
 def auroc(score, label):
-    """Mann-Whitney AUC: P(score of a true positive > score of a negative)."""
-    label = label.astype(bool)
+    label = np.asarray(label).astype(bool)
     n_pos, n_neg = int(label.sum()), int((~label).sum())
     if n_pos == 0 or n_neg == 0:
         return float("nan")
@@ -76,53 +84,39 @@ def auroc(score, label):
     return float((ranks[label].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
 
 
-def cluster_spearman(score, quality, xs, image_id, cluster_iou_thr, lane_width,
-                     img_w, img_h, device, max_images=2000):
-    """Rank correlation restricted to predictions that compete in NMS.
+def pair_accuracy(score, pairs):
+    """Fraction of (better, worse) pairs the score orders correctly."""
+    if len(pairs) == 0:
+        return float("nan")
+    return float((score[pairs[:, 0]] > score[pairs[:, 1]]).mean())
 
-    A global correlation counts easy comparisons between an obvious lane and
-    obvious background. NMS never makes those; it chooses between near
-    duplicates, and that is the only comparison that decides F1.
-    """
-    concordant = discordant = 0
-    for image in np.unique(image_id)[:max_images]:
-        sel = np.flatnonzero(image_id == image)
-        if sel.size < 2:
-            continue
-        rows = torch.from_numpy(xs[sel]).float().to(device)
-        with torch.no_grad():
-            mutual = pairwise_lane_iou(rows, rows, lane_width, img_w, img_h)
-            mutual = torch.nan_to_num(mutual, nan=0.0).cpu().numpy()
-        s, q = score[sel], quality[sel]
-        n = sel.size
-        for i in range(n):
-            for j in range(i + 1, n):
-                if mutual[i, j] <= cluster_iou_thr:
-                    continue
-                if abs(q[i] - q[j]) < 0.05:
-                    continue
-                right = (s[i] > s[j]) == (q[i] > q[j])
-                concordant += int(right)
-                discordant += int(not right)
-    total = concordant + discordant
-    if total == 0:
-        return float("nan"), 0
-    return concordant / total, total
+
+def bootstrap_pair_accuracy(score, pairs, image_of_pair, iters=200, seed=0):
+    """CI by resampling *images*, since pairs inside one image are dependent."""
+    if len(pairs) == 0:
+        return float("nan"), float("nan")
+    rng = np.random.RandomState(seed)
+    images = np.unique(image_of_pair)
+    by_image = {img: np.flatnonzero(image_of_pair == img) for img in images}
+    samples = []
+    for _ in range(iters):
+        picked = rng.choice(images, size=len(images), replace=True)
+        idx = np.concatenate([by_image[img] for img in picked])
+        samples.append(pair_accuracy(score, pairs[idx]))
+    return float(np.percentile(samples, 2.5)), float(np.percentile(samples, 97.5))
 
 
 # ------------------------------------------------------------------ dataflow
-def build_gt_dataloader(cfg):
-    """Validation data with deterministic augmentation *and* ground truth.
+def _with_gt_and_val_aug(loader_cfg, cfg, shuffle):
+    """Deterministic augmentation *and* ground truth, from any dataloader cfg.
 
     The val pipeline drops the GT keys because inference does not need them, so
     this borrows the training pipeline (which packs them) and swaps its
-    albumentation list for the validation one. Nothing random is left.
+    albumentation list for the validation one.
     """
-    loader = copy.deepcopy(cfg.val_dataloader)
+    loader = copy.deepcopy(loader_cfg)
     train_pipeline = copy.deepcopy(cfg.train_dataloader.dataset.pipeline)
-    val_pipeline = cfg.val_dataloader.dataset.pipeline
-
-    val_al = next((t.get("pipelines") for t in val_pipeline
+    val_al = next((t.get("pipelines") for t in cfg.val_dataloader.dataset.pipeline
                    if t.get("type") == "albumentation"), None)
     if val_al is not None:
         for transform in train_pipeline:
@@ -130,21 +124,107 @@ def build_gt_dataloader(cfg):
                 transform["pipelines"] = copy.deepcopy(val_al)
     loader.dataset.pipeline = train_pipeline
     loader.dataset.test_mode = False
-    loader.sampler = dict(type="DefaultSampler", shuffle=False)
+    loader.sampler = dict(type="DefaultSampler", shuffle=shuffle)
     return Runner.build_dataloader(loader)
 
 
 def sequence_of(filename):
     """CULane path -> the driving session it came from.
 
-    e.g. ``.../driver_23_30frame/05151649_0422.MP4/00030.jpg`` ->
+    ``.../driver_23_30frame/05151649_0422.MP4/00030.jpg`` ->
     ``driver_23_30frame/05151649_0422.MP4``. Consecutive frames share it, which
-    is exactly what must not straddle the split.
+    is what must not straddle a split.
     """
     parts = os.path.normpath(str(filename)).split(os.sep)
     return "/".join(parts[-3:-1]) if len(parts) >= 3 else str(filename)
 
 
+@torch.no_grad()
+def collect(model, head, loader, device, feature_key, captured, max_images, tag):
+    feats, scores, quals, xs_all, groups, image_ids = [], [], [], [], [], []
+    seen = 0
+    for data in loader:
+        data = model.data_preprocessor(data, False)
+        pyramid = model.extract_feat(data["inputs"])
+        outs = head(pyramid)                       # eval -> StagePredictions
+
+        pred_xs = outs["xs"].float()
+        score = torch.softmax(outs["cls_logits"].float(), dim=-1)[..., 1]
+        batch, num_q = score.shape
+
+        lanes = head.target_adapter.extract_lanes(data["data_samples"], device)
+        quality = torch.zeros_like(score)
+        for b in range(batch):
+            target = lanes[b][lanes[b][:, 1] == 1]
+            if target.shape[0] == 0:
+                continue
+            geo_p = pred_xs[b] * (float(head.img_w - 1) / float(head.img_w))
+            geo_t = target[:, 6:] / float(head.img_w)
+            iou = pairwise_lane_iou(geo_p, geo_t, head.lane_width, head.img_w, head.img_h)
+            quality[b] = torch.nan_to_num(iou, nan=0.0).max(dim=1).values
+
+        feats.append(captured[feature_key].view(batch, num_q, -1).cpu().numpy())
+        scores.append(score.cpu().numpy())
+        quals.append(quality.cpu().numpy())
+        xs_all.append(pred_xs.cpu().numpy())
+        for b in range(batch):
+            name = data["data_samples"][b].metainfo.get("filename", f"{tag}{seen + b}")
+            groups.extend([sequence_of(name)] * num_q)
+            image_ids.extend([f"{tag}{seen + b}"] * num_q)
+        seen += batch
+        if seen >= max_images:
+            break
+        if seen % 1000 < batch:
+            print(f"  [{tag}] {seen} images", flush=True)
+
+    dim = feats[0].shape[-1]
+    return dict(
+        feat=np.concatenate(feats).reshape(-1, dim),
+        score=np.concatenate(scores).reshape(-1),
+        quality=np.concatenate(quals).reshape(-1),
+        xs=np.concatenate(xs_all).reshape(-1, xs_all[0].shape[-1]),
+        groups=np.array(groups),
+        image_ids=np.array(image_ids),
+        num_images=seen,
+    )
+
+
+def build_pairs(data, head, device, cluster_iou_thr, margin, max_images=None):
+    """Oriented (better, worse) pairs among predictions that compete in NMS.
+
+    A global correlation is inflated by easy lane-vs-background comparisons.
+    NMS never makes those: it chooses between near-duplicates, and that is the
+    only comparison that decides which lane survives.
+    """
+    pairs, pair_image, decisive = [], [], []
+    images = np.unique(data["image_ids"])
+    if max_images is not None:
+        images = images[:max_images]
+    for image in images:
+        sel = np.flatnonzero(data["image_ids"] == image)
+        if sel.size < 2:
+            continue
+        rows = torch.from_numpy(data["xs"][sel]).float().to(device)
+        with torch.no_grad():
+            mutual = pairwise_lane_iou(rows, rows, head.lane_width,
+                                       head.img_w, head.img_h)
+            mutual = torch.nan_to_num(mutual, nan=0.0).cpu().numpy()
+        q = data["quality"][sel]
+        gap = q[:, None] - q[None, :]
+        competes = (mutual > cluster_iou_thr) & ~np.eye(sel.size, dtype=bool)
+        better = np.argwhere(competes & (gap > margin))
+        for i, j in better:
+            pairs.append((sel[i], sel[j]))
+            pair_image.append(image)
+            # A pair only changes the metric if choosing wrongly turns a true
+            # positive into a false one. Both members above 0.5 -> NMS can pick
+            # either and still score a TP.
+            decisive.append(bool(q[i] > 0.5 >= q[j]))
+    return (np.array(pairs, dtype=np.int64).reshape(-1, 2),
+            np.array(pair_image), np.array(decisive, dtype=bool))
+
+
+# --------------------------------------------------------------------- probe
 class Probe(nn.Module):
     """Deliberately over-parameterized: the question is whether the information
     is present, not whether a small head can find it."""
@@ -162,52 +242,65 @@ class Probe(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-def train_probe(feat, target, groups, device, epochs=40, batch=4096, lr=1e-3, seed=0):
+def fit_probe(fit_feat, fit_target, fit_pairs, eval_feat, device,
+              objective="pairwise", epochs=30, batch=8192, lr=1e-3, tau=1.0, seed=0):
     torch.manual_seed(seed)
-    rng = np.random.RandomState(seed)
-    uniq = np.unique(groups)
-    rng.shuffle(uniq)
-    holdout = set(uniq[: max(1, len(uniq) // 5)].tolist())
-    is_hold = np.array([g in holdout for g in groups])
+    x = torch.from_numpy(fit_feat).float()
+    mean, std = x.mean(0, keepdim=True), x.std(0, keepdim=True).clamp_min(1e-5)
+    x = ((x - mean) / std).to(device)
 
-    xf = torch.from_numpy(feat[~is_hold]).float()
-    yf = torch.from_numpy(target[~is_hold]).float()
-    mean, std = xf.mean(0, keepdim=True), xf.std(0, keepdim=True).clamp_min(1e-5)
-
-    model = Probe(feat.shape[1]).to(device)
+    model = Probe(fit_feat.shape[1]).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-    n = xf.shape[0]
-    for epoch in range(epochs):
-        model.train()
-        order = torch.randperm(n)
-        for start in range(0, n, batch):
-            idx = order[start:start + batch]
-            xb = ((xf[idx] - mean) / std).to(device)
-            yb = yf[idx].to(device)
-            loss = nn.functional.binary_cross_entropy_with_logits(model(xb), yb)
-            opt.zero_grad(); loss.backward(); opt.step()
-        sched.step()
+
+    if objective == "pairwise":
+        if len(fit_pairs) == 0:
+            raise SystemExit("no cluster pairs in the fit split; lower --cluster-iou")
+        pairs = torch.from_numpy(fit_pairs).long().to(device)
+        n = pairs.shape[0]
+        for _ in range(epochs):
+            model.train()
+            order = torch.randperm(n, device=device)
+            for start in range(0, n, batch):
+                idx = pairs[order[start:start + batch]]
+                out = model(x[idx.reshape(-1)]).view(-1, 2)
+                loss = F.softplus(-(out[:, 0] - out[:, 1]) / tau).mean()
+                opt.zero_grad(); loss.backward(); opt.step()
+            sched.step()
+    else:
+        y = torch.from_numpy(fit_target).float().to(device)
+        n = x.shape[0]
+        for _ in range(epochs):
+            model.train()
+            order = torch.randperm(n, device=device)
+            for start in range(0, n, batch):
+                idx = order[start:start + batch]
+                loss = F.binary_cross_entropy_with_logits(model(x[idx]), y[idx])
+                opt.zero_grad(); loss.backward(); opt.step()
+            sched.step()
 
     model.eval()
     with torch.no_grad():
-        xh = ((torch.from_numpy(feat[is_hold]).float() - mean) / std).to(device)
-        pred = torch.sigmoid(model(xh)).cpu().numpy()
-    return pred, is_hold
+        xe = ((torch.from_numpy(eval_feat).float() - mean) / std).to(device)
+        out = torch.cat([model(xe[i:i + 65536]) for i in range(0, xe.shape[0], 65536)])
+    return out.cpu().numpy()
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("config")
     ap.add_argument("checkpoint")
-    ap.add_argument("--max-images", type=int, default=4000)
-    ap.add_argument("--feature", choices=["roi", "tower"], default="roi",
-                    help="roi = the pooled feature entering the cls tower; "
-                         "tower = the vector the final cls layer sees")
+    ap.add_argument("--max-fit-images", type=int, default=12000,
+                    help="images from the TRAIN split used to fit the probe")
+    ap.add_argument("--max-eval-images", type=int, default=4000,
+                    help="images from the VAL split used to score it")
+    ap.add_argument("--objective", choices=["pairwise", "absolute"], default="pairwise")
+    ap.add_argument("--feature", choices=["roi", "tower"], default="roi")
     ap.add_argument("--cluster-iou", type=float, default=0.35)
+    ap.add_argument("--margin", type=float, default=0.05)
+    ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--epochs", type=int, default=40)
-    ap.add_argument("--dump", help="optional .npz to save the raw arrays")
+    ap.add_argument("--dump", help="optional .npz of the raw arrays")
     args = ap.parse_args()
 
     cfg = Config.fromfile(args.config)
@@ -229,105 +322,155 @@ def main():
     handles = [head.cls_modules[0].register_forward_pre_hook(grab("roi")),
                head.cls_layers.register_forward_pre_hook(grab("tower"))]
 
-    loader = build_gt_dataloader(cfg)
+    # Fit on train (shuffled so a capped subset spans many sequences),
+    # evaluate on val (ordered, deterministic).
+    fit_loader = _with_gt_and_val_aug(cfg.train_dataloader, cfg, shuffle=True)
+    eval_loader = _with_gt_and_val_aug(cfg.val_dataloader, cfg, shuffle=False)
 
-    feats, scores, quals, xs_all, groups, image_ids = [], [], [], [], [], []
-    seen = 0
-    with torch.no_grad():
-        for data in loader:
-            data = model.data_preprocessor(data, False)
-            pyramid = model.extract_feat(data["inputs"])
-            outs = head(pyramid)                      # eval -> StagePredictions
-
-            pred_xs = outs["xs"].float()              # [B, K, R], final stage
-            score = torch.softmax(outs["cls_logits"].float(), dim=-1)[..., 1]
-            batch, num_q = score.shape
-
-            lanes = head.target_adapter.extract_lanes(data["data_samples"], device)
-            quality = torch.zeros_like(score)
-            for b in range(batch):
-                target = lanes[b][lanes[b][:, 1] == 1]
-                if target.shape[0] == 0:
-                    continue
-                geo_p = pred_xs[b] * (float(head.img_w - 1) / float(head.img_w))
-                geo_t = target[:, 6:] / float(head.img_w)
-                iou = pairwise_lane_iou(geo_p, geo_t, head.lane_width,
-                                        head.img_w, head.img_h)
-                quality[b] = torch.nan_to_num(iou, nan=0.0).max(dim=1).values
-
-            feature = captured[args.feature].view(batch, num_q, -1)
-            feats.append(feature.cpu().numpy())
-            scores.append(score.cpu().numpy())
-            quals.append(quality.cpu().numpy())
-            xs_all.append(pred_xs.cpu().numpy())
-            for b in range(batch):
-                name = data["data_samples"][b].metainfo.get("filename", f"img{seen + b}")
-                groups.extend([sequence_of(name)] * num_q)
-                image_ids.extend([seen + b] * num_q)
-            seen += batch
-            if seen >= args.max_images:
-                break
+    print("collecting fit split (train)...")
+    fit = collect(model, head, fit_loader, device, args.feature, captured,
+                  args.max_fit_images, "fit")
+    print("collecting eval split (val)...")
+    ev = collect(model, head, eval_loader, device, args.feature, captured,
+                 args.max_eval_images, "ev")
     for handle in handles:
         handle.remove()
 
-    feat = np.concatenate(feats).reshape(-1, feats[0].shape[-1])
-    score = np.concatenate(scores).reshape(-1)
-    quality = np.concatenate(quals).reshape(-1)
-    xs = np.concatenate(xs_all).reshape(-1, xs_all[0].shape[-1])
-    groups = np.array(groups)
-    image_ids = np.array(image_ids)
+    overlap = set(fit["groups"]) & set(ev["groups"])
+    print(f"\nfit : {fit['num_images']} images, {fit['feat'].shape[0]} predictions, "
+          f"{len(set(fit['groups']))} sequences")
+    print(f"eval: {ev['num_images']} images, {ev['feat'].shape[0]} predictions, "
+          f"{len(set(ev['groups']))} sequences")
+    print(f"sequences in both splits: {len(overlap)}")
+    print(f"eval predictions with LaneIoU > 0.5: {(ev['quality'] > 0.5).mean():.1%} "
+          f"({(ev['quality'] > 0.5).sum() / max(1, ev['num_images']):.1f} per image)")
 
-    print(f"\n{seen} images, {feat.shape[0]} predictions, "
-          f"{feat.shape[1]}-d {args.feature} features, "
-          f"{len(np.unique(groups))} sequences")
-    print(f"predictions with LaneIoU > 0.5: {(quality > 0.5).mean():.1%}")
+    print("\nbuilding NMS clusters...")
+    fit_pairs, _, _ = build_pairs(fit, head, device, args.cluster_iou, args.margin)
+    eval_pairs, eval_pair_image, eval_decisive = build_pairs(
+        ev, head, device, args.cluster_iou, args.margin)
+    print(f"fit pairs {len(fit_pairs)}, eval pairs {len(eval_pairs)} "
+          f"({eval_decisive.sum()} decisive, {eval_decisive.mean():.1%})")
+
+    print(f"training probe ({args.objective})...")
+    probe = fit_probe(fit["feat"], fit["quality"], fit_pairs, ev["feat"], device,
+                      objective=args.objective, epochs=args.epochs)
+
+    # Null 1: identical data, identical clusters, random *orientation*. The
+    # probe cannot beat chance on this, so anything above 0.5 is leakage.
+    # (The previous version trained on a symmetric pair set instead, which is
+    # a contradictory objective rather than a random one, and read 0.54.)
+    rng = np.random.RandomState(0)
+    flipped = fit_pairs.copy()
+    if len(flipped):
+        flip = rng.rand(len(flipped)) < 0.5
+        flipped[flip] = flipped[flip][:, ::-1]
+    control_shuffled = fit_probe(fit["feat"], fit["quality"], flipped, ev["feat"],
+                                 device, objective=args.objective, epochs=args.epochs)
+
+    # Null 2: no training at all. A randomly initialized network is still a
+    # function of the features, so this measures how much ordering the feature
+    # geometry gives away for free. It is the floor every other number should
+    # be read against — not 0.5.
+    torch.manual_seed(1234)
+    untrained = Probe(ev["feat"].shape[1]).to(device).eval()
+    with torch.no_grad():
+        xe = torch.from_numpy(ev["feat"]).float()
+        xe = ((xe - xe.mean(0, keepdim=True)) / xe.std(0, keepdim=True).clamp_min(1e-5)).to(device)
+        control_random = torch.cat([untrained(xe[i:i + 65536])
+                                    for i in range(0, xe.shape[0], 65536)]).cpu().numpy()
+
+    fit_plus = np.concatenate([fit["feat"], fit["score"][:, None]], axis=1)
+    ev_plus = np.concatenate([ev["feat"], ev["score"][:, None]], axis=1)
+    control_score = fit_probe(fit_plus, fit["quality"], fit_pairs, ev_plus, device,
+                              objective=args.objective, epochs=args.epochs)
 
     if args.dump:
-        np.savez_compressed(args.dump, feat=feat, score=score, quality=quality,
-                            xs=xs, groups=groups, image_ids=image_ids)
+        np.savez_compressed(args.dump, **{f"eval_{k}": v for k, v in ev.items()
+                                          if isinstance(v, np.ndarray)},
+                            probe=probe, eval_pairs=eval_pairs)
         print(f"raw arrays -> {args.dump}")
 
-    probe_pred, is_hold = train_probe(feat, quality, groups, device, epochs=args.epochs)
+    label = ev["quality"] > 0.5
+    print(f"\n{'':26} {'Spearman':>10} {'AUROC>0.5':>11}   (global — easy comparisons)")
+    print("-" * 64)
+    series = (("model score", ev["score"]), ("probe", probe),
+              ("probe + score feature", control_score),
+              ("null: random orientation", control_shuffled),
+              ("null: untrained network", control_random))
+    for name, s in series:
+        print(f"{name:26} {spearman(s, ev['quality']):10.4f} {auroc(s, label):11.4f}")
 
-    s_hold, q_hold = score[is_hold], quality[is_hold]
-    xs_hold, img_hold = xs[is_hold], image_ids[is_hold]
-    label = q_hold > 0.5
-
-    print(f"\nheld-out sequences: {len(np.unique(groups[is_hold]))}, "
-          f"{is_hold.sum()} predictions\n")
-    print(f"{'':22} {'Spearman':>10} {'AUROC>0.5':>11}")
-    print("-" * 46)
-    print(f"{'model score':22} {spearman(s_hold, q_hold):10.4f} {auroc(s_hold, label):11.4f}")
-    print(f"{'probe on features':22} {spearman(probe_pred, q_hold):10.4f} "
-          f"{auroc(probe_pred, label):11.4f}")
-
-    model_cluster, n_pairs = cluster_spearman(
-        s_hold, q_hold, xs_hold, img_hold, args.cluster_iou,
-        head.lane_width, head.img_w, head.img_h, device)
-    probe_cluster, _ = cluster_spearman(
-        probe_pred, q_hold, xs_hold, img_hold, args.cluster_iou,
-        head.lane_width, head.img_w, head.img_h, device)
-
-    print(f"\nPairwise accuracy inside NMS clusters ({n_pairs} supervised pairs)")
+    print(f"\nPairwise accuracy inside NMS clusters — {len(eval_pairs)} pairs")
     print("this is the ordering F1 depends on; 0.5 = coin flip")
-    print(f"  model score        {model_cluster:.4f}")
-    print(f"  probe on features  {probe_cluster:.4f}")
+    print("-" * 64)
+    results, decisive_results = {}, {}
+    for name, s in series:
+        acc = pair_accuracy(s, eval_pairs)
+        lo, hi = bootstrap_pair_accuracy(s, eval_pairs, eval_pair_image)
+        results[name] = acc
+        print(f"  {name:26} {acc:.4f}   95% CI [{lo:.4f}, {hi:.4f}]")
 
-    gain = probe_cluster - model_cluster
-    print()
-    if not np.isfinite(gain):
-        print("Too few competing pairs to judge; raise --max-images.")
-    elif gain > 0.05:
-        print(f"EPISTEMIC: the probe recovers {gain:+.3f} cluster pair accuracy from the")
-        print("same features the head already has. A better scoring objective can reach it.")
+    if eval_decisive.any():
+        print(f"\nRestricted to DECISIVE pairs — {int(eval_decisive.sum())} of them, "
+              f"where one member is above IoU 0.5 and the other is not.")
+        print("Only these can turn a true positive into a false one; the rest are")
+        print("both-good pairs where NMS cannot hurt the metric whichever it keeps.")
+        print("-" * 64)
+        dec_pairs = eval_pairs[eval_decisive]
+        dec_image = eval_pair_image[eval_decisive]
+        for name, s in series:
+            acc = pair_accuracy(s, dec_pairs)
+            lo, hi = bootstrap_pair_accuracy(s, dec_pairs, dec_image)
+            decisive_results[name] = acc
+            print(f"  {name:26} {acc:.4f}   95% CI [{lo:.4f}, {hi:.4f}]")
+
+    print("\n" + "=" * 64)
+    n_eval_seq = len(set(ev["groups"]))
+    if overlap:
+        print(f"INVALID: {len(overlap)} sequences appear in both splits. CULane frames")
+        print("are consecutive, so the probe has effectively seen the eval data.")
+        return 1
+    leak = results["null: random orientation"] - 0.5
+    if abs(leak) > 0.02:
+        print(f"INVALID: the random-orientation null reads "
+              f"{results['null: random orientation']:.3f}, not ~0.5 ({leak:+.3f}).")
+        print("Something leaks between fit and evaluation; the headline is meaningless.")
+        return 1
+    if results["probe + score feature"] < results["model score"] - 0.02:
+        print("INCONCLUSIVE: the probe cannot even match the score when handed the score")
+        print("as an input feature, so it is underfit. Raise --epochs or --max-fit-images")
+        print("before reading anything into the comparison.")
+        return 1
+    if n_eval_seq < 8:
+        print(f"UNDERPOWERED: only {n_eval_seq} evaluation sequences. Raise")
+        print("--max-eval-images, or point the eval loader at the test list.")
+
+    gain = results["probe"] - results["model score"]
+    floor = results["null: untrained network"]
+    print(f"NMS picks the better duplicate {results['model score']:.1%} of the time.")
+    print(f"a random function of the same features already gets {floor:.1%}, so that,")
+    print("not 0.5, is the floor these numbers sit above.")
+    span = max(1e-6, 1.0 - floor)
+    print(f"  model score {(results['model score'] - floor) / span:.1%} of the way "
+          f"from that floor to perfect")
+    print(f"  probe       {(results['probe'] - floor) / span:.1%}")
+    print(f"probe - model, inside clusters: {gain:+.4f} "
+          f"({gain / max(1e-6, 1 - results['model score']):.1%} of what is left)")
+    if decisive_results:
+        dgain = decisive_results["probe"] - decisive_results["model score"]
+        print(f"probe - model, DECISIVE pairs only: {dgain:+.4f}   <- the number that")
+        print("   bounds what a ranking loss can buy in F1")
+    if gain > 0.05:
+        print("\nEPISTEMIC: the features carry ordering information the score does not use.")
+        print("A ranking objective on the score has something to reach.")
     elif gain > 0.02:
-        print(f"MIXED: {gain:+.3f}. Some headroom, but most of the oracle gap is not in")
-        print("these features. Expect small gains from scoring work.")
+        print("\nMIXED: some headroom, most of the oracle gap is not in these features.")
     else:
-        print(f"ALERT — ALEATORIC: {gain:+.3f}. An over-parameterized head with nothing to")
-        print("do but this task cannot rank better than your score does. The oracle gap is")
-        print("the dataset, not the architecture. This is a result worth reporting.")
+        print("\nALEATORIC: a probe trained directly on this ordering, on the same data the")
+        print("detector saw, cannot beat the score. The gap is the dataset, not the head.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
