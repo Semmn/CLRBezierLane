@@ -193,6 +193,32 @@ def globalize_local_cp(control_points, margin, eps=1e-4, cp_frame="global"):
     return cp_x, y_start
 
 
+def reparam_cp_to_frame(cp_x, ratio):
+    """Express a cubic's control points in a frame whose end sits at ``ratio``.
+
+    Both frames start at the image top, so the map between their Bernstein
+    parameters is t_other = ratio * t_this, and de Casteljau subdivision at
+    ``ratio`` gives the exact control points of the same curve. Valid for
+    ratio > 1 too, where it is an extrapolation of the same cubic.
+
+    Needed because with cp_frame="anchored" the GT control points are fitted in
+    the GT's own frame (t = y / y_start_gt) while the predicted state lives in
+    the predicted frame (t = y / y_start_pred). Comparing the two coefficient
+    vectors directly penalizes a perfectly correct curve whenever the two
+    start points differ — 50 px of phantom error for a 0.1 difference in
+    y_start. This removes that.
+    """
+    r = ratio.unsqueeze(-1) if ratio.ndim == cp_x.ndim - 1 else ratio
+    omr = 1.0 - r
+    p0, p1, p2, p3 = (cp_x[..., i:i + 1] for i in range(4))
+    q0 = p0
+    q1 = omr * p0 + r * p1
+    q2 = omr.pow(2) * p0 + 2.0 * r * omr * p1 + r.pow(2) * p2
+    q3 = (omr.pow(3) * p0 + 3.0 * omr.pow(2) * r * p1
+          + 3.0 * omr * r.pow(2) * p2 + r.pow(3) * p3)
+    return torch.cat((q0, q1, q2, q3), dim=-1)
+
+
 def update_brr_state(cp_x, y_start, delta, n_strips, margin):
     """Additive BRR update (V11 independent-CP residuals).
 

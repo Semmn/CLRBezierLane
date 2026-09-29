@@ -30,7 +30,8 @@ from .geometry import eval_cubic, eval_global_cubic
 from .gsrc import GSRCModule
 from .lateral import LateralEvidence
 from .query_attention import MaskedQuerySelfAttention
-from .geometry import brr_reference, fit_global_cubic_to_clr_rows, globalize_local_cp, update_brr_state
+from .geometry import (brr_reference, fit_global_cubic_to_clr_rows, globalize_local_cp,
+                       reparam_cp_to_frame, update_brr_state)
 from .lane_iou import LaneIoULoss, pairwise_lane_iou
 from .preconditioner import ControlPointPreconditioner
 from .ranking import batch_cluster_rank_loss
@@ -814,6 +815,16 @@ class CLRBezierHead(_OfficialHead):
         sup = (sup * sup.new_tensor(self.brr_component_weights)).mean(-1).mean()
 
         scale = float(max(1, self.img_w - 1))
+        if self.cp_frame == "anchored":
+            # The GT control points were fitted in the GT's own frame
+            # (t = y / y_start_gt); the state lives in the predicted frame
+            # (t = y / y_start_pred). Move the target into the predicted frame
+            # before comparing, or a correct curve is charged for the
+            # difference between the two start points.
+            with torch.no_grad():
+                ratio = (state[:, 0].detach().clamp(1e-3, 1.0)
+                         / target[:, 2].clamp_min(1e-3)).clamp(0.2, 5.0)
+                gt_cp = reparam_cp_to_frame(gt_cp, ratio)
         cp_elem = _smooth_l1(state[:, 2:6] * scale, gt_cp * scale, self.brr_cp_beta).mean(-1)
         ok = gt_cp_ok.float()
         cp = (cp_elem * ok).sum() / ok.sum().clamp_min(1.0)
