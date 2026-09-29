@@ -48,6 +48,62 @@ def bernstein_basis(y):
     )
 
 
+CP_FRAMES = ("global", "anchored")
+
+
+def bezier_t(query_y, y_start=None, frame="global", eps=1e-3):
+    """Map image y to the Bernstein parameter t.
+
+    "global"   t = y. The four control points sit at image y = 0, 1/3, 2/3, 1,
+               so the curve's domain is the whole image whatever the lane does.
+
+    "anchored" t = y / y_start. The control points sit at 0, y_start/3,
+               2*y_start/3, y_start: the last one *is* the lane's start point
+               and the first is pinned to the image top, which is CLRNet's
+               anchor span. A lane entering the frame halfway up then covers
+               its own domain completely instead of half of it, and the basis
+               functions are evaluated where the data actually is.
+
+    Rows below the start give t > 1. A cubic extrapolates violently there, and
+    the official decoder does walk below the start for ``extend_bottom``, so
+    those rows are handled by the linear continuation in ``eval_cubic``
+    rather than by the cubic itself.
+    """
+    y = torch.as_tensor(query_y)
+    if frame == "global":
+        return y
+    if frame != "anchored":
+        raise ValueError(f"cp_frame must be one of {CP_FRAMES}, got {frame!r}")
+    if y_start is None:
+        raise ValueError("the anchored frame needs y_start")
+    denom = y_start.clamp_min(eps)
+    while denom.ndim < y.ndim:
+        denom = denom.unsqueeze(-1)
+    return y / denom
+
+
+def eval_cubic(cp_x, query_y, y_start=None, frame="global", eps=1e-3):
+    """x(y) in either frame, with a linear continuation past the start point."""
+    y = torch.as_tensor(query_y, device=cp_x.device, dtype=cp_x.dtype)
+    while y.ndim < cp_x.ndim:
+        y = y.unsqueeze(0)
+    if frame == "global":
+        return eval_global_cubic(cp_x, y)
+
+    t = bezier_t(y, y_start, frame="anchored", eps=eps)
+    t_in = t.clamp(0.0, 1.0)
+    omt = 1.0 - t_in
+    x = (omt.pow(3) * cp_x[..., 0:1]
+         + 3.0 * omt.pow(2) * t_in * cp_x[..., 1:2]
+         + 3.0 * omt * t_in.pow(2) * cp_x[..., 2:3]
+         + t_in.pow(3) * cp_x[..., 3:4])
+    # dx/dt at the clamped endpoint, for a C1 linear continuation outside [0, 1].
+    slope = 3.0 * (omt.pow(2) * (cp_x[..., 1:2] - cp_x[..., 0:1])
+                   + 2.0 * omt * t_in * (cp_x[..., 2:3] - cp_x[..., 1:2])
+                   + t_in.pow(2) * (cp_x[..., 3:4] - cp_x[..., 2:3]))
+    return x + slope * (t - t_in)
+
+
 def eval_global_cubic(cp_x, query_y):
     """Evaluate x(y) of the global cubic.
 
@@ -87,7 +143,7 @@ def project_support_y(control_points, eps=1e-4):
     return torch.stack((x, y), dim=-1)
 
 
-def globalize_local_cp(control_points, margin, eps=1e-4):
+def globalize_local_cp(control_points, margin, eps=1e-4, cp_frame="global"):
     """Convert support-local cubic CPs to the fixed-global-y BRR state.
 
     Port of V11 ``_brr_globalize_control_points``. Exact for the
@@ -120,8 +176,12 @@ def globalize_local_cp(control_points, margin, eps=1e-4):
             + t.pow(2) * (x[..., 3] - x[..., 2])
         )
 
+    # The target frame spans [0, frame_bottom]: the whole image for "global",
+    # the lane's own start point for "anchored" (where t_bottom is 1 by
+    # construction, so the fourth control point IS the start point).
+    frame_bottom = torch.ones_like(y_bottom) if cp_frame == "global" else y_bottom
     t_top = (0.0 - y_top) / span
-    t_bottom = (1.0 - y_top) / span
+    t_bottom = (frame_bottom - y_top) / span
     q0 = eval_local(t_top)
     q1 = q0 + deriv_local(t_top) / span / 3.0
     q3 = eval_local(t_bottom)
@@ -153,7 +213,8 @@ def update_brr_state(cp_x, y_start, delta, n_strips, margin):
     return new_cp_x, new_y_start, raw_cp_x, raw_y_start
 
 
-def brr_reference(cp_x, y_start, length, prior_ys, sample_x_indices, img_w, img_h, n_strips):
+def brr_reference(cp_x, y_start, length, prior_ys, sample_x_indices, img_w, img_h,
+                  n_strips, cp_frame="global"):
     """Decode BRR state into a CLRerNet-layout prediction tensor.
 
     Port of V11 ``_brr_reference_from_cp`` with official start_y.
@@ -164,7 +225,7 @@ def brr_reference(cp_x, y_start, length, prior_ys, sample_x_indices, img_w, img_
     """
     n_rows = int(prior_ys.numel())
     ys = prior_ys.to(device=cp_x.device, dtype=cp_x.dtype)
-    x_full = eval_global_cubic(cp_x, ys)
+    x_full = eval_cubic(cp_x, ys, y_start, cp_frame)
     length = torch.as_tensor(length, device=cp_x.device, dtype=cp_x.dtype)
 
     reference = cp_x.new_zeros(cp_x.shape[:-1] + (6 + n_rows,))
@@ -179,8 +240,8 @@ def brr_reference(cp_x, y_start, length, prior_ys, sample_x_indices, img_w, img_
     safe_len = torch.minimum(length.clamp_min(2.0 * one_row), max_len)
     span = (safe_len - one_row).clamp_min(0.0)
     y_top = (y_bottom - span).clamp(0.0, 1.0)
-    start_x = eval_global_cubic(cp_x, y_bottom.unsqueeze(-1)).squeeze(-1)
-    top_x = eval_global_cubic(cp_x, y_top.unsqueeze(-1)).squeeze(-1)
+    start_x = eval_cubic(cp_x, y_bottom.unsqueeze(-1), y_start, cp_frame).squeeze(-1)
+    top_x = eval_cubic(cp_x, y_top.unsqueeze(-1), y_start, cp_frame).squeeze(-1)
     dx_pix = (top_x - start_x) * float(img_w - 1)
     dy_pix = span * float(img_h - 1)
     theta = torch.atan2(dy_pix.clamp_min(1.0e-6), dx_pix) / math.pi
@@ -194,7 +255,8 @@ def brr_reference(cp_x, y_start, length, prior_ys, sample_x_indices, img_w, img_
     return reference, reference_on_map
 
 
-def fit_global_cubic_to_clr_rows(target_xs_px, prior_ys, img_w, ridge, margin, min_valid_points=2):
+def fit_global_cubic_to_clr_rows(target_xs_px, prior_ys, img_w, ridge, margin,
+                                 min_valid_points=2, cp_frame="global"):
     """Fit fixed-global-y cubic CPs to GT CLR rows (batched, differentiable-free).
 
     Same objective as UnLaneDet ``GenerateLaneLine._fit_brr_control_points_x``:
@@ -219,6 +281,14 @@ def fit_global_cubic_to_clr_rows(target_xs_px, prior_ys, img_w, ridge, margin, m
     x = torch.where(valid, xs / float(max(1, img_w - 1)), torch.zeros_like(xs))
     mask = valid.to(xs.dtype)
     count = mask.sum(dim=-1)
+
+    if cp_frame == "anchored":
+        # The GT's own start point: the lowest row it occupies. Fitting in
+        # t = y / y_start puts the control points on the same frame the head
+        # predicts in, so the CP loss and the reference agree.
+        row_y = prior_ys.to(device=xs.device, dtype=xs.dtype).view(1, num_rows)
+        y_start_gt = (row_y * mask).max(dim=-1).values.clamp_min(1e-3)
+        y = (y / y_start_gt.view(num, 1)).clamp(0.0, 1.0)
 
     basis = bernstein_basis(y)  # [N, R, 4]
     weighted = basis * mask.unsqueeze(-1)

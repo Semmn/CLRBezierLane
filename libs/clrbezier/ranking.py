@@ -119,7 +119,7 @@ def cluster_rank_loss(
     """
     device = scores.device
     zero = scores.new_zeros(())
-    stats = {"rank_pairs": zero, "rank_pair_acc": zero}
+    stats = {"rank_pairs": zero, "rank_pair_acc": zero, "rank_logit_gap": zero}
 
     if pred_xs.numel() == 0 or scores.numel() < 2:
         return zero, stats
@@ -175,6 +175,13 @@ def cluster_rank_loss(
     with torch.no_grad():
         stats["rank_pairs"] = torch.as_tensor(float(idx_i.numel()), device=device)
         stats["rank_pair_acc"] = (diff > 0).float().mean()
+        # The typical within-cluster score gap, in whatever space `scores` is.
+        # tau should sit near this: far below it and every ordered pair
+        # saturates to zero gradient, far above it and the loss stays in its
+        # linear region and treats easy and hard pairs alike. Cross-entropy and
+        # focal loss produce very different gaps, so tau does not transfer
+        # between them.
+        stats["rank_logit_gap"] = diff.abs().mean()
     return loss, stats
 
 
@@ -188,7 +195,8 @@ def batch_cluster_rank_loss(scores, pred_xs, quality, valid=None,
     batch = scores.shape[0]
     total = scores.new_zeros(())
     counted = 0
-    agg = {"rank_pairs": scores.new_zeros(()), "rank_pair_acc": scores.new_zeros(())}
+    agg = {"rank_pairs": scores.new_zeros(()), "rank_pair_acc": scores.new_zeros(()),
+           "rank_logit_gap": scores.new_zeros(())}
     for b in range(batch):
         loss, stats = cluster_rank_loss(
             scores[b], pred_xs[b], quality[b],
@@ -197,11 +205,11 @@ def batch_cluster_rank_loss(scores, pred_xs, quality, valid=None,
             **kwargs)
         if float(stats["rank_pairs"]) > 0:
             total = total + loss
-            agg["rank_pairs"] = agg["rank_pairs"] + stats["rank_pairs"]
-            agg["rank_pair_acc"] = agg["rank_pair_acc"] + stats["rank_pair_acc"]
+            for key in agg:
+                agg[key] = agg[key] + stats[key]
             counted += 1
     if counted == 0:
         return total, agg
-    agg["rank_pairs"] = agg["rank_pairs"] / counted
-    agg["rank_pair_acc"] = agg["rank_pair_acc"] / counted
+    for key in agg:
+        agg[key] = agg[key] / counted
     return total / counted, agg

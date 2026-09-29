@@ -68,7 +68,8 @@ class ControlPointPreconditioner(nn.Module):
         # Column norms over the whole image: the normalization reference.
         self.register_buffer("full_norm", basis.pow(2).sum(0).sqrt(), persistent=False)
 
-    def gains(self, y_start: torch.Tensor, length: torch.Tensor) -> torch.Tensor:
+    def gains(self, y_start: torch.Tensor, length: torch.Tensor,
+              frame: str = "global") -> torch.Tensor:
         """Per-control-point scale, shape ``y_start.shape + (4,)``.
 
         ``y_start`` is image y of the lane start (1 = bottom) and ``length`` is
@@ -83,10 +84,20 @@ class ControlPointPreconditioner(nn.Module):
         basis_sq = self.basis_sq.to(device=y_start.device, dtype=y_start.dtype)
         full = self.full_norm.to(device=y_start.device, dtype=y_start.dtype)
 
-        # Visible band in image y: [y_start - length, y_start].
-        top = (y_start - length).clamp(0.0, 1.0)
-        lo = torch.minimum(top, y_start)[..., None]
-        hi = torch.maximum(top, y_start)[..., None]
+        # Visible band, expressed in the Bernstein parameter t.
+        #   global   : t = y, so the band is [y_start - length, y_start].
+        #   anchored : t = y / y_start, so the band is [1 - length/y_start, 1]
+        #              and a lane reaching the image top covers t = [0, 1]
+        #              entirely — no deficit at all, which is the point of the
+        #              anchored frame.
+        if frame == "anchored":
+            coverage = (length / y_start.clamp_min(1e-3)).clamp(0.0, 1.0)
+            lo = (1.0 - coverage)[..., None]
+            hi = torch.ones_like(lo)
+        else:
+            top = (y_start - length).clamp(0.0, 1.0)
+            lo = torch.minimum(top, y_start)[..., None]
+            hi = torch.maximum(top, y_start)[..., None]
         mask = ((rows >= lo) & (rows <= hi)).to(y_start.dtype)   # [..., R]
 
         # Column norms restricted to the visible rows.
@@ -97,12 +108,13 @@ class ControlPointPreconditioner(nn.Module):
         return gain
 
     def forward(self, delta_cp: torch.Tensor, y_start: torch.Tensor,
-                length: torch.Tensor) -> torch.Tensor:
-        return delta_cp * self.gains(y_start, length)
+                length: torch.Tensor, frame: str = "global") -> torch.Tensor:
+        return delta_cp * self.gains(y_start, length, frame)
 
     @torch.no_grad()
     def diagnostics(self, y_start: torch.Tensor, length: torch.Tensor,
-                    scores: torch.Tensor = None, topk: int = 4) -> dict:
+                    scores: torch.Tensor = None, topk: int = 4,
+                    frame: str = "global") -> dict:
         """Averaged over every query, and over the top-scoring few.
 
         The plain mean covers all anchors, most of which match nothing and
@@ -111,7 +123,7 @@ class ControlPointPreconditioner(nn.Module):
         ``topk`` highest-scoring queries per image, which is roughly the set
         that survives NMS.
         """
-        gain = self.gains(y_start, length)
+        gain = self.gains(y_start, length, frame)
         out = {
             "precond_gain_p0": gain[..., 0].mean(),
             "precond_gain_p1": gain[..., 1].mean(),

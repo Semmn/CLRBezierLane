@@ -26,7 +26,7 @@ from .assigners import build_cost_cache, build_lane_assigner
 from .data_adapters import CLRTargetAdapter
 from .alignment import QualityFocalLoss, ignore_unmatched, quality_targets
 from .cascade import QualityGate, ReferenceReprojector, sampling_xs
-from .geometry import eval_global_cubic
+from .geometry import eval_cubic, eval_global_cubic
 from .gsrc import GSRCModule
 from .lateral import LateralEvidence
 from .query_attention import MaskedQuerySelfAttention
@@ -103,6 +103,7 @@ class CLRBezierHead(_OfficialHead):
         roi_mid_channels=48,
         roi_gather_cfg=None,
         look_forward_twice=False,
+        cp_frame="global",
         cp_precond_cfg=None,
         rank_loss_cfg=None,
         seg_num_classes=5,
@@ -169,6 +170,20 @@ class CLRBezierHead(_OfficialHead):
             visible_only=prior_cfg.get("visible_only", True),
             min_support=prior_cfg.get("min_support", 1.0 / self.n_strips))
         self.cp_x_margin = float(brr_cfg.get("cp_x_margin", 0.5))
+        # Where the four control points live.
+        #   "global"   : image y = 0, 1/3, 2/3, 1 — the curve's domain is the
+        #                whole image however short the lane is.
+        #   "anchored" : image y = 0, y_start/3, 2*y_start/3, y_start — the last
+        #                control point IS the lane's start point and the first is
+        #                pinned to the image top, matching CLRNet's anchor span.
+        self.cp_frame = str(cp_frame)
+        if self.cp_frame not in ("global", "anchored"):
+            raise ValueError("cp_frame must be 'global' or 'anchored'")
+        if self.cp_frame == "anchored" and reproject_cfg:
+            # ReferenceReprojector refits control points on the fixed global
+            # basis; it would silently write global-frame points into an
+            # anchored state.
+            raise ValueError("reproject_cfg is not supported with cp_frame='anchored'")
 
         # ---- network ----------------------------------------------------------
         rg_cfg = dict(roi_gather_cfg or {})
@@ -466,9 +481,11 @@ class CLRBezierHead(_OfficialHead):
         batch_size, num_q = local_cp.shape[:2]
         one_row = 1.0 / float(self.n_strips)
         geo = dict(prior_ys=self.prior_ys, sample_x_indices=self.sample_x_indices,
-                   img_w=self.img_w, img_h=self.img_h, n_strips=self.n_strips)
+                   img_w=self.img_w, img_h=self.img_h, n_strips=self.n_strips,
+                   cp_frame=self.cp_frame)
 
-        cp_x, y_start = globalize_local_cp(local_cp, self.cp_x_margin, self.eps)
+        cp_x, y_start = globalize_local_cp(local_cp, self.cp_x_margin, self.eps,
+                                           cp_frame=self.cp_frame)
         _, on_map = brr_reference(cp_x, y_start, y_start + one_row, **geo)
 
         pooled_stages, preds, states = [], [], []
@@ -477,7 +494,8 @@ class CLRBezierHead(_OfficialHead):
         for stage in range(self.refine_layers):
             if self._need_input_xs:
                 # full-row x of the reference this stage samples from (gate_on="input")
-                input_xs.append(eval_global_cubic(cp_x.detach(), self.prior_ys.to(cp_x.dtype)))
+                input_xs.append(eval_cubic(cp_x.detach(), self.prior_ys.to(cp_x.dtype),
+                                           y_start.detach(), self.cp_frame))
             prior_xs = torch.flip(on_map, dims=[2])
             pooled = pool_prior_features(feats[stage], prior_xs, self.prior_feat_ys,
                                          self.prior_feat_channels)
@@ -521,13 +539,15 @@ class CLRBezierHead(_OfficialHead):
                 # visible span. With apply_to="reference" only the curve the
                 # IoU loss sees is rescaled; the BRR state supervision keeps
                 # the raw delta.
-                gains = self.cp_precond.gains(y_start, reg[..., 1])
+                gains = self.cp_precond.gains(y_start, reg[..., 1],
+                                              frame=self.cp_frame)
                 reg_ref = torch.cat(
                     [reg[..., :2], reg[..., 2:6] * gains, reg[..., 6:]], dim=-1)
                 if self.cp_precond.apply_to == "both":
                     reg = reg_ref
                 precond_stats.append(self.cp_precond.diagnostics(
-                    y_start, reg[..., 1], scores=cls_logits[..., 1] - cls_logits[..., 0]))
+                    y_start, reg[..., 1], scores=cls_logits[..., 1] - cls_logits[..., 0],
+                    frame=self.cp_frame))
 
             new_x, new_y, _, _ = update_brr_state(cp_x, y_start, reg_ref[..., :6],
                                                   self.n_strips, self.cp_x_margin)
@@ -648,7 +668,8 @@ class CLRBezierHead(_OfficialHead):
     def loss_by_outputs(self, outs, lanes, seg_gt=None):
         valid_targets = [t[t[:, 1] == 1] for t in lanes]
         gt_cps = [fit_global_cubic_to_clr_rows(t[:, 6:], self.prior_ys, self.img_w,
-                                               self.brr_cp_fit_ridge, self.cp_x_margin)
+                                               self.brr_cp_fit_ridge, self.cp_x_margin,
+                                               cp_frame=self.cp_frame)
                   for t in valid_targets]
 
         main = self._branch_losses(outs["main_preds"], outs["main_states"], valid_targets, gt_cps,
@@ -718,8 +739,10 @@ class CLRBezierHead(_OfficialHead):
         """
         device = preds[0].device
         total = preds[0].new_zeros(())
-        stats = {"rank_pairs": preds[0].new_zeros(()),
-                 "rank_pair_acc": preds[0].new_zeros(())}
+        # Aggregate whatever diagnostics ranking.py reports rather than a
+        # hardcoded list, so a head and a ranking module from different
+        # versions cannot disagree about the key set.
+        stats = {}
         counted = 0
         for stage in sorted(self.rank_loss_stages):
             if stage >= len(preds):
@@ -744,8 +767,8 @@ class CLRBezierHead(_OfficialHead):
                 lane_width=self.lane_width, img_w=self.img_w, img_h=self.img_h,
                 **self.rank_loss_kwargs)
             total = total + loss
-            stats["rank_pairs"] = stats["rank_pairs"] + agg["rank_pairs"]
-            stats["rank_pair_acc"] = stats["rank_pair_acc"] + agg["rank_pair_acc"]
+            for key, value in agg.items():
+                stats[key] = stats.get(key, torch.zeros_like(value)) + value
             counted += 1
         if counted:
             total = total / counted
