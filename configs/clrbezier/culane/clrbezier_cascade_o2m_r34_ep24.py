@@ -40,4 +40,4 @@ default_hooks = dict(
     ),
 )
 
-model = dict(test_cfg=dict(conf_threshold=0.40))
+model = dict(test_cfg=dict(conf_threshold=0.55))

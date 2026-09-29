@@ -86,13 +86,19 @@ model = dict(
         cp_precond_cfg=None,
         rank_loss_cfg=dict(
             enabled=True,
-            loss_weight=0.5,
-            stages=[0,1,2],                 # final stage only; [0, 1, 2] also works
-            cluster_iou_thr=0.50,           # match the NMS threshold used at inference
-            margin=0.05,                    # skip pairs whose quality gap is noise
-            tau=0.5,
+            loss_weight=0.5,         # lower than the one-to-one default: the
+                                     # CE conflict is live under one-to-many
+            stages=[0,1,2],
+            cluster_iou_thr=0.50,    # ~8 px separation at 800 wide; set it from
+                                     # the separation your NMS actually merges
+            margin=0.05,
+            score_space="logit",  # NOT "prob": in probability space the
+                                  # loss floors at softplus(-1/tau) and the
+                                  # gradient dies for confident duplicates
+            tau=0.5,              # logit units now, so 0.5 is sharper than
+                                  # it was on probabilities
             weight_by_gap=True,
-            positives_only=False,    # see below
+            positives_only=False,
         ),
         aux_cfg=dict(
             enabled=True, # Disable Auxiliary branch

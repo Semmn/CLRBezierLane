@@ -43,8 +43,18 @@ class ControlPointPreconditioner(nn.Module):
     """
 
     def __init__(self, n_strips: int = 71, max_gain: float = 8.0,
-                 min_length: float = 0.1, power: float = 1.0):
+                 min_length: float = 0.1, power: float = 1.0,
+                 apply_to: str = "both"):
         super().__init__()
+        if apply_to not in ("both", "reference"):
+            raise ValueError("apply_to must be 'both' or 'reference'")
+        # "reference" scales only the curve the IoU loss sees, leaving the
+        # BRR state supervision on the raw delta. That matters for short
+        # lanes: fit_global_cubic_to_clr_rows regularizes toward the best
+        # affine fit, so a short lane's target control points are mostly the
+        # ridge prior rather than the data, and multiplying the step toward
+        # them by up to max_gain amplifies a regularization artifact.
+        self.apply_to = apply_to
         self.n_strips = int(n_strips)
         self.max_gain = float(max_gain)
         self.min_length = float(min_length)
@@ -91,11 +101,28 @@ class ControlPointPreconditioner(nn.Module):
         return delta_cp * self.gains(y_start, length)
 
     @torch.no_grad()
-    def diagnostics(self, y_start: torch.Tensor, length: torch.Tensor) -> dict:
+    def diagnostics(self, y_start: torch.Tensor, length: torch.Tensor,
+                    scores: torch.Tensor = None, topk: int = 4) -> dict:
+        """Averaged over every query, and over the top-scoring few.
+
+        The plain mean covers all anchors, most of which match nothing and
+        carry meaningless predicted geometry, so it says more about the unused
+        anchors than about the lanes. The ``_top`` figures average over the
+        ``topk`` highest-scoring queries per image, which is roughly the set
+        that survives NMS.
+        """
         gain = self.gains(y_start, length)
-        return {
+        out = {
             "precond_gain_p0": gain[..., 0].mean(),
             "precond_gain_p1": gain[..., 1].mean(),
             "precond_gain_p3": gain[..., 3].mean(),
             "precond_clipped": (gain >= self.max_gain - 1e-6).float().mean(),
         }
+        if scores is not None and gain.ndim >= 2:
+            k = min(int(topk), gain.shape[-2])
+            idx = scores.topk(k, dim=-1).indices                      # [..., k]
+            sel = torch.gather(gain, -2, idx[..., None].expand(*idx.shape, 4))
+            out["precond_gain_p0_top"] = sel[..., 0].mean()
+            out["precond_gain_p3_top"] = sel[..., 3].mean()
+            out["precond_clipped_top"] = (sel >= self.max_gain - 1e-6).float().mean()
+        return out

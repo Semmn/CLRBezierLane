@@ -204,6 +204,16 @@ class CLRBezierHead(_OfficialHead):
         self.rank_loss_enabled = bool(rank_loss_cfg) and rank_cfg.pop('enabled', True)
         self.rank_loss_weight = float(rank_cfg.pop('loss_weight', 1.0))
         self.rank_loss_stages = set(rank_cfg.pop('stages', [self.refine_layers - 1]))
+        # "logit" (default) compares the binary logit; "prob" compares the
+        # softmax probability, which is what the first version did and should
+        # not be used. In probability space the difference is bounded by 1, so
+        # with tau=0.5 the loss cannot fall below softplus(-2) = 0.127 and sits
+        # near 0.32 whatever the model does; worse, d(prob)/d(logit) = p(1-p)
+        # vanishes exactly for the confident duplicates that make up the hard
+        # pairs, so the gradient dies where the ordering is wrong.
+        self.rank_score_space = rank_cfg.pop('score_space', 'logit')
+        if self.rank_score_space not in ('logit', 'prob'):
+            raise ValueError("rank_loss_cfg.score_space must be 'logit' or 'prob'")
         self.rank_loss_kwargs = rank_cfg
         cls_modules, reg_modules = [], []
         for _ in range(num_fc):
@@ -500,18 +510,23 @@ class CLRBezierHead(_OfficialHead):
             cls_logits = cls_head(cls_f).view(batch_size, num_q, 2).float()
             reg = self.reg_layers(reg_f).view(batch_size, num_q, -1).float()
 
+            reg_ref = reg
             if self.cp_precond is not None:
                 # Equalize the per-control-point step over the lane's own
-                # visible span before it is applied; everything downstream,
-                # including the state supervision, sees the corrected delta.
+                # visible span. With apply_to="reference" only the curve the
+                # IoU loss sees is rescaled; the BRR state supervision keeps
+                # the raw delta.
                 gains = self.cp_precond.gains(y_start, reg[..., 1])
-                reg = torch.cat(
+                reg_ref = torch.cat(
                     [reg[..., :2], reg[..., 2:6] * gains, reg[..., 6:]], dim=-1)
-                precond_stats.append(self.cp_precond.diagnostics(y_start, reg[..., 1]))
+                if self.cp_precond.apply_to == "both":
+                    reg = reg_ref
+                precond_stats.append(self.cp_precond.diagnostics(
+                    y_start, reg[..., 1], scores=cls_logits[..., 1] - cls_logits[..., 0]))
 
-            new_x, new_y, _, _ = update_brr_state(cp_x, y_start, reg[..., :6],
+            new_x, new_y, _, _ = update_brr_state(cp_x, y_start, reg_ref[..., :6],
                                                   self.n_strips, self.cp_x_margin)
-            length = reg[..., 1]
+            length = reg_ref[..., 1]
             ref, ref_on_map = brr_reference(new_x, new_y, length, **geo)
             pred = torch.cat([cls_logits, ref[..., 2:6], ref[..., 6:] + reg[..., 6:]], dim=-1)
 
@@ -705,7 +720,9 @@ class CLRBezierHead(_OfficialHead):
             if stage >= len(preds):
                 continue
             pred = preds[stage]
-            score = F.softmax(pred[..., :2].float(), dim=-1)[..., 1]
+            logits = pred[..., :2].float()
+            score = (logits[..., 1] - logits[..., 0] if self.rank_score_space == "logit"
+                     else F.softmax(logits, dim=-1)[..., 1])
             pred_xs = pred[..., 6:].float()
             with torch.no_grad():
                 quality = torch.zeros_like(score)

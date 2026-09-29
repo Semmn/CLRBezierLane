@@ -578,3 +578,103 @@ TRAIN_PID=$!
 echo "Training launcher PID: $TRAIN_PID"
 disown -h "$TRAIN_PID"
 tail -f "$LOG"
+
+# ================================================================================================
+# Visited at the 2026.09.29
+# Test the result
+CONFIG_NAME="clrbezier_cascade_o2m_r34_ep24"
+MODEL_NAME="clrbezier"
+DATASET="culane"
+TRAIN_EXP_NAME="run1"
+EVAL_EXP_NAME="test1"
+GPU_ID=0
+CONFIG=/exhdd/seungyu/CLRBezierLane/configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py
+CHECKPOINT=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/$TRAIN_EXP_NAME/epoch_24.pth
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/$EVAL_EXP_NAME
+LOG="$WORK_DIR/test.log"
+mkdir -p "$WORK_DIR"
+nohup env \
+    CUDA_VISIBLE_DEVICES=$GPU_ID \
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+    python3 tools/test.py \
+    "$CONFIG" \
+    "$CHECKPOINT" \
+    --work-dir "$WORK_DIR" \
+    > "$LOG" 2>&1 < /dev/null &
+TEST_PID=$!
+echo "Testing PID: $TEST_PID"
+disown -h "$TEST_PID"
+tail -f "$LOG"
+
+CONFIG_NAME="clrbezier_deform_r34_ep24"
+MODEL_NAME="clrbezier"
+DATASET="culane"
+TRAIN_EXP_NAME="run1"
+EVAL_EXP_NAME="test1"
+GPU_ID=1
+CONFIG=/exhdd/seungyu/CLRBezierLane/configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py
+CHECKPOINT=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/$TRAIN_EXP_NAME/epoch_24.pth
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/$EVAL_EXP_NAME
+LOG="$WORK_DIR/test.log"
+mkdir -p "$WORK_DIR"
+nohup env \
+    CUDA_VISIBLE_DEVICES=$GPU_ID \
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+    python3 tools/test.py \
+    "$CONFIG" \
+    "$CHECKPOINT" \
+    --work-dir "$WORK_DIR" \
+    > "$LOG" 2>&1 < /dev/null &
+TEST_PID=$!
+echo "Testing PID: $TEST_PID"
+disown -h "$TEST_PID"
+tail -f "$LOG"
+
+CONFIG_NAME="clrbezier_precond_r34"
+MODEL_NAME="clrbezier"
+DATASET="culane"
+TRAIN_EXP_NAME="run1"
+EVAL_EXP_NAME="test1"
+GPU_ID=2
+CONFIG=/exhdd/seungyu/CLRBezierLane/configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py
+CHECKPOINT=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/$TRAIN_EXP_NAME/epoch_24.pth
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/$EVAL_EXP_NAME
+LOG="$WORK_DIR/test.log"
+mkdir -p "$WORK_DIR"
+nohup env \
+    CUDA_VISIBLE_DEVICES=$GPU_ID \
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+    python3 tools/test.py \
+    "$CONFIG" \
+    "$CHECKPOINT" \
+    --work-dir "$WORK_DIR" \
+    > "$LOG" 2>&1 < /dev/null &
+TEST_PID=$!
+echo "Testing PID: $TEST_PID"
+disown -h "$TEST_PID"
+tail -f "$LOG"
+
+CONFIG_NAME="clrbezier_rank_r34"
+MODEL_NAME="clrbezier"
+DATASET="culane"
+TRAIN_EXP_NAME="run1"
+EVAL_EXP_NAME="test1"
+GPU_ID=2
+EPOCHS=24
+CONFIG=/exhdd/seungyu/CLRBezierLane/configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py
+CHECKPOINT=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/$TRAIN_EXP_NAME/epoch_$EPOCHS.pth
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/$EVAL_EXP_NAME
+LOG="$WORK_DIR/test.log"
+mkdir -p "$WORK_DIR"
+nohup env \
+    CUDA_VISIBLE_DEVICES=$GPU_ID \
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+    python3 tools/test.py \
+    "$CONFIG" \
+    "$CHECKPOINT" \
+    --work-dir "$WORK_DIR" \
+    > "$LOG" 2>&1 < /dev/null &
+TEST_PID=$!
+echo "Testing PID: $TEST_PID"
+disown -h "$TEST_PID"
+tail -f "$LOG"

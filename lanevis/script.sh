@@ -4,7 +4,7 @@
 # MODE=dash (interactive page)
 
 # Visualize through Figures (PNG)
-CONFIG_NAME="clrbezier_collab_perturb_r34"
+CONFIG_NAME="clrbezier_precond_r34"
 TRAIN_DIR="run1"
 MODEL_NAME="clrbezier"
 DATASET="culane"

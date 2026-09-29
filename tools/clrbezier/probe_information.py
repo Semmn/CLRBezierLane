@@ -283,7 +283,7 @@ def fit_probe(fit_feat, fit_target, fit_pairs, eval_feat, device,
     with torch.no_grad():
         xe = ((torch.from_numpy(eval_feat).float() - mean) / std).to(device)
         out = torch.cat([model(xe[i:i + 65536]) for i in range(0, xe.shape[0], 65536)])
-    return out.cpu().numpy()
+    return out.cpu().numpy(), (model, mean, std)
 
 
 def main():
@@ -301,6 +301,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--dump", help="optional .npz of the raw arrays")
+    ap.add_argument("--save-probe", help="save the fitted probe for rescore_eval.py")
     args = ap.parse_args()
 
     cfg = Config.fromfile(args.config)
@@ -353,8 +354,14 @@ def main():
           f"({eval_decisive.sum()} decisive, {eval_decisive.mean():.1%})")
 
     print(f"training probe ({args.objective})...")
-    probe = fit_probe(fit["feat"], fit["quality"], fit_pairs, ev["feat"], device,
-                      objective=args.objective, epochs=args.epochs)
+    probe, probe_bundle = fit_probe(fit["feat"], fit["quality"], fit_pairs, ev["feat"],
+                                    device, objective=args.objective, epochs=args.epochs)
+    if args.save_probe:
+        model_, mean_, std_ = probe_bundle
+        torch.save(dict(state_dict=model_.state_dict(), mean=mean_, std=std_,
+                        in_dim=fit["feat"].shape[1], feature=args.feature,
+                        objective=args.objective), args.save_probe)
+        print(f"probe -> {args.save_probe}")
 
     # Null 1: identical data, identical clusters, random *orientation*. The
     # probe cannot beat chance on this, so anything above 0.5 is leakage.
@@ -365,8 +372,8 @@ def main():
     if len(flipped):
         flip = rng.rand(len(flipped)) < 0.5
         flipped[flip] = flipped[flip][:, ::-1]
-    control_shuffled = fit_probe(fit["feat"], fit["quality"], flipped, ev["feat"],
-                                 device, objective=args.objective, epochs=args.epochs)
+    control_shuffled, _ = fit_probe(fit["feat"], fit["quality"], flipped, ev["feat"],
+                                    device, objective=args.objective, epochs=args.epochs)
 
     # Null 2: no training at all. A randomly initialized network is still a
     # function of the features, so this measures how much ordering the feature
@@ -382,8 +389,8 @@ def main():
 
     fit_plus = np.concatenate([fit["feat"], fit["score"][:, None]], axis=1)
     ev_plus = np.concatenate([ev["feat"], ev["score"][:, None]], axis=1)
-    control_score = fit_probe(fit_plus, fit["quality"], fit_pairs, ev_plus, device,
-                              objective=args.objective, epochs=args.epochs)
+    control_score, _ = fit_probe(fit_plus, fit["quality"], fit_pairs, ev_plus, device,
+                                 objective=args.objective, epochs=args.epochs)
 
     if args.dump:
         np.savez_compressed(args.dump, **{f"eval_{k}": v for k, v in ev.items()
@@ -449,12 +456,10 @@ def main():
     gain = results["probe"] - results["model score"]
     floor = results["null: untrained network"]
     print(f"NMS picks the better duplicate {results['model score']:.1%} of the time.")
-    print(f"a random function of the same features already gets {floor:.1%}, so that,")
-    print("not 0.5, is the floor these numbers sit above.")
-    span = max(1e-6, 1.0 - floor)
-    print(f"  model score {(results['model score'] - floor) / span:.1%} of the way "
-          f"from that floor to perfect")
-    print(f"  probe       {(results['probe'] - floor) / span:.1%}")
+    print(f"one untrained draw reads {floor:.1%}. That is a single random function, not")
+    print("an expectation, so it can land either side of 0.5 and is NOT a floor to")
+    print("normalize against; the random-orientation null "
+          f"({results['null: random orientation']:.3f}) is the one that must be 0.5.")
     print(f"probe - model, inside clusters: {gain:+.4f} "
           f"({gain / max(1e-6, 1 - results['model score']):.1%} of what is left)")
     if decisive_results:
