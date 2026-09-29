@@ -158,6 +158,26 @@ def main():
     ok &= report("an image with no usable pairs contributes nothing",
                  float(empty) == 0.0)
 
+    # 9. Distance clustering must match CLRNet's NMS rule, and must reach
+    #    further than any LaneIoU threshold can.
+    from libs.clrbezier.ranking import mean_row_distance
+    wide = torch.stack([straight_lane(0.50), straight_lane(0.50 + 25 / 799),
+                        straight_lane(0.50 + 90 / 799)])
+    wide_q = torch.tensor([0.90, 0.60, 0.30])
+    dist = mean_row_distance(wide, IMG_W)
+    print(f"\nmean row distance (px): 0<->1 {dist[0,1]:.1f}, 0<->2 {dist[0,2]:.1f}")
+    ok &= report("distance matches the constructed separation",
+                 abs(float(dist[0, 1]) - 25) < 0.5 and abs(float(dist[0, 2]) - 90) < 0.5)
+    _, dstats = cluster_rank_loss(torch.tensor([3.0, 2.0, 1.0]), wide, wide_q,
+                                  cluster_mode="distance", nms_thres=50.0)
+    print(f"pairs within 50 px: {int(dstats['rank_pairs'])} (expected 1: the 25 px pair)")
+    ok &= report("nms_thres selects the pairs NMS would merge",
+                 int(dstats["rank_pairs"]) == 1)
+    _, istats = cluster_rank_loss(torch.tensor([3.0, 2.0, 1.0]), wide, wide_q,
+                                  cluster_mode="iou", cluster_iou_thr=0.35)
+    ok &= report("LaneIoU cannot reach a 25 px pair (zero overlap past 15 px)",
+                 int(istats["rank_pairs"]) == 0)
+
     print("\nPASS" if ok else "\nFAILURES ABOVE")
     return 0 if ok else 1
 

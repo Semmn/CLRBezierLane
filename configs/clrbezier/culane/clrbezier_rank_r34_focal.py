@@ -29,7 +29,7 @@ custom_imports = dict(
     ],
     allow_failed_imports=False,
 )
-cfg_name = "clrbezier_rank_r34.py"
+cfg_name = "clrbezier_rank_r34_focal.py"
 
 img_w, img_h, num_points = 800, 320, 72
 model = dict(
@@ -86,20 +86,22 @@ model = dict(
         cp_precond_cfg=None,
         rank_loss_cfg=dict(
             enabled=True,
-            loss_weight=0.5,
-            stages=[2],              # final stage only; [0, 1, 2] also works
+            loss_weight=0.3,         # lower than the one-to-one default: the
+                                     # CE conflict is live under one-to-many
+            stages=[2],
             cluster_mode="distance", # CLRNet's lane NMS merges by mean |dx|, not
                                      # by IoU; "iou" can only reach 2*lane_width
                                      # (15 px) and misses most of each cluster
             nms_thres=50,            # defaults to model.test_cfg.nms_thres
             margin=0.05,
-            score_space="logit",    # NOT "prob": in probability space the
-                                    # loss floors at softplus(-1/tau) and the
-                                    # gradient dies for confident duplicates
-            tau=1.0,                # logit units now, so 0.5 is sharper than
-                                    # it was on probabilities
+            score_space="logit",  # NOT "prob": in probability space the
+                                  # loss floors at softplus(-1/tau) and the
+                                  # gradient dies for confident duplicates
+            tau=1.0,              # logit units now, so 0.5 is sharper than
+                                  # it was on probabilities
+
             weight_by_gap=True,
-            positives_only=False,    # see below
+            positives_only=False,
         ),
         aux_cfg=dict(
             enabled=True, # Disable Auxiliary branch
@@ -126,7 +128,7 @@ model = dict(
             clamp_x=True, clamp_y=True,
         ),
         loss_cfg=dict(
-            use_focal=False,
+            use_focal=True,
             iou_loss_type="laneiou",     # regression loss = 1 - GLIoU
             cost_iou_type="laneiou",     # "laneiou" or "gliou"
             cls_bg_weight=0.4,
@@ -166,7 +168,7 @@ model = dict(
     ),
     test_cfg=dict(
         # Default CLRerNet uses conf_threshold=0.41
-        conf_threshold=0.90,
+        conf_threshold=0.50,
         use_nms=True,
         as_lanes=True,
         extend_bottom=True,

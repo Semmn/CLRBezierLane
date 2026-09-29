@@ -214,6 +214,11 @@ class CLRBezierHead(_OfficialHead):
         self.rank_score_space = rank_cfg.pop('score_space', 'logit')
         if self.rank_score_space not in ('logit', 'prob'):
             raise ValueError("rank_loss_cfg.score_space must be 'logit' or 'prob'")
+        # Default the cluster distance to the NMS threshold this model will
+        # actually run with, so the loss supervises the comparisons NMS makes.
+        if self.rank_loss_enabled and rank_cfg.get("cluster_mode", "distance") == "distance":
+            rank_cfg.setdefault("nms_thres", float(
+                (test_cfg or {}).get("nms_thres", 50.0)))
         self.rank_loss_kwargs = rank_cfg
         cls_modules, reg_modules = [], []
         for _ in range(num_fc):

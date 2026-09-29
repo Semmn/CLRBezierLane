@@ -51,11 +51,30 @@ import torch.nn.functional as F
 from .lane_iou import pairwise_lane_iou
 
 
+def mean_row_distance(pred_xs, img_w: int):
+    """Pairwise mean |dx| in pixels over rows where both lanes are valid.
+
+    This is what CLRNet's lane NMS measures, so it is what cluster membership
+    should use. LaneIoU cannot substitute: with a half-width of 7.5/800 two
+    lanes more than 15 px apart have *zero* overlap, so no IoU threshold can
+    reach an NMS distance of 50 px. An IoU rule therefore supervises only the
+    innermost few pixels of each cluster and leaves the rest invisible.
+    """
+    valid = (pred_xs >= 0.0) & (pred_xs <= 1.0)
+    both = valid[:, None, :] & valid[None, :, :]
+    diff = (pred_xs[:, None, :] - pred_xs[None, :, :]).abs() * float(img_w - 1)
+    count = both.sum(-1)
+    dist = (diff * both).sum(-1) / count.clamp(min=1)
+    return dist.masked_fill(count == 0, float("inf"))
+
+
 def cluster_rank_loss(
     scores,
     pred_xs,
     quality,
     valid=None,
+    cluster_mode: str = "distance",
+    nms_thres: float = 50.0,
     cluster_iou_thr: float = 0.35,
     margin: float = 0.05,
     tau: float = 0.5,
@@ -76,9 +95,16 @@ def cluster_rank_loss(
         quality: ``[K]`` LaneIoU of each prediction against its best GT. Rows
             with no GT overlap should be 0.
         valid: optional ``[K]`` bool, predictions to consider at all.
-        cluster_iou_thr: mutual LaneIoU above which two predictions are treated
-            as duplicates, i.e. as competing in NMS. Match this to the NMS
-            threshold actually used at inference.
+        cluster_mode: "distance" (default) treats two predictions as competing
+            when their mean row distance is below ``nms_thres``, which is
+            exactly CLRNet's lane NMS rule. "iou" uses ``cluster_iou_thr`` on
+            LaneIoU instead, which can only ever select pairs closer than
+            2 * lane_width (15 px at the default) and so misses most of the
+            cluster.
+        nms_thres: distance threshold in pixels at ``img_w``, for
+            ``cluster_mode="distance"``. Set it to the ``test_cfg.nms_thres``
+            you actually run at inference.
+        cluster_iou_thr: LaneIoU threshold for ``cluster_mode="iou"``.
         margin: minimum quality gap for a pair to be supervised. Pairs closer
             than this carry no reliable ordering and only add noise.
         tau: logit temperature. Smaller = sharper separation demanded.
@@ -114,10 +140,18 @@ def cluster_rank_loss(
     # matrix is computed without gradient — cluster membership is a routing
     # decision, not something to learn through.
     with torch.no_grad():
-        mutual = pairwise_lane_iou(xs, xs, lane_width, img_w, img_h)
-        n = mutual.shape[0]
-        eye = torch.eye(n, dtype=torch.bool, device=device)
-        competes = (mutual > cluster_iou_thr) & ~eye
+        if cluster_mode == "distance":
+            proximity = mean_row_distance(xs, img_w)
+            n = proximity.shape[0]
+            eye = torch.eye(n, dtype=torch.bool, device=device)
+            competes = (proximity < nms_thres) & ~eye
+        elif cluster_mode == "iou":
+            mutual = pairwise_lane_iou(xs, xs, lane_width, img_w, img_h)
+            n = mutual.shape[0]
+            eye = torch.eye(n, dtype=torch.bool, device=device)
+            competes = (mutual > cluster_iou_thr) & ~eye
+        else:
+            raise ValueError("cluster_mode must be 'distance' or 'iou'")
         gap = q[:, None] - q[None, :]
         # Keep the oriented pair (i beats j) once: gap > margin implies i > j.
         pairs = competes & (gap > margin)
