@@ -43,7 +43,7 @@ from mmdet.registry import MODELS
 from libs.datasets.metrics.culane_metric import CULaneMetric
 
 from probe_information import Probe          # same directory
-from sweep_threshold import evaluate_at
+from fast_sweep import run_sweep
 
 
 def logit(p, eps=1e-6):
@@ -57,6 +57,12 @@ def main():
     ap.add_argument("checkpoint")
     ap.add_argument("probe", help="the .pth written by --save-probe")
     ap.add_argument("--split", choices=["test", "val"], default="test")
+    ap.add_argument("--jobs", type=int, default=None,
+                    help="worker processes for the rasterization pass")
+    ap.add_argument("--no-verify", action="store_true")
+    ap.add_argument("--rgb-masks", action="store_true",
+                    help="rasterize onto the official 3-channel canvas instead "
+                         "of 1 channel; 2.3x slower, provably the same IoU")
     ap.add_argument("--dump-threshold", type=float, default=0.10)
     ap.add_argument("--grid", type=float, nargs=3, default=[0.10, 0.96, 0.02],
                     metavar=("START", "STOP", "STEP"))
@@ -147,19 +153,17 @@ def main():
     thresholds = [t for t in np.round(np.arange(start, stop + 1e-9, step), 4)
                   if t >= args.dump_threshold]
 
+    rows, best = run_sweep({"baseline": base_dump, "probe": probe_dump},
+                           thresholds, data_root, data_list, categories_dir,
+                           metric, jobs=args.jobs, verify=not args.no_verify,
+                           logger=MMLogger.get_current_instance(),
+                           rgb_masks=args.rgb_masks)
+
     print(f"\n{'conf':>6} {'baseline F1':>12} {'probe-scored F1':>16}")
     print("-" * 38)
-    best = {"baseline": (None, -1.0), "probe": (None, -1.0)}
-    for threshold in thresholds:
-        row = []
-        for name, dump in (("baseline", base_dump), ("probe", probe_dump)):
-            result = evaluate_at(dump, threshold, metric, data_root, data_list,
-                                 categories_dir)
-            f1 = float(result.get("F1", result.get("F1_0.5", float("nan"))))
-            row.append(f1)
-            if f1 > best[name][1]:
-                best[name] = (threshold, f1)
-        print(f"{threshold:6.2f} {row[0] * 100:12.2f} {row[1] * 100:16.2f}", flush=True)
+    for i, threshold in enumerate(thresholds):
+        print(f"{threshold:6.2f} {rows['baseline'][i]['F1'] * 100:12.2f} "
+              f"{rows['probe'][i]['F1'] * 100:16.2f}")
 
     gain = (best["probe"][1] - best["baseline"][1]) * 100
     print(f"\nbaseline     best F1 {best['baseline'][1] * 100:.2f} at conf {best['baseline'][0]:.2f}")

@@ -11,6 +11,15 @@ filtering after therefore leave the same set, and so does the ``nms_topk`` cap
 (the top-k overall that clear ``t`` are exactly the top-k of those that clear
 ``t``). One dump at a low threshold gives every higher threshold exactly.
 
+Cost
+----
+Rasterizing 34,680 images is the expensive part, and it does not depend on the
+threshold, so it happens once: see ``fast_sweep.py`` for why that is exact and
+for the test that checks it against ``eval_predictions``. The earlier version of
+this script called the official evaluator once per threshold -- 44 full CULane
+evaluations for the default grid -- which is what made it look like it was
+"evaluating again and again".
+
 What it is for
 --------------
 A model whose optimum sits at 0.90 has its scores packed against 1.0, where the
@@ -32,8 +41,6 @@ from __future__ import annotations
 import argparse
 import copy
 import os
-import shutil
-import tempfile
 
 import numpy as np
 import torch
@@ -44,7 +51,9 @@ from mmengine.runner import Runner
 from mmengine.runner.checkpoint import load_checkpoint
 from mmdet.registry import MODELS
 
-from libs.datasets.metrics.culane_metric import CULaneMetric, eval_predictions
+from libs.datasets.metrics.culane_metric import CULaneMetric
+
+from fast_sweep import run_sweep, verify_official
 
 
 def _get(result, *names):
@@ -81,22 +90,16 @@ def collect(model, loader, device, max_images=None):
 
 
 def evaluate_at(dump, threshold, metric, data_root, data_list, categories_dir):
-    """Write the filtered predictions and run the official CULane evaluation."""
-    result_dir = tempfile.mkdtemp(prefix="sweep_")
-    try:
-        for sub_name, lanes, scores in dump:
-            keep = [lane for lane, score in zip(lanes, scores) if score >= threshold]
-            path = os.path.join(result_dir, str(sub_name))
-            path = os.path.splitext(path)[0] + ".lines.txt"
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            text = metric.get_prediction_string(keep)
-            with open(path, "w") as handle:
-                if text:
-                    handle.write(text + "\n")
-        return eval_predictions(result_dir, data_root, data_list, categories_dir,
-                                logger=MMLogger.get_current_instance())
-    finally:
-        shutil.rmtree(result_dir, ignore_errors=True)
+    """One official evaluation at one threshold, through the filesystem.
+
+    Correct, and the right call when you want a single reportable number with
+    its category breakdown. Do NOT put it in a loop: it re-parses all 34,680
+    annotations and re-rasterizes every lane on each call. Use ``run_sweep``
+    for a grid.
+    """
+    return verify_official(dump, threshold, metric, data_root, data_list,
+                           categories_dir,
+                           logger=MMLogger.get_current_instance())
 
 
 def main():
@@ -113,6 +116,15 @@ def main():
                     help="the threshold you selected on validation, for the "
                          "transfer-loss line")
     ap.add_argument("--max-images", type=int, default=None)
+    ap.add_argument("--jobs", type=int, default=None,
+                    help="worker processes for the rasterization pass; 1 keeps "
+                         "it in-process, which is what you want if it crashes")
+    ap.add_argument("--no-verify", action="store_true",
+                    help="skip the single official eval_predictions check at "
+                         "the peak threshold")
+    ap.add_argument("--rgb-masks", action="store_true",
+                    help="rasterize onto the official 3-channel canvas instead "
+                         "of 1 channel; 2.3x slower, provably the same IoU")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
 
@@ -150,19 +162,23 @@ def main():
         thresholds.append(round(args.picked, 4))
         thresholds.sort()
 
-    print(f"{'conf':>6} {'F1':>8} {'precision':>10} {'recall':>8}")
+    swept, _ = run_sweep({"model": dump}, thresholds, data_root, data_list,
+                         categories_dir, metric, jobs=args.jobs,
+                         verify=not args.no_verify,
+                         logger=MMLogger.get_current_instance(),
+                         rgb_masks=args.rgb_masks)
+
+    print(f"\n{'conf':>6} {'F1':>8} {'precision':>10} {'recall':>8}")
     print("-" * 36)
     rows = []
-    for threshold in thresholds:
-        result = evaluate_at(dump, threshold, metric, data_root, data_list, categories_dir)
-        f1 = float(result.get("F1", result.get("F1_0.5", float("nan"))))
-        precision = float(result.get("Precision", result.get("Precision0.5", float("nan"))))
-        recall = float(result.get("Recall", result.get("Recall0.5", float("nan"))))
-        rows.append((threshold, f1, precision, recall))
+    for result in swept["model"]:
+        threshold = result["threshold"]
+        rows.append((threshold, result["F1"], result["Precision"], result["Recall"]))
         mark = "  <- picked on val" if (args.picked is not None
                                         and abs(threshold - args.picked) < 1e-9) else ""
-        print(f"{threshold:6.2f} {f1 * 100:8.2f} {precision * 100:10.2f} "
-              f"{recall * 100:8.2f}{mark}", flush=True)
+        print(f"{threshold:6.2f} {result['F1'] * 100:8.2f} "
+              f"{result['Precision'] * 100:10.2f} "
+              f"{result['Recall'] * 100:8.2f}{mark}")
 
     best = max(rows, key=lambda r: r[1])
     print(f"\ntest-optimal: conf {best[0]:.2f} -> F1 {best[1] * 100:.2f}")
