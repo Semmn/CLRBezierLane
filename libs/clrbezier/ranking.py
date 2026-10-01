@@ -79,6 +79,8 @@ def cluster_rank_loss(
     margin: float = 0.05,
     tau: float = 0.5,
     weight_by_gap: bool = True,
+    weight_mode: str = "gap",
+    decisive_thr: float = 0.5,
     positives_only: bool = False,
     positive_mask=None,
     lane_width: float = 7.5 / 800,
@@ -110,6 +112,19 @@ def cluster_rank_loss(
         tau: logit temperature. Smaller = sharper separation demanded.
         weight_by_gap: weight each pair by ``q_i - q_j``, so clear-cut pairs
             dominate and marginal ones barely contribute.
+        weight_mode: what the weighting should chase.
+            "gap"      — by ``q_i - q_j`` (the original behaviour).
+            "decisive" — only pairs that straddle ``decisive_thr``, i.e. where
+                one member is a metric true positive and the other is not.
+                Those are the only comparisons whose outcome can turn a TP into
+                an FP; for a pair at (0.9, 0.7) NMS may keep either and F1 never
+                notices. Gap weighting is doubly misaligned with F1 here: it
+                spends weight on inconsequential pairs and under-weights the
+                hard decisive ones like (0.55, 0.45).
+            "boundary" — decisive pairs, weighted toward the threshold, so the
+                (0.55, 0.45) cases dominate the (0.95, 0.05) ones the model
+                already gets right.
+        decisive_thr: the metric's IoU threshold, 0.5 for CULane.
         positives_only: restrict to pairs where both are assigned positives.
         positive_mask: ``[K]`` bool, required when ``positives_only``.
         max_pairs: cap on supervised pairs per image (subsampled if exceeded).
@@ -119,7 +134,8 @@ def cluster_rank_loss(
     """
     device = scores.device
     zero = scores.new_zeros(())
-    stats = {"rank_pairs": zero, "rank_pair_acc": zero, "rank_logit_gap": zero}
+    stats = {"rank_pairs": zero, "rank_pair_acc": zero, "rank_logit_gap": zero,
+             "rank_decisive_frac": zero, "rank_pair_acc_dec": zero}
 
     if pred_xs.numel() == 0 or scores.numel() < 2:
         return zero, stats
@@ -164,13 +180,27 @@ def cluster_rank_loss(
             idx_i, idx_j = idx_i[sel], idx_j[sel]
         gaps = gap[idx_i, idx_j]
 
+    with torch.no_grad():
+        q_hi, q_lo = q[idx_i], q[idx_j]
+        decisive = (q_hi > decisive_thr) & (q_lo <= decisive_thr)
+        if weight_mode == "decisive":
+            raw_w = decisive.to(s.dtype)
+        elif weight_mode == "boundary":
+            # closeness of the pair to the threshold: 1 when both sit on it.
+            near = 1.0 - (q_hi - q_lo).clamp(0.0, 1.0)
+            raw_w = decisive.to(s.dtype) * near
+        elif weight_mode == "gap":
+            raw_w = gaps if weight_by_gap else torch.ones_like(gaps)
+        else:
+            raise ValueError("weight_mode must be 'gap', 'decisive' or 'boundary'")
+
     diff = s[idx_i] - s[idx_j]
     losses = F.softplus(-diff / tau)
-    if weight_by_gap:
-        weights = gaps / gaps.sum().clamp_min(1e-6)
-        loss = (losses * weights).sum()
-    else:
-        loss = losses.mean()
+    total_w = raw_w.sum()
+    if float(total_w) <= 0:
+        # no pair of consequence in this image
+        return zero, stats
+    loss = (losses * (raw_w / total_w.clamp_min(1e-6))).sum()
 
     with torch.no_grad():
         stats["rank_pairs"] = torch.as_tensor(float(idx_i.numel()), device=device)
@@ -182,6 +212,9 @@ def cluster_rank_loss(
         # focal loss produce very different gaps, so tau does not transfer
         # between them.
         stats["rank_logit_gap"] = diff.abs().mean()
+        stats["rank_decisive_frac"] = decisive.float().mean()
+        if decisive.any():
+            stats["rank_pair_acc_dec"] = (diff[decisive] > 0).float().mean()
     return loss, stats
 
 
@@ -195,8 +228,9 @@ def batch_cluster_rank_loss(scores, pred_xs, quality, valid=None,
     batch = scores.shape[0]
     total = scores.new_zeros(())
     counted = 0
-    agg = {"rank_pairs": scores.new_zeros(()), "rank_pair_acc": scores.new_zeros(()),
-           "rank_logit_gap": scores.new_zeros(())}
+    agg = {k: scores.new_zeros(()) for k in
+           ("rank_pairs", "rank_pair_acc", "rank_logit_gap",
+            "rank_decisive_frac", "rank_pair_acc_dec")}
     for b in range(batch):
         loss, stats = cluster_rank_loss(
             scores[b], pred_xs[b], quality[b],
