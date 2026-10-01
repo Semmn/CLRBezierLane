@@ -29,9 +29,11 @@ custom_imports = dict(
     ],
     allow_failed_imports=False,
 )
-cfg_name = "clrbezier_rank_r34_focal.py"
+cfg_name = "clrbezier_anchored_o2m_rank_q2q_r34.py"
 
 img_w, img_h, num_points = 800, 320, 72
+_o2m = dict(type="SimOTALaneAssigner", candidate_topk=4, min_dynamic_k=1,
+            cls_weight=1.0, point_weight=0.0, iou_weight=3.0)
 model = dict(
     type="CLRerNet",
     data_preprocessor=dict(
@@ -63,7 +65,7 @@ model = dict(
         num_points=num_points,
         prior_feat_channels=64,
         fc_hidden_dim=64,
-        num_priors=35, # Number of priors
+        num_priors=192, # Number of priors
         num_fc=2,
         refine_layers=3,
         sample_points=36,
@@ -73,22 +75,30 @@ model = dict(
         seg_num_classes=5,
         # separate final classification layer for the auxiliary branch;
         # the shared towers still receive its gradient
-        aux_cls_head=True,
+        aux_cls_head=False,
         lateral_cfg=None,
         look_forward_twice=False,
         prior_cfg=dict(delta_scale=0.1, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),
         brr_cfg=dict(cp_x_margin=0.5),
-        main_assigner=dict(type="HungarianLaneAssigner", cls_weight=1.0, point_weight=2.0, iou_weight=3.0),
+        main_assigner=_o2m,
         # per-stage override; stages not listed use main_assigner
-        main_stage_assigners=None,
-        main_quality_gate=None,
+        main_stage_assigners={"0": _o2m, "1": _o2m, "2": _o2m},
+        main_quality_gate=dict(
+            # narrow LaneIoU (~CULane metric IoU); 0.5 = already a metric TP
+            min_iou=[0.0, 0.3, 0.5],
+            keep_best=True,        # every GT keeps its best pair
+            mode="cls_and_reg",    # "cls_only": gated pairs still get regression
+            gate_on="output",      # "input": Cascade R-CNN definition (pair with re-projection)
+            warmup_iters=1500,     # thresholds ramp from 0
+        ),
         reproject_cfg=None,
+        cp_frame="anchored", # defaults to "global"
         cp_precond_cfg=None,
         rank_loss_cfg=dict(
             enabled=True,
-            loss_weight=0.3,         # lower than the one-to-one default: the
+            loss_weight=1.0,         # lower than the one-to-one default: the
                                      # CE conflict is live under one-to-many
-            stages=[2],
+            stages=[0,1,2],
             cluster_mode="distance", # CLRNet's lane NMS merges by mean |dx|, not
                                      # by IoU; "iou" can only reach 2*lane_width
                                      # (15 px) and misses most of each cluster
@@ -99,12 +109,14 @@ model = dict(
                                   # gradient dies for confident duplicates
             tau=1.0,              # logit units now, so 0.5 is sharper than
                                   # it was on probabilities
+            weight_mode='boundary',
+            decisive_thr=0.5,
 
             weight_by_gap=True,
             positives_only=False,
         ),
         aux_cfg=dict(
-            enabled=True, # Disable Auxiliary branch
+            enabled=False, # Disable Auxiliary branch
             num_groups=3,
             stages=[0, 1, 2],
             assigners=[
@@ -164,11 +176,18 @@ model = dict(
             length_unit="auto",
         ),
         gsrc_cfg=None,
-        query_attn_cfg=None
+        query_attn_cfg=dict(
+            stages=[0, 1, 2],
+            num_heads=2,
+            use_state_embedding=True,
+            use_pairwise_bias=True,
+            gate_init=0.0,
+            detach_state=True,
+        ),
     ),
     test_cfg=dict(
         # Default CLRerNet uses conf_threshold=0.41
-        conf_threshold=0.45,
+        conf_threshold=0.50,
         use_nms=True,
         as_lanes=True,
         extend_bottom=True,

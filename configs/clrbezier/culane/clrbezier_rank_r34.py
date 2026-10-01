@@ -166,7 +166,7 @@ model = dict(
     ),
     test_cfg=dict(
         # Default CLRerNet uses conf_threshold=0.41
-        conf_threshold=0.90,
+        conf_threshold=0.85,
         use_nms=True,
         as_lanes=True,
         extend_bottom=True,
