@@ -1,3 +1,4 @@
+# Visualization Tools
 # MODE=png (paper figure)
 # MODE=csv (csv file)
 # MODE=table (best / plateau table)
@@ -19,3 +20,20 @@ DATASET="culane"
 LOG_DIR="work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/$TRAIN_DIR"
 MODE=dash
 python3 -m lanevis $MODE $LOG_DIR -o $LOG_DIR/$MODE
+
+
+# Confidence Sweep Tools
+# --mode: ablate, model, gt
+CUDA_VISIBLE_DEVICES=2 python tools/clrbezier/test_curvature.py --mode ablate \
+    --data-root /exhdd/seungyu/dataset/LaneDataset/CULane \
+--data-list /exhdd/seungyu/dataset/LaneDataset/CULane/list/test.txt \
+--config /exhdd/seungyu/CLRBezierLane/configs/clrbezier/culane/clrbezier_anchored_o2m_r34.py \
+--checkpoint /exhdd/seungyu/CLRBezierLane/work_dirs/clrbezier/culane/clrbezier_anchored_o2m_r34/run1/epoch_36.pth \
+--jobs 8 --expect-f1 80.56
+
+CUDA_VISIBLE_DEVICES=2 python tools/clrbezier/test_curvature.py --mode ablate \
+    --data-root /exhdd/seungyu/dataset/LaneDataset/CULane \
+--data-list /exhdd/seungyu/dataset/LaneDataset/CULane/list/test.txt \
+--config /exhdd/seungyu/CLRBezierLane/configs/clrernet/culane/clrernet_culane_r34.py \
+--checkpoint /exhdd/seungyu/CLRBezierLane/work_dirs/clrernet/culane/clrernet_culane_r34_e36/run1/epoch_36.pth \
+--jobs 8 --expect-f1 80.38

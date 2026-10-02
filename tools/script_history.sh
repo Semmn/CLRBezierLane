@@ -914,3 +914,21 @@ TRAIN_PID=$!
 echo "Training launcher PID: $TRAIN_PID"
 disown -h "$TRAIN_PID"
 tail -f "$LOG"
+
+CONFIG_NAME="clrbezier_anchored_o2o_r34_e20_nms"
+MODEL_NAME="clrbezier"
+PORT=25003
+DATASET=culane
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/run1
+LOG="$WORK_DIR/train.log"
+mkdir -p "$WORK_DIR"
+nohup env CUDA_VISIBLE_DEVICES=2 PORT=$PORT \
+    bash tools/dist_train.sh \
+    /exhdd/seungyu/CLRBezierLane/configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py \
+    1 \
+    --work-dir "$WORK_DIR" \
+    > "$LOG" 2>&1 < /dev/null &
+TRAIN_PID=$!
+echo "Training launcher PID: $TRAIN_PID"
+disown -h "$TRAIN_PID"
+tail -f "$LOG"

@@ -320,6 +320,14 @@ def main():
     tp, fp, fn = official_counts(sel, 0.10)
     ok &= report("per-category F1 matches",
                  abs(fast_rows[0][f"F1_{cat}_{MAIN_IOU}"] - f1_of(tp, fp, fn)) < 1e-12)
+    # ...and at EVERY IoU level, not only the main one. Gating per-category on
+    # MAIN_IOU silently produced an empty 0.75 breakdown downstream.
+    for level in IOU_THRESHOLDS:
+        tp, fp, fn = official_counts(sel, 0.10, level)
+        key = f"F1_{cat}_{level}"
+        ok &= report(f"per-category F1 present and correct at IoU {level}",
+                     key in fast_rows[0]
+                     and abs(fast_rows[0][key] - f1_of(tp, fp, fn)) < 1e-12)
 
     # The single-channel canvas. This is the one optimization that touches the
     # IoU value itself rather than how often it is computed, so it is checked on

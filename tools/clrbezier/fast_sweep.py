@@ -263,7 +263,12 @@ def sweep(records, thresholds, iou_thresholds=IOU_THRESHOLDS, per_category=False
                         f"F1_{iou_thr}": f1})
             if iou_thr == MAIN_IOU:
                 out.update({"F1": f1, "Precision": prec, "Recall": rec})
-            if per_category and iou_thr == MAIN_IOU:
+            # Every IoU level, not just the main one. Gating this on MAIN_IOU
+            # emitted only F1_<cat>_0.5 keys, so a caller asking for the 0.75
+            # breakdown got None for every category and printed an empty table --
+            # the per-level hits are already computed, so the restriction bought
+            # nothing and silently withheld the level that matters most here.
+            if per_category:
                 cats = sorted({r["cat"] for r in records})
                 for cat in cats:
                     sel = [(r, h) for r, h in zip(records, hits) if r["cat"] == cat]
@@ -340,7 +345,8 @@ def check_against_official(records, dump, threshold, metric, data_root,
 
 def run_sweep(dumps: dict, thresholds, data_root: str, data_list: str,
               categories_dir: str, metric, jobs: int = None,
-              verify: bool = True, logger=None, rgb_masks: bool = False):
+              verify: bool = True, logger=None, rgb_masks: bool = False,
+              return_records: bool = False):
     """Sweep one or more dumps over one threshold grid.
 
     ``dumps`` maps a label ("nms", "fuse", "baseline", "probe") to a dump from
@@ -383,4 +389,9 @@ def run_sweep(dumps: dict, thresholds, data_root: str, data_list: str,
             check_against_official(records[label], dumps[label], best[label][0],
                                    metric, data_root, data_list, categories_dir,
                                    logger=logger)
+    # The cached IoU matrices cost one rasterization pass each; handing them back
+    # lets a caller re-aggregate (per category, at another IoU level) for free
+    # instead of paying for that pass again.
+    if return_records:
+        return rows, best, records
     return rows, best
