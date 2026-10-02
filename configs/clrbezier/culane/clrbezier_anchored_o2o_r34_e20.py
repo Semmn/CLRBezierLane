@@ -29,11 +29,9 @@ custom_imports = dict(
     ],
     allow_failed_imports=False,
 )
-cfg_name = "clrbezier_anchored_o2m_r34.py"
+cfg_name = "clrbezier_anchored_o2o_r34_e20.py"
 
 img_w, img_h, num_points = 800, 320, 72
-_o2m = dict(type="SimOTALaneAssigner", candidate_topk=4, min_dynamic_k=1,
-            cls_weight=1.0, point_weight=0.0, iou_weight=3.0)
 model = dict(
     type="CLRerNet",
     data_preprocessor=dict(
@@ -65,7 +63,7 @@ model = dict(
         num_points=num_points,
         prior_feat_channels=64,
         fc_hidden_dim=64,
-        num_priors=192, # Number of priors
+        num_priors=35, # Number of priors
         num_fc=2,
         refine_layers=3,
         sample_points=36,
@@ -75,22 +73,15 @@ model = dict(
         seg_num_classes=5,
         # separate final classification layer for the auxiliary branch;
         # the shared towers still receive its gradient
-        aux_cls_head=False,
+        aux_cls_head=True,
         lateral_cfg=None,
         look_forward_twice=False,
         prior_cfg=dict(delta_scale=0.1, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),
         brr_cfg=dict(cp_x_margin=0.5),
-        main_assigner=_o2m,
+        main_assigner=dict(type="HungarianLaneAssigner", cls_weight=1.0, point_weight=2.0, iou_weight=3.0),
         # per-stage override; stages not listed use main_assigner
-        main_stage_assigners={"0": _o2m, "1": _o2m, "2": _o2m},
-        main_quality_gate=dict(
-            # narrow LaneIoU (~CULane metric IoU); 0.5 = already a metric TP
-            min_iou=[0.0, 0.3, 0.5],
-            keep_best=True,        # every GT keeps its best pair
-            mode="cls_and_reg",    # "cls_only": gated pairs still get regression
-            gate_on="output",      # "input": Cascade R-CNN definition (pair with re-projection)
-            warmup_iters=1500,     # thresholds ramp from 0
-        ),
+        main_stage_assigners=None,
+        main_quality_gate=None,
         reproject_cfg=None,
         cp_frame="anchored", # defaults to "global"
         cp_precond_cfg=None,
@@ -116,7 +107,7 @@ model = dict(
             positives_only=False,
         ),
         aux_cfg=dict(
-            enabled=False, # Disable Auxiliary branch
+            enabled=True, # Disable Auxiliary branch
             num_groups=3,
             stages=[0, 1, 2],
             assigners=[
@@ -140,7 +131,7 @@ model = dict(
             clamp_x=True, clamp_y=True,
         ),
         loss_cfg=dict(
-            use_focal=True,
+            use_focal=False,
             iou_loss_type="laneiou",     # regression loss = 1 - GLIoU
             cost_iou_type="laneiou",     # "laneiou" or "gliou"
             cls_bg_weight=0.4,
@@ -180,7 +171,7 @@ model = dict(
     ),
     test_cfg=dict(
         # Default CLRerNet uses conf_threshold=0.41
-        conf_threshold=0.43,
+        conf_threshold=0.85,
         use_nms=True,
         as_lanes=True,
         extend_bottom=True,
@@ -193,14 +184,14 @@ model = dict(
 )
 
 # Number of epochs
-total_epochs = 36
+total_epochs = 20 #  Single GPU training
 checkpoint_config = dict(interval=total_epochs)
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=total_epochs, val_interval=3)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
 # Batch size (Number of batch size per GPU)
-train_dataloader=dict(batch_size=32)
+train_dataloader=dict(batch_size=32) # Batch Size 32
 randomness = dict(seed=0, deterministic=True)
 optim_wrapper = dict(type='OptimWrapper', optimizer=dict(type="AdamW", lr=6e-4))
 param_scheduler = [

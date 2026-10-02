@@ -806,3 +806,111 @@ TRAIN_PID=$!
 echo "Training launcher PID: $TRAIN_PID"
 disown -h "$TRAIN_PID"
 tail -f "$LOG"
+
+# ================================================================================================
+# Visited at the 2026.10.02
+# Rank Loss on the principled design
+CONFIG_NAME="clrbezier_anchored_o2m_rank_q2q_r34"
+MODEL_NAME="clrbezier"
+DATASET="culane"
+TRAIN_EXP_NAME="run1"
+EVAL_EXP_NAME="test1"
+GPU_ID=0
+EPOCHS=36
+CONFIG=/exhdd/seungyu/CLRBezierLane/configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py
+CHECKPOINT=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/$TRAIN_EXP_NAME/epoch_$EPOCHS.pth
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/$EVAL_EXP_NAME
+LOG="$WORK_DIR/test.log"
+mkdir -p "$WORK_DIR"
+nohup env \
+    CUDA_VISIBLE_DEVICES=$GPU_ID \
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+    python3 tools/test.py \
+    "$CONFIG" \
+    "$CHECKPOINT" \
+    --work-dir "$WORK_DIR" \
+    > "$LOG" 2>&1 < /dev/null &
+TEST_PID=$!
+echo "Testing PID: $TEST_PID"
+disown -h "$TEST_PID"
+tail -f "$LOG"
+
+
+CONFIG_NAME="clrbezier_anchored_o2m_r34"
+MODEL_NAME="clrbezier"
+DATASET="culane"
+TRAIN_EXP_NAME="run1"
+EVAL_EXP_NAME="test1"
+GPU_ID=1
+EPOCHS=36
+CONFIG=/exhdd/seungyu/CLRBezierLane/configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py
+CHECKPOINT=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/$TRAIN_EXP_NAME/epoch_$EPOCHS.pth
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/$EVAL_EXP_NAME
+LOG="$WORK_DIR/test.log"
+mkdir -p "$WORK_DIR"
+nohup env \
+    CUDA_VISIBLE_DEVICES=$GPU_ID \
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+    python3 tools/test.py \
+    "$CONFIG" \
+    "$CHECKPOINT" \
+    --work-dir "$WORK_DIR" \
+    > "$LOG" 2>&1 < /dev/null &
+TEST_PID=$!
+echo "Testing PID: $TEST_PID"
+disown -h "$TEST_PID"
+tail -f "$LOG"
+
+CONFIG_NAME="clrbezier_anchored_o2m_r34_e20"
+MODEL_NAME="clrbezier"
+PORT=25000
+DATASET=culane
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/run1
+LOG="$WORK_DIR/train.log"
+mkdir -p "$WORK_DIR"
+nohup env CUDA_VISIBLE_DEVICES=0 PORT=$PORT \
+    bash tools/dist_train.sh \
+    /exhdd/seungyu/CLRBezierLane/configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py \
+    1 \
+    --work-dir "$WORK_DIR" \
+    > "$LOG" 2>&1 < /dev/null &
+TRAIN_PID=$!
+echo "Training launcher PID: $TRAIN_PID"
+disown -h "$TRAIN_PID"
+tail -f "$LOG"
+
+CONFIG_NAME="clrbezier_anchored_o2m_r34_lr"
+MODEL_NAME="clrbezier"
+PORT=25001
+DATASET=culane
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/run1
+LOG="$WORK_DIR/train.log"
+mkdir -p "$WORK_DIR"
+nohup env CUDA_VISIBLE_DEVICES=4,5,6,7 PORT=$PORT \
+    bash tools/dist_train.sh \
+    /exhdd/seungyu/CLRBezierLane/configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py \
+    4 \
+    --work-dir "$WORK_DIR" \
+    > "$LOG" 2>&1 < /dev/null &
+TRAIN_PID=$!
+echo "Training launcher PID: $TRAIN_PID"
+disown -h "$TRAIN_PID"
+tail -f "$LOG"
+
+CONFIG_NAME="clrbezier_anchored_o2o_r34_e20"
+MODEL_NAME="clrbezier"
+PORT=25002
+DATASET=culane
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/run1
+LOG="$WORK_DIR/train.log"
+mkdir -p "$WORK_DIR"
+nohup env CUDA_VISIBLE_DEVICES=1 PORT=$PORT \
+    bash tools/dist_train.sh \
+    /exhdd/seungyu/CLRBezierLane/configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py \
+    1 \
+    --work-dir "$WORK_DIR" \
+    > "$LOG" 2>&1 < /dev/null &
+TRAIN_PID=$!
+echo "Training launcher PID: $TRAIN_PID"
+disown -h "$TRAIN_PID"
+tail -f "$LOG"

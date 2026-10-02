@@ -29,7 +29,7 @@ custom_imports = dict(
     ],
     allow_failed_imports=False,
 )
-cfg_name = "clrbezier_anchored_o2m_r34.py"
+cfg_name = "clrbezier_anchored_o2m_r34_lr.py"
 
 img_w, img_h, num_points = 800, 320, 72
 _o2m = dict(type="SimOTALaneAssigner", candidate_topk=4, min_dynamic_k=1,
@@ -193,16 +193,16 @@ model = dict(
 )
 
 # Number of epochs
-total_epochs = 36
+total_epochs = 15 # Multi-GPU Training
 checkpoint_config = dict(interval=total_epochs)
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=total_epochs, val_interval=3)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
 # Batch size (Number of batch size per GPU)
-train_dataloader=dict(batch_size=32)
+train_dataloader=dict(batch_size=32) # Batch Size 32
 randomness = dict(seed=0, deterministic=True)
-optim_wrapper = dict(type='OptimWrapper', optimizer=dict(type="AdamW", lr=6e-4))
+optim_wrapper = dict(type='OptimWrapper', optimizer=dict(type="AdamW", lr=32e-4)) # 5.3 times
 param_scheduler = [
     dict(type='CosineAnnealingLR', eta_min=0, begin=0, T_max=total_epochs, end=total_epochs, by_epoch=True, convert_to_iter_based=True),
 ]
