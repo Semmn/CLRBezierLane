@@ -490,7 +490,7 @@ class CLRBezierHead(_OfficialHead):
         _, on_map = brr_reference(cp_x, y_start, y_start + one_row, **geo)
 
         pooled_stages, preds, states = [], [], []
-        input_xs, reproj_stats, precond_stats = [], [], []
+        input_xs, reproj_stats, precond_stats, moe_stats = [], [], [], []
         step = self._step_cache
         for stage in range(self.refine_layers):
             if self._need_input_xs:
@@ -509,6 +509,9 @@ class CLRBezierHead(_OfficialHead):
                                       reference_points=ref_pts, reference_valid_mask=ref_mask)
             else:
                 roi = self.roi_gather(pooled_stages, feats[stage], stage)
+            gather_stats = getattr(self.roi_gather, "last_stats", None)
+            if gather_stats:
+                moe_stats.append(gather_stats)
             if self.gsrc is not None:
                 roi = self.gsrc.inject(stage, roi, context_tokens)
             if self.query_attn is not None and stage in self.query_attn_stages:
@@ -581,7 +584,7 @@ class CLRBezierHead(_OfficialHead):
                 else:
                     cp_x, y_start, on_map = next_x.detach(), new_y.detach(), next_map.detach()
         return preds, states, dict(input_xs=input_xs or None, reproj=reproj_stats,
-                                   precond=precond_stats)
+                                   precond=precond_stats, moe=moe_stats)
 
     def gsrc_tokens(self, feats):
         """Global context tokens from the coarsest FPN level ([B, H*W, C])."""
@@ -594,7 +597,9 @@ class CLRBezierHead(_OfficialHead):
         main_preds, main_states, main_extra = self._refine(feats, clean_cp, tokens)
         out = dict(main_preds=main_preds, main_states=main_states,
                    main_input_xs=main_extra["input_xs"], reproj=main_extra["reproj"],
-                   precond=main_extra["precond"])
+                   precond=main_extra["precond"], moe=main_extra.get("moe", []))
+        if self.gsrc is not None and getattr(self.gsrc, "last_stats", None):
+            out["moe_gsrc"] = dict(self.gsrc.last_stats)
 
         if self.aux_enabled and self.aux_num_groups > 0:
             m = self.aux_num_groups
@@ -696,6 +701,25 @@ class CLRBezierHead(_OfficialHead):
             for key in outs["precond"][0]:
                 diag[key] = torch.stack([st[key] for st in outs["precond"]]).mean()
 
+        # MoE router diagnostics. Keys come from whatever the gate reports rather
+        # than a hardcoded list, so a gate and a head from different versions
+        # cannot disagree about the key set.
+        moe_balance = None
+        moe_sources = list(outs.get("moe", []))
+        if outs.get("moe_gsrc"):
+            moe_sources.append({f"gsrc_{k}": v for k, v in outs["moe_gsrc"].items()})
+        if moe_sources:
+            from .moe import finalize_moe_stats, merge_moe_stats
+            acc = {}
+            for st in moe_sources:
+                merge_moe_stats(acc, {k: v for k, v in st.items()
+                                      if not k.endswith("balance_loss")})
+            diag.update(finalize_moe_stats(acc))
+            balances = [v for st in moe_sources for k, v in st.items()
+                        if k.endswith("balance_loss")]
+            if balances:
+                moe_balance = torch.stack([b.reshape(()) for b in balances]).mean()
+
         if "aux_preds" in outs:
             aux = self._branch_losses(outs["aux_preds"], outs["aux_states"], valid_targets, gt_cps,
                                       self._aux_pairs, self.aux_stages, apply_brr=self.aux_apply_brr,
@@ -723,6 +747,12 @@ class CLRBezierHead(_OfficialHead):
         )
         if rank is not None:
             losses["loss_rank"] = rank * self.rank_loss_weight
+        if moe_balance is not None:
+            # Hard gating only. cv_squared(importance) + cv_squared(load), already
+            # scaled by the gate's balance_weight. Watch it against loss_cls: a
+            # balance term that dominates is steering the model to spread tokens
+            # rather than to detect lanes.
+            losses["loss_moe_balance"] = moe_balance
         if seg_gt is not None:
             seg_loss = F.nll_loss(F.log_softmax(outs["seg"], dim=1), seg_gt,
                                   weight=self.seg_class_weights, ignore_index=self.seg_ignore_label)

@@ -121,19 +121,34 @@ class RowColumnBlock(nn.Module):
 
 
 class TokenTransformerBlock(nn.Module):
-    """Pre-norm self-attention + MLP over flattened tokens."""
+    """Pre-norm self-attention + MLP over flattened tokens.
 
-    def __init__(self, dim, num_heads=4, ffn_dim=256, drop=0.0):
+    ``moe_cfg`` replaces the MLP with a mixture of experts. This is the one place
+    in the head that matches V-MoE's own placement -- the FFN of a block over
+    real tokens (250 of them at (10, 25)) -- rather than a leaf read-out. See
+    ``libs/clrbezier/moe.py`` for why soft gating comes first.
+    """
+
+    def __init__(self, dim, num_heads=4, ffn_dim=256, drop=0.0, moe_cfg=None):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, num_heads, dropout=drop, batch_first=True)
         self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(),
-                                 nn.Dropout(drop), nn.Linear(ffn_dim, dim))
+        self.moe = bool(moe_cfg)
+        if self.moe:
+            from .moe import MoEFFN
+            self.mlp = MoEFFN(dim, hidden_dim=ffn_dim, dropout=drop, **dict(moe_cfg))
+        else:
+            self.mlp = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(),
+                                     nn.Dropout(drop), nn.Linear(ffn_dim, dim))
+        self.last_stats = {}
 
     def forward(self, tokens):
         x = self.norm1(tokens)
         tokens = tokens + self.attn(x, x, x, need_weights=False)[0]
+        if self.moe:
+            update, self.last_stats = self.mlp(self.norm2(tokens))
+            return tokens + update
         return tokens + self.mlp(self.norm2(tokens))
 
 
@@ -154,8 +169,10 @@ class GSRCContext(nn.Module):
 
     def __init__(self, in_channels=64, proj_dim=64, feat_size=(10, 25), num_layers=2,
                  ffn_dim=256, ffn_drop=0.25, attn_drop=0.1, context_branch="transformer",
-                 num_heads=4, use_pos_embed=True, segman_cfg=None):
+                 num_heads=4, use_pos_embed=True, segman_cfg=None, moe_cfg=None):
         super().__init__()
+        self.moe_cfg = dict(moe_cfg) if moe_cfg else None
+        self.last_stats = {}
         self.feat_size = (int(feat_size[0]), int(feat_size[1]))
         self.proj_dim = int(proj_dim)
         self.context_branch = context_branch
@@ -171,8 +188,12 @@ class GSRCContext(nn.Module):
         elif context_branch == "transformer":
             self.ctx_proj = nn.Conv2d(in_channels, proj_dim, kernel_size=1)
             self.ctx_layer = nn.ModuleList([
-                TokenTransformerBlock(proj_dim, num_heads, ffn_dim) for _ in range(num_layers)])
+                TokenTransformerBlock(proj_dim, num_heads, ffn_dim, moe_cfg=self.moe_cfg)
+                for _ in range(num_layers)])
         elif context_branch == "segman":
+            if self.moe_cfg:
+                raise ValueError("moe_cfg applies to the transformer context branch; "
+                                 "the segman branch has no TokenTransformerBlock FFN")
             from libs.models.necks.gsrc_fpn import BasicLayer_Norm  # noqa: WPS433
             from libs.models.necks.gsrc_fpn import LayerNorm2d as GsrcLayerNorm2d
             cfg = dict(embed_dim=proj_dim, depth=num_layers, num_heads=2, window_size=7,
@@ -206,8 +227,13 @@ class GSRCContext(nn.Module):
                 ctx = self._flatten(ctx)
                 if self.pos_embed is not None:
                     ctx = ctx + self.pos_embed
+                from .moe import finalize_moe_stats, merge_moe_stats
+                acc = {}
                 for block in self.ctx_layer:
                     ctx = block(ctx)
+                    if getattr(block, "last_stats", None):
+                        merge_moe_stats(acc, block.last_stats)
+                self.last_stats = finalize_moe_stats(acc) if acc else {}
             else:
                 ctx = self._flatten(self.ctx_layer(ctx))
             query = self.cross_norm_q(tokens if self.pos_embed is None else tokens + self.pos_embed)
@@ -307,6 +333,11 @@ class GSRCModule(nn.Module):
     def zero_init(self):
         for module in self.injections.values():
             module.zero_init()
+
+    @property
+    def last_stats(self):
+        """MoE router diagnostics from the most recent ``tokens()`` call."""
+        return getattr(self.context, "last_stats", {})
 
     def tokens(self, feat):
         return self.context(feat)
