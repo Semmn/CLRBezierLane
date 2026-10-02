@@ -61,3 +61,6 @@ kernels/selective_scan/selective_scan.egg-info/
 
 # Lane Visualization Local Script
 lanevis/local_script.sh
+
+# Exclude llamas cache folder
+cache
