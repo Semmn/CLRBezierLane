@@ -177,9 +177,15 @@ class _ExpertStack(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``[..., in]`` -> ``[..., E, out]``."""
-        out = torch.einsum("...i,eoi->...eo", x, self.weight)
+        # Align dtypes explicitly. Under AMP the activation arrives as fp16 while
+        # the parameter stays fp32; einsum is on the autocast list so it would
+        # usually be handled, but outside an autocast region (an eval pass, a
+        # diagnostic script, a hook) mixed dtypes raise. The comparison makes this
+        # a no-op in the common case.
+        weight = self.weight if self.weight.dtype == x.dtype else self.weight.to(x.dtype)
+        out = torch.einsum("...i,eoi->...eo", x, weight)
         if self.bias is not None:
-            out = out + self.bias
+            out = out + self.bias.to(out.dtype)
         return out
 
     @torch.no_grad()
@@ -250,9 +256,11 @@ class MoEFFN(nn.Module):
         h = self.drop(self.act(self.fc1(x)))                      # [..., E, hidden]
         # fc2 holds one matrix per expert and h already carries the expert axis,
         # so contract per-expert rather than through _ExpertStack.forward.
-        out = torch.einsum("...eh,eoh->...eo", h, self.fc2.weight)
+        w2 = self.fc2.weight
+        w2 = w2 if w2.dtype == h.dtype else w2.to(h.dtype)
+        out = torch.einsum("...eh,eoh->...eo", h, w2)
         if self.fc2.bias is not None:
-            out = out + self.fc2.bias
+            out = out + self.fc2.bias.to(out.dtype)
         out = (out * weights.unsqueeze(-1)).sum(dim=-2)
         stats["moe_expert_divergence"] = self.fc1.divergence()
         return out, stats
