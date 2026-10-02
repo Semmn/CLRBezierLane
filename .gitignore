@@ -22,11 +22,6 @@ wandb/
 *.mov
 *.mkv
 
-# Dataset
-data/
-dataset/
-datasets/
-
 # Python cache
 __pycache__/
 *.pyc
