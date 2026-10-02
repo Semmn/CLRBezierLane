@@ -206,7 +206,7 @@ model = dict(
                 feat_size=(10, 25),
                 num_layers=2,
                 ffn_dim=256,
-                ffn_drop=0.25,
+                ffn_drop=0.1,
                 attn_drop=0.1,
                 context_branch="transformer",  # "segman" (needs natten + selective_scan) | "none"
                 moe_cfg=dict(
@@ -218,11 +218,23 @@ model = dict(
                 # above 0 or the experts have collapsed onto each other.
                 num_heads=4,
                 use_pos_embed=True,
+                # The structure branch's residual is fixed here. The ported
+                # RowColumnBlock added norm(x) instead of x, so it was not a
+                # residual block at all: it could not represent the identity, it
+                # destroyed the activation scale at every block, and the gradient
+                # had to pass through LayerNorm's rank-deficient Jacobian with no
+                # highway back. Set struct_residual="legacy" to reproduce it.
+                struct_residual="pre_norm",
+                struct_layer_scale=1e-2,   # small, not 0: at 0 the branch is dead
             ),
             injection_cfg=dict(
+                # gamma starts at 0, so the context branch -- and the router inside it
+                # -- receives NO gradient on step 1 and only begins learning once the
+                # gate opens. Harmless for a long run, wasteful for a router you want
+                # to watch sharpen. 1e-2 starts it live while staying near-identity.
                 num_heads=4,
                 fuse="gate",               # "concat" reproduces the v2-head style fusion
-                gate_init=0.0,             # 1e-2 to make GSRC active from iteration 0
+                gate_init=1e-2,             # 1e-2 to make GSRC active from iteration 0
                 query_self_attention=False,  # separate ablation for the one-to-one branch
             ),
         ),

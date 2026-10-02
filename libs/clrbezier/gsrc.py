@@ -54,7 +54,6 @@ class ConvFFN(nn.Module):
     def forward(self, x):
         x = self.act_layer(self.fc1(x))
         x = x + self.dwconv(x)
-        x = self.drop(x)
         return self.drop(self.fc2(x))
 
 
@@ -104,20 +103,64 @@ class RowColumnAttention(nn.Module):
 
 
 class RowColumnBlock(nn.Module):
-    def __init__(self, dim, feat_size, ffn_dim, attn_drop=0.1, ffn_drop=0.25):
+    """Pre-norm residual row-column attention + ConvFFN.
+
+    The ported version was **not a residual block**:
+
+        x_norm = norm(x)
+        x = x_norm + attn(x_norm)        # the skip carries norm(x), not x
+
+    A pre-norm residual is ``x + attn(norm(x))``. Adding the *normalized*
+    activation instead of the original breaks the identity path in three ways:
+    the block cannot represent the identity (so it cannot start as a no-op, which
+    the module docstring claims GSRC does); the activation scale is destroyed at
+    every block and never restored; and the gradient has to pass through
+    LayerNorm's Jacobian, which projects out the mean and is rank-deficient, so
+    there is no clean highway back through ``num_layers`` blocks. That is a
+    plausible reason GSRC has never been a clear win in the ablations.
+
+    ``layer_scale_init`` adds a per-channel LayerScale on both branches so the
+    block *does* start near identity. It is small rather than zero on purpose:
+    at exactly zero the branch parameters receive no gradient at all (the same
+    trap as the deformable offsets and the MoE experts), so the block would start
+    dead rather than quiet.
+
+    ``residual="legacy"`` restores the ported behaviour for an A/B, since the fix
+    changes what the module computes and existing GSRC weights were trained
+    against the old form.
+    """
+
+    def __init__(self, dim, feat_size, ffn_dim, attn_drop=0.1, ffn_drop=0.1,
+                 residual="pre_norm", layer_scale_init=1e-2):
         super().__init__()
+        if residual not in ("pre_norm", "legacy"):
+            raise ValueError("residual must be 'pre_norm' or 'legacy'")
+        self.residual = residual
         self.rc_attn = RowColumnAttention(dim, dim, feat_size)
-        self.ffn = ConvFFN(dim, ffn_dim)
+        self.ffn = ConvFFN(dim, ffn_dim, dropout=ffn_drop)
         self.layer_norm1 = LayerNorm2d(dim)
         self.layer_norm2 = LayerNorm2d(dim)
         self.attn_dropout = nn.Dropout2d(attn_drop) if attn_drop > 0 else nn.Identity()
         self.ffn_dropout = nn.Dropout2d(ffn_drop) if ffn_drop > 0 else nn.Identity()
+        if residual == "pre_norm" and layer_scale_init is not None:
+            self.gamma_attn = nn.Parameter(torch.full((dim,), float(layer_scale_init)))
+            self.gamma_ffn = nn.Parameter(torch.full((dim,), float(layer_scale_init)))
+        else:
+            self.gamma_attn = self.gamma_ffn = None
+
+    def _scale(self, gamma, update):
+        return update if gamma is None else update * gamma.view(1, -1, 1, 1)
 
     def forward(self, x):
-        x_norm = self.layer_norm1(x)
-        x = x_norm + self.attn_dropout(self.rc_attn(x_norm))
-        x_norm = self.layer_norm2(x)
-        return x_norm + self.ffn_dropout(self.ffn(x_norm))
+        if self.residual == "legacy":
+            x_norm = self.layer_norm1(x)
+            x = x_norm + self.attn_dropout(self.rc_attn(x_norm))
+            x_norm = self.layer_norm2(x)
+            return x_norm + self.ffn_dropout(self.ffn(x_norm))
+        x = x + self._scale(self.gamma_attn,
+                            self.attn_dropout(self.rc_attn(self.layer_norm1(x))))
+        return x + self._scale(self.gamma_ffn,
+                               self.ffn_dropout(self.ffn(self.layer_norm2(x))))
 
 
 class TokenTransformerBlock(nn.Module):
@@ -161,6 +204,17 @@ class GSRCContext(nn.Module):
         feat_size: (H, W) of the source map; 800x320 input -> (10, 25).
         num_layers: blocks per branch.
         ffn_dim / ffn_drop: FFN width and dropout of the structure branch.
+            ffn_drop defaults to 0.1, down from the ported 0.25: it drives a
+            ``Dropout2d``, which zeroes whole CHANNELS rather than elements, so
+            0.25 on 64 channels removed 16 of them per sample from a module whose
+            job is to carry global context. Combined with the broken residual
+            above that was a lot of pressure on a branch that could not route
+            around it.
+        struct_residual: "pre_norm" (fixed) or "legacy" (the ported non-residual
+            form), for an A/B against existing GSRC checkpoints.
+        struct_layer_scale: per-channel LayerScale init on both branches of each
+            structure block. Small, not zero -- at zero the branch gets no
+            gradient.
         context_branch: "transformer" (default, dependency-free),
             "segman" (BasicLayer_Norm from libs/models/necks/gsrc_fpn.py; needs
             natten and selective_scan_cuda_oflex), or "none" (structure only).
@@ -168,8 +222,9 @@ class GSRCContext(nn.Module):
     """
 
     def __init__(self, in_channels=64, proj_dim=64, feat_size=(10, 25), num_layers=2,
-                 ffn_dim=256, ffn_drop=0.25, attn_drop=0.1, context_branch="transformer",
-                 num_heads=4, use_pos_embed=True, segman_cfg=None, moe_cfg=None):
+                 ffn_dim=256, ffn_drop=0.1, attn_drop=0.1, context_branch="transformer",
+                 num_heads=4, use_pos_embed=True, segman_cfg=None, moe_cfg=None,
+                 struct_residual="pre_norm", struct_layer_scale=1e-2):
         super().__init__()
         self.moe_cfg = dict(moe_cfg) if moe_cfg else None
         self.last_stats = {}
@@ -180,7 +235,8 @@ class GSRCContext(nn.Module):
 
         self.struct_proj = nn.Conv2d(in_channels, proj_dim, kernel_size=1)
         self.struct_layer = nn.Sequential(*[
-            RowColumnBlock(proj_dim, self.feat_size, ffn_dim, attn_drop, ffn_drop)
+            RowColumnBlock(proj_dim, self.feat_size, ffn_dim, attn_drop, ffn_drop,
+                           residual=struct_residual, layer_scale_init=struct_layer_scale)
             for _ in range(num_layers)])
 
         if context_branch == "none":

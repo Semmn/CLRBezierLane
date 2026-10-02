@@ -161,7 +161,8 @@ class CurveDeformableSampler(nn.Module):
                  num_offsets: int = 4, max_normal_offset: float = 2.0,
                  offset_mode: str = "normal", max_tangent_offset: float = 1.0,
                  residual_scale_init: float = 0.1, init_mode: str = "symmetry_broken",
-                 offset_init_gain: float = 0.1, moe_cfg: Optional[dict] = None):
+                 offset_init_gain: float = 0.1, moe_cfg: Optional[dict] = None,
+                 route_per_lane: bool = False):
         super().__init__()
         if num_offsets < 2:
             raise ValueError("num_offsets must be >= 2 (index 0 is the reference point)")
@@ -185,6 +186,17 @@ class CurveDeformableSampler(nn.Module):
         self.max_tangent_offset = float(max_tangent_offset)
         self.init_mode = init_mode
         self.offset_init_gain = float(offset_init_gain)
+        # Routing granularity. The router reads `point_query`, which exists per
+        # (lane, row-along-lane) pair, so by default a single lane can send its
+        # far-field end to one expert and its near-field end to another:
+        # K * S = 3456 decisions per image at K=192, S=18. That is the better
+        # default here precisely because the thin informative-token count is the
+        # main risk -- more decisions means more signal per expert.
+        # route_per_lane=True routes on the lane query alone (K = 192 decisions),
+        # which is the coarser "this lane is a curve lane -> curve expert" story:
+        # more interpretable, and the right choice if you want the gate to
+        # correlate with a per-lane label, at 18x less routing signal.
+        self.route_per_lane = bool(route_per_lane)
 
         self.value_proj = nn.Conv2d(in_channels, hidden_dim, 1)
         # One projection on the concatenation rather than three summed Linear(D,D):
@@ -286,8 +298,15 @@ class CurveDeformableSampler(nn.Module):
             (query.unsqueeze(2).expand(b, k, s, query.shape[-1]), centre, geometry), dim=-1)))
 
         if self.moe_cfg:
-            raw, moe_stats = self.offset_head(point_query)
+            route_on = None
+            if self.route_per_lane:
+                # One decision per lane, broadcast to its points.
+                route_on = query.unsqueeze(2).expand(b, k, s, query.shape[-1])
+            raw, moe_stats = self.offset_head(point_query, route_on=route_on)
             stats.update(moe_stats)
+            stats["moe_decisions"] = torch.tensor(
+                float(b * k if self.route_per_lane else b * k * s),
+                device=point_query.device)
         else:
             raw = self.offset_head(point_query)
         raw = raw.reshape(b, k, s, self.num_offsets - 1, self.offset_dim)
@@ -346,7 +365,7 @@ class CurveAlignedDeformableROIGather(ROIGather):
                  deform_offset_mode="normal", deform_max_normal_offset=2.0,
                  deform_max_tangent_offset=1.0, deform_residual_scale=0.1,
                  deform_init_mode="symmetry_broken", deform_offset_init_gain=0.1,
-                 deform_moe_cfg=None, **retired):
+                 deform_moe_cfg=None, deform_route_per_lane=False, **retired):
         super().__init__(in_channels, num_priors, sample_points, fc_hidden_dim,
                          refine_layers, mid_channels=mid_channels)
         ignored = sorted(k for k in retired if k in RETIRED_KEYS)
@@ -368,6 +387,7 @@ class CurveAlignedDeformableROIGather(ROIGather):
             offset_mode=deform_offset_mode, max_tangent_offset=deform_max_tangent_offset,
             residual_scale_init=deform_residual_scale, init_mode=deform_init_mode,
             offset_init_gain=deform_offset_init_gain, moe_cfg=deform_moe_cfg,
+            route_per_lane=deform_route_per_lane,
         ) if self.use_deformable else None
         self.last_stats: dict = {}
 
