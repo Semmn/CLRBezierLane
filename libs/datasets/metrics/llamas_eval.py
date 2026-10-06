@@ -209,10 +209,12 @@ def eval_predictions(pred_dir,
             label_paths = pkl.load(cache_file)
     else:
         annotations, label_paths = load_labels(anno_dir)
-        with open(annotations_path, 'wb') as cache_file:
-            pkl.dump(annotations, cache_file)
-        with open(label_path, 'wb') as cache_file:
-            pkl.dump(label_paths, cache_file)
+        # write-then-rename: concurrent runs never read a half-written cache
+        for path, obj in ((annotations_path, annotations), (label_path, label_paths)):
+            tmp = f'{path}.{os.getpid()}.tmp'
+            with open(tmp, 'wb') as cache_file:
+                pkl.dump(obj, cache_file)
+            os.replace(tmp, path)
         
     print(f'Loading prediction data ({pred_dir})...')
     predictions = load_prediction_list(label_paths, pred_dir)
@@ -222,6 +224,7 @@ def eval_predictions(pred_dir,
         results = map(
             partial(culane_metric,
                     width=width,
+                    iou_thresholds=iou_thresholds,
                     unofficial=unofficial,
                     img_shape=LLAMAS_IMG_RES), predictions, annotations)
     else:

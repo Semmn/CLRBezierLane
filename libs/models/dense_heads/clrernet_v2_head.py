@@ -327,7 +327,7 @@ class CLRerV2Head(BaseDenseHead):
                 self.seg_decoder = SegDecoder(
                     self.img_h,
                     self.img_w,
-                    num_classes=5,
+                    num_classes=loss_seg.get("num_classes", 5),
                     prior_feat_channels=self.prior_feat_channels,
                     refine_layers=self.refine_layers,
                 )

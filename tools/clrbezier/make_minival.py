@@ -22,6 +22,7 @@ Usage:
 
 Writes, next to the existing lists:
     list/train_minus_minival_gt.txt   training list, held-out sessions removed
+    list/train_minus_minival_diffs.npz  the frame-difference values for that list
     list/minival.txt                  image paths, for the metric's data_list
     list/minival_sequences.txt        which sessions were held out
 
@@ -34,6 +35,8 @@ import argparse
 import os
 import random
 from collections import defaultdict
+
+import numpy as np
 
 
 def sequence_of(image_path):
@@ -52,11 +55,16 @@ def main():
     ap.add_argument("--max-frames", type=int, default=None,
                     help="optionally subsample the held-out frames, to keep "
                          "evaluation fast; sessions are kept whole")
+    ap.add_argument("--diff-file", default="list/train_diffs.npz",
+                    help="frame-difference file of --train-list (CulaneDataset "
+                         "indexes it by line number, so it must be subset too)")
     args = ap.parse_args()
 
     train_path = os.path.join(args.data_root, args.train_list)
     with open(train_path) as handle:
-        lines = [line.rstrip("\n") for line in handle if line.strip()]
+        raw = handle.readlines()  # CulaneDataset.parse_datalist enumerates these
+    indexed = [(i, line.rstrip("\n")) for i, line in enumerate(raw) if line.strip()]
+    lines = [line for _, line in indexed]
 
     by_sequence = defaultdict(list)
     for line in lines:
@@ -69,6 +77,7 @@ def main():
     held = sorted(sequences[: args.sequences])
     held_set = set(held)
 
+    keep_idx = [i for i, l in indexed if sequence_of(l.split()[0]) not in held_set]
     keep_lines = [l for l in lines if sequence_of(l.split()[0]) not in held_set]
     hold_lines = [l for l in lines if sequence_of(l.split()[0]) in held_set]
 
@@ -83,6 +92,18 @@ def main():
 
     with open(out_train, "w") as handle:
         handle.write("\n".join(keep_lines) + "\n")
+    # The training loader drops near-duplicate frames with diffs[line_index].
+    # A shorter list read against the full diffs array would silently filter
+    # the wrong frames, so write the matching subset.
+    diff_path = os.path.join(args.data_root, args.diff_file)
+    out_diffs = None
+    if os.path.exists(diff_path):
+        diffs = np.load(diff_path)["data"]
+        if len(diffs) != len(raw):
+            raise SystemExit(f"{diff_path} has {len(diffs)} entries but {train_path} "
+                             f"has {len(raw)} lines; they must correspond")
+        out_diffs = os.path.join(list_dir, "train_minus_minival_diffs.npz")
+        np.savez(out_diffs, data=diffs[keep_idx])
     with open(out_minival, "w") as handle:
         # The metric's data_list wants image paths only.
         handle.write("\n".join(line.split()[0] for line in hold_lines) + "\n")
@@ -95,6 +116,10 @@ def main():
     print(f"\nCULane val.txt covers ~23 sessions; this covers {len(held)}.")
     print("\nIn the config:")
     print(f'  train_dataloader.dataset.data_list = data_root + "/list/train_minus_minival_gt.txt"')
+    if out_diffs is not None:
+        print(f'  train_dataloader.dataset.diff_file = data_root + "/list/train_minus_minival_diffs.npz"')
+    else:
+        print(f"  (no {args.diff_file} found: set train_dataloader.dataset.diff_file=None)")
     print(f'  val_dataloader.dataset.data_list   = data_root + "/list/minival.txt"')
     print(f'  val_evaluator.data_list            = data_root + "/list/minival.txt"')
     print("\nRe-run every comparison you selected on val before trusting its ranking.")

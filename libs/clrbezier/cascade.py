@@ -73,7 +73,13 @@ class ReferenceReprojector(nn.Module):
         """xs: [N, R] normalized x; mask: [N, R] bool -> (cp [N, 4], ok [N]).
 
         ``prior_cp`` [N, 4]: ridge target. None uses the least-squares line.
+        Float32 with autocast off: fp16 normal equations are ill-conditioned.
         """
+        with torch.autocast(device_type=xs.device.type, enabled=False):
+            return self._fit(xs.float(), mask,
+                             None if prior_cp is None else prior_cp.float())
+
+    def _fit(self, xs, mask, prior_cp=None):
         w = mask.to(xs.dtype)
         x = torch.where(mask, xs, torch.zeros_like(xs))
         count = w.sum(-1)

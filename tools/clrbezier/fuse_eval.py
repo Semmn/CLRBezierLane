@@ -53,7 +53,7 @@ from mmengine.logging import MMLogger
 from libs.datasets.metrics.culane_metric import CULaneMetric
 from libs.clrbezier.ranking import mean_row_distance
 
-from fast_sweep import run_sweep
+from fast_sweep import lane_scores, run_sweep
 
 
 def cluster_and_fuse(xs, scores, anchor_params, lengths, img_w, nms_thres,
@@ -176,7 +176,7 @@ def main():
                         fx, fp, torch.round(fl * head.n_strips), fs,
                         head.test_cfg.as_lanes, head.test_cfg.extend_bottom)
                     dumps[mode].append(
-                        (name, lanes, fs.detach().cpu().numpy().astype(np.float64)))
+                        (name, lanes, lane_scores(lanes, fs.detach().cpu().tolist())))
             seen += len(data["data_samples"])
             if seen % 2000 < len(data["data_samples"]):
                 print(f"  {seen} images", flush=True)

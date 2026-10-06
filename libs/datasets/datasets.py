@@ -183,8 +183,10 @@ class LlamasDataset(_GTRoundTripMixin, CulaneDataset):
         img_infos = [self.json_to_img_path(p) for p in json_paths]
         mask_paths = [osp.relpath(p, self.img_prefix) for p in json_paths]  # key only
         os.makedirs(self.cache_dir, exist_ok=True)
-        with open(cache_path, "wb") as f:
+        tmp_path = f"{cache_path}.{os.getpid()}.tmp"  # atomic: concurrent runs share cache/
+        with open(tmp_path, "wb") as f:
             pickle.dump(dict(img_infos=img_infos, annotations=annotations, mask_paths=mask_paths), f)
+        os.replace(tmp_path, cache_path)
         return img_infos, annotations, mask_paths
 
     def load_gt_lanes(self, idx):

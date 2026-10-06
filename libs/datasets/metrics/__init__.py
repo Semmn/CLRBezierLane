@@ -65,26 +65,31 @@ class TuSimpleMetric(BaseMetric):
 
     def compute_metrics(self, results):
         logger = MMLogger.get_current_instance()
-        out_dir = self.output_dir or tempfile.mkdtemp(prefix="tusimple_eval_")
-        os.makedirs(out_dir, exist_ok=True)
-        pred_file = osp.join(out_dir, "tusimple_predictions.json")
-        with open(pred_file, "w") as f:
-            f.write("\n".join(json.dumps(r) for r in results))
+        temp_dir = None if self.output_dir else tempfile.mkdtemp(prefix="tusimple_eval_")
+        out_dir = self.output_dir or temp_dir
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            pred_file = osp.join(out_dir, "tusimple_predictions.json")
+            with open(pred_file, "w") as f:
+                f.write("\n".join(json.dumps(r) for r in results))
 
-        gt_file = self.gt_json
-        if self.partial_eval:
-            keep = {r["raw_file"] for r in results}
-            gt_file = osp.join(out_dir, "partial_gt.json")
-            with open(self.gt_json) as src, open(gt_file, "w") as dst:
-                dst.writelines(line for line in src
-                               if line.strip() and json.loads(line)["raw_file"] in keep)
+            gt_file = self.gt_json
+            if self.partial_eval:
+                keep = {r["raw_file"] for r in results}
+                gt_file = osp.join(out_dir, "partial_gt.json")
+                with open(self.gt_json) as src, open(gt_file, "w") as dst:
+                    dst.writelines(line for line in src
+                                   if line.strip() and json.loads(line)["raw_file"] in keep)
 
-        from .tusimple_eval import LaneEval  # lazy: needs scikit-learn
-        result_json, accuracy = LaneEval.bench_one_submit(pred_file, gt_file)
-        print_log(result_json, logger=logger)
-        out = {item["name"]: float(item["value"]) for item in json.loads(result_json)}
-        out["Accuracy"] = float(accuracy)
-        return out
+            from .tusimple_eval import LaneEval  # lazy: needs scikit-learn
+            result_json, accuracy = LaneEval.bench_one_submit(pred_file, gt_file)
+            print_log(result_json, logger=logger)
+            out = {item["name"]: float(item["value"]) for item in json.loads(result_json)}
+            out["Accuracy"] = float(accuracy)
+            return out
+        finally:
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 # =============================================================================
@@ -124,8 +129,15 @@ class LLAMASMetric(BaseMetric):
         return "\n".join(out)
 
     def process(self, data_batch: dict, data_samples: Sequence[dict]) -> None:
+        split_dir = "color_images/{}/".format("valid" if self.split == "val" else self.split)
         for result in data_samples:
             relative_path = result["metainfo"]["sub_img_name"]
+            if split_dir not in relative_path:
+                # test_dataloader/test_evaluator both default to val: overriding
+                # only one of them would score (or submit) the wrong split.
+                raise ValueError(f"LLAMASMetric(split={self.split!r}) got image "
+                                 f"{relative_path!r}; set the dataset and evaluator "
+                                 "split together")
             output_filename = "/".join(relative_path.split("/")[-2:]).replace(
                 "_color_rect.png", ".lines.txt")
             self.results.append((output_filename, self.get_prediction_string(result["lanes"])))

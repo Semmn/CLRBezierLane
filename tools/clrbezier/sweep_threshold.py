@@ -53,7 +53,7 @@ from mmdet.registry import MODELS
 
 from libs.datasets.metrics.culane_metric import CULaneMetric
 
-from fast_sweep import run_sweep, verify_official
+from fast_sweep import lane_scores, run_sweep, verify_official
 
 
 def _get(result, *names):
@@ -79,7 +79,7 @@ def collect(model, loader, device, max_images=None):
                 lanes = _get(result, "lanes")
                 scores = _get(result, "scores")
                 meta = _get(result, "metainfo", "meta")
-                scores = np.asarray([float(s) for s in scores], dtype=np.float64)
+                scores = lane_scores(lanes, scores)
                 out.append((meta["sub_img_name"], lanes, scores))
             seen += len(results)
             if seen % 2000 < len(results):

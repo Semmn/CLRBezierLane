@@ -103,9 +103,12 @@ class LaneEval(object):
         fp = fp / num
         fn = fn / num
         tp = 1 - fp
-        precision = tp / (tp + fp)
-        recall = tp / (tp + fn)
-        f1 = 2 * precision * recall / (precision + recall)
+        # CLRNet's F1 (kept for comparability); guarded so a checkpoint whose
+        # every prediction is a false positive (tp == 0) gives 0, not a crash.
+        precision = tp / (tp + fp) if tp + fp > 0 else 0.0
+        recall = tp / (tp + fn) if tp + fn > 0 else 0.0
+        f1 = (2 * precision * recall / (precision + recall)
+              if precision + recall > 0 else 0.0)
 
         return json.dumps([{
             'name': 'Accuracy',

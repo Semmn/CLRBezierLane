@@ -77,6 +77,25 @@ EPS = 1e-8
 # ground truth, loaded once
 
 
+
+def lane_scores(lanes, scores) -> np.ndarray:
+    """One score per returned lane.
+
+    ``get_lanes`` returns every post-NMS score, but ``predictions_to_lanes``
+    drops lanes with <= 1 row, so the two lists can differ in length and
+    pairing them by position mis-scores the lanes after a dropped one. Each
+    ``Lane`` carries its own score in ``metadata["conf"]``; use that.
+    """
+    confs = [(getattr(lane, "metadata", None) or {}).get("conf") for lane in lanes]
+    if all(c is not None for c in confs):
+        return np.asarray([float(c.item() if hasattr(c, "item") else c) for c in confs],
+                          dtype=np.float64)
+    scores = [float(s) for s in scores]
+    if len(scores) != len(lanes):
+        raise ValueError(f"{len(lanes)} lanes but {len(scores)} scores and no "
+                         "metadata['conf'] to align them (use as_lanes=True)")
+    return np.asarray(scores, dtype=np.float64)
+
 def _key(name) -> str:
     """Data-list path and ``sub_img_name`` reduced to one comparable form."""
     name = str(name).lstrip("/")

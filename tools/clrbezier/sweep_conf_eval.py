@@ -39,6 +39,7 @@ import math
 import os
 import os.path as osp
 import pickle
+import shutil
 import time
 
 import numpy as np
@@ -140,7 +141,14 @@ def sweep(dump, thresholds, metric_factory, lane_cls, metric_key=None, log=print
         metric.results = []
         samples = filtered_samples(dump, t, lane_cls)
         metric.process({}, samples)
-        res = metric.compute_metrics(metric.results)
+        try:
+            res = metric.compute_metrics(metric.results)
+        finally:
+            # CULaneMetric writes one .lines.txt per image to a temp dir it never
+            # removed (official behaviour); one copy per threshold fills /tmp.
+            tmp = getattr(metric, "result_dir", None)
+            if tmp and not getattr(metric, "output_dir", None):
+                shutil.rmtree(tmp, ignore_errors=True)
         res = {k: float(v) for k, v in res.items()
                if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool)}
         key = key or pick_key(res, metric_key)
@@ -274,6 +282,12 @@ def main():
             raise ValueError(f"dump was made at conf >= {saved['conf']}, above the range start "
                              f"{thresholds[0]}; lanes below it are missing")
         dump, evaluator_cfg = saved["dump"], saved["evaluator_cfg"]
+        # the metric comes from the dump, so label the report with its split
+        if saved.get("split") and saved["split"] != args.split:
+            print(f"[info] the dump is from the {saved['split']} split; reporting it as such")
+        args.split = saved.get("split", args.split)
+        if cfg_options:
+            print("[warn] --cfg-options is ignored with --load-dump (no inference is run)")
         print(f"loaded {len(dump)} images from {args.load_dump} (conf >= {saved['conf']})")
     else:
         if not args.checkpoint:
@@ -286,7 +300,8 @@ def main():
         if args.save_dump:
             with open(args.save_dump, "wb") as f:
                 pickle.dump(dict(conf=thresholds[0], dump=dump, evaluator_cfg=evaluator_cfg,
-                                 config=args.config, checkpoint=args.checkpoint), f)
+                                 config=args.config, checkpoint=args.checkpoint,
+                                 split=args.split), f)
             print(f"saved the pass to {args.save_dump}")
     if args.max_images:
         print("[warn] --max-images evaluates against the FULL annotation set; numbers are not valid")
@@ -314,7 +329,9 @@ def main():
         w.writeheader()
         w.writerows(rows)
     with open(base + ".json", "w") as f:
-        json.dump(dict(config=args.config, checkpoint=args.checkpoint, split=args.split,
+        json.dump(dict(config=args.config,
+                       checkpoint=args.checkpoint or (saved.get("checkpoint") if args.load_dump else None),
+                       split=args.split,
                        metric_key=key, best=best, rows=rows), f, indent=1)
     print(f"{'wrote' if args.overwrite else 'appended to'} {out} (+ {base}.csv, {base}.json for this run)")
     return 0

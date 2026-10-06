@@ -5,6 +5,7 @@ Copyright (c) 2021 Lucas Tabelini
 """
 
 import os
+import shutil
 from pathlib import Path
 from functools import partial
 import tempfile
@@ -28,11 +29,15 @@ from libs.utils.visualizer import draw_lane
 
 @METRICS.register_module()
 class CULaneMetric(BaseMetric):
-    def __init__(self, data_root, data_list, y_step=2):
+    def __init__(self, data_root, data_list, y_step=2, output_dir=None):
         self.img_prefix = data_root
         self.list_path = data_list
         self.test_categories_dir = str(Path(data_root).joinpath("list/test_split/"))
-        self.result_dir = tempfile.TemporaryDirectory().name
+        # output_dir keeps the .lines.txt predictions (the official C++
+        # evaluator's input format); otherwise they go to a temp dir that is
+        # removed after scoring (one file per image, every validation).
+        self.output_dir = output_dir
+        self.result_dir = output_dir or tempfile.mkdtemp(prefix="culane_eval_")
         self.ori_w, self.ori_h = 1640, 590
         self.y_step = y_step
         super().__init__()
@@ -69,13 +74,17 @@ class CULaneMetric(BaseMetric):
                 if len(output) > 0:
                     print(output, file=f)
 
-        results = eval_predictions(
-            self.result_dir,
-            self.img_prefix,
-            self.list_path,
-            self.test_categories_dir,
-            logger=MMLogger.get_current_instance(),
-        )
+        try:
+            results = eval_predictions(
+                self.result_dir,
+                self.img_prefix,
+                self.list_path,
+                self.test_categories_dir,
+                logger=MMLogger.get_current_instance(),
+            )
+        finally:
+            if self.output_dir is None:
+                shutil.rmtree(self.result_dir, ignore_errors=True)
         return results
 
     def get_prediction_string(self, lanes):

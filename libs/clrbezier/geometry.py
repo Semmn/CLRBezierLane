@@ -445,6 +445,18 @@ def brr_reference(cp_x, y_start, length, prior_ys, sample_x_indices, img_w, img_
 def fit_global_cubic_to_clr_rows(target_xs_px, prior_ys, img_w, ridge, margin,
                                  min_valid_points=2, cp_frame="global",
                                  n_strips=None, min_span=0.1, return_frame=False):
+    """See ``_fit_global_cubic_to_clr_rows``. Runs in float32 with autocast off:
+    under AMP the einsums would build the 4x4 normal equations in fp16, which
+    moves the global-frame CP target by ~16 px on average (as in transport_cp)."""
+    with torch.autocast(device_type=target_xs_px.device.type, enabled=False):
+        return _fit_global_cubic_to_clr_rows(
+            target_xs_px.float(), prior_ys.float(), img_w, ridge, margin,
+            min_valid_points, cp_frame, n_strips, min_span, return_frame)
+
+
+def _fit_global_cubic_to_clr_rows(target_xs_px, prior_ys, img_w, ridge, margin,
+                                  min_valid_points=2, cp_frame="global",
+                                  n_strips=None, min_span=0.1, return_frame=False):
     """Fit fixed-global-y cubic CPs to GT CLR rows (batched, differentiable-free).
 
     Same objective as UnLaneDet ``GenerateLaneLine._fit_brr_control_points_x``:

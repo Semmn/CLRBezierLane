@@ -43,7 +43,7 @@ from mmdet.registry import MODELS
 from libs.datasets.metrics.culane_metric import CULaneMetric
 
 from probe_information import Probe          # same directory
-from fast_sweep import run_sweep
+from fast_sweep import lane_scores, run_sweep
 
 
 def logit(p, eps=1e-6):
@@ -123,7 +123,7 @@ def main():
                 extend_bottom=head.test_cfg.extend_bottom)
             for i, sample in enumerate(samples):
                 base_dump.append((sample.metainfo["sub_img_name"], lanes[i],
-                                  np.asarray([float(s) for s in scores[i]])))
+                                  lane_scores(lanes[i], scores[i])))
 
             # Same predictions, same NMS, same decode — only the score changes.
             feature = captured[feature_key].view(batch * num_q, -1).float()
@@ -138,7 +138,7 @@ def main():
                 extend_bottom=head.test_cfg.extend_bottom)
             for i, sample in enumerate(samples):
                 probe_dump.append((sample.metainfo["sub_img_name"], lanes[i],
-                                   np.asarray([float(s) for s in scores[i]])))
+                                   lane_scores(lanes[i], scores[i])))
 
             seen += batch
             if seen % 2000 < batch:
