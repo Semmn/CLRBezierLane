@@ -13,7 +13,6 @@ custom_imports = dict(
         "libs.core.bbox",
         "libs.core.anchor",
         "libs.core.hook",
-        "libs.lanedata",
         "libs.clrbezier",
     ],
     allow_failed_imports=False,

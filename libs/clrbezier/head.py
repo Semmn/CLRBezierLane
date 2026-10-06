@@ -854,7 +854,12 @@ class CLRBezierHead(_OfficialHead):
             with torch.no_grad():
                 ratio = (state[:, 0].detach().clamp(1e-3, 1.0)
                          / target[:, 2].clamp_min(1e-3)).clamp(0.2, 5.0)
-                gt_cp = reparam_cp_to_frame(gt_cp, ratio)
+                # For ratio > 1 the subdivision extrapolates the GT cubic past its
+                # own support; on curved lanes that leaves the range the state is
+                # clamped to (update_brr_state), giving a target no state can reach.
+                # A no-op for ratio <= 1 (the result stays in the GT's convex hull).
+                gt_cp = reparam_cp_to_frame(gt_cp, ratio).clamp(
+                    -self.cp_x_margin, 1.0 + self.cp_x_margin)
         cp_elem = _smooth_l1(state[:, 2:6] * scale, gt_cp * scale, self.brr_cp_beta).mean(-1)
         ok = gt_cp_ok.float()
         cp = (cp_elem * ok).sum() / ok.sum().clamp_min(1.0)

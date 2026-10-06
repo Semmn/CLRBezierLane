@@ -7,7 +7,7 @@ from mmdet.registry import TRANSFORMS
 from mmdet.structures import DetDataSample
 from mmengine.structures import InstanceData
 
-from libs.utils.lane_utils import sample_lane
+from libs.utils.lane_utils import sample_lane_rows
 
 
 @TRANSFORMS.register_module()
@@ -43,18 +43,23 @@ class PackCLRNetInputs(BaseTransform):
         lanes[:, 1] = 0
         for lane_idx, lane in enumerate(old_lanes):
             try:
-                xs_outside_image, xs_inside_image = sample_lane(
-                    lane, self.offsets_ys, self.img_w
-                )
+                # x at every row from the bottom up to the lane top, in row order.
+                # The official hstack((xs_outside_image, xs_inside_image)) moved every
+                # outside row to the front, which shifts a lane that leaves the image
+                # sideways (above its first visible row) up by that many rows.
+                all_xs = sample_lane_rows(lane, self.offsets_ys, self.img_w)
             except AssertionError:
                 continue
-            if len(xs_inside_image) <= 1:  # to calculate theta
+            inside_rows = np.nonzero((all_xs >= 0) & (all_xs < self.img_w))[0]
+            if len(inside_rows) <= 1:  # to calculate theta
                 continue
+            first_row, last_row = int(inside_rows[0]), int(inside_rows[-1])
+            xs_inside_image = all_xs[inside_rows]
             thetas = []
             for i in range(1, len(xs_inside_image)):
                 theta = (
                     math.atan(
-                        i
+                        (inside_rows[i] - first_row)
                         * self.strip_size
                         / (xs_inside_image[i] - xs_inside_image[0] + 1e-5)
                     )
@@ -64,15 +69,12 @@ class PackCLRNetInputs(BaseTransform):
                 thetas.append(theta)
             theta_far = sum(thetas) / len(thetas)
 
-            all_xs = np.hstack((xs_outside_image, xs_inside_image))
             lanes[lane_idx, 0] = 0
             lanes[lane_idx, 1] = 1
-            lanes[lane_idx, 2] = (
-                1 - len(xs_outside_image) / self.n_strips
-            )  # y0, relative
+            lanes[lane_idx, 2] = 1 - first_row / self.n_strips  # y0, relative
             lanes[lane_idx, 3] = xs_inside_image[0]  # x0, absolute
             lanes[lane_idx, 4] = theta_far  # theta
-            lanes[lane_idx, 5] = len(xs_inside_image)  # length
+            lanes[lane_idx, 5] = last_row - first_row + 1  # length
             lanes[lane_idx, 6 : 6 + len(all_xs)] = all_xs  # xs, absolute
 
         results["lanes"] = to_tensor(lanes)

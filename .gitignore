@@ -59,3 +59,7 @@ lanevis/local_script.sh
 
 # Exclude llamas cache folder
 cache
+
+# patch history
+patch
+.patch

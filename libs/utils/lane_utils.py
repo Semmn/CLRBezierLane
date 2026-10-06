@@ -60,9 +60,9 @@ def interp(points, n=5):
     return output
 
 
-def sample_lane(points, sample_ys, img_w):
+def sample_lane_rows(points, sample_ys, img_w):
     """
-    Sample lane points on the horizontal grids.
+    Sample lane x coordinates on the horizontal grids, keeping the row order.
     Adapted from:
     https://github.com/lucastabelini/LaneATT/blob/main/lib/datasets/lane_dataset.py
 
@@ -70,14 +70,12 @@ def sample_lane(points, sample_ys, img_w):
         points (List[numpy.float64]): lane point coordinate list (length = Np * 2).
           The values are treated as (x0, y0, x1, y1, ...., xp-1, yp-1).
           y0 ~ yp-1 must be sorted in descending order (y1 > y0).
-        sample_ys (numpy.ndarray): shape (Nr,).
-        img_w (int): image width.
+        sample_ys (numpy.ndarray): shape (Nr,), bottom -> top.
+        img_w (int): image width (unused; kept for the sample_lane signature).
 
     Returns:
-        numpy.ndarray: x coordinates outside the image, shape (No,).
-        numpy.ndarray: x coordinates inside the image, shape (Ni,).
-    Np: number of input lane points, Nr: number of rows,
-    No and Ni: number of x coordinates outside and inside image.
+        numpy.ndarray: x at sample_ys[0], sample_ys[1], ... up to the lane top,
+          shape (Na,), Na <= Nr. Values outside [0, img_w) are kept as they are.
     """
     points = np.array([points[0::2], points[1::2]]).transpose(1, 0)
     if not np.all(points[1:, 1] < points[:-1, 1]):
@@ -93,7 +91,7 @@ def sample_lane(points, sample_ys, img_w):
     mask_inside_domain = (sample_ys >= domain_min_y) & (sample_ys <= domain_max_y)
     sample_ys_inside_domain = sample_ys[mask_inside_domain]
     if len(sample_ys_inside_domain) == 0:
-        return np.zeros(0), np.zeros(0)
+        return np.zeros(0)
     interp_xs = interp(sample_ys_inside_domain)
 
     # extrapolate lane to the bottom of the image with a straight line using the 2 points closest to the bottom
@@ -101,7 +99,30 @@ def sample_lane(points, sample_ys, img_w):
     extrap = np.polyfit(two_closest_points[:, 1], two_closest_points[:, 0], deg=1)
     extrap_ys = sample_ys[sample_ys > domain_max_y]
     extrap_xs = np.polyval(extrap, extrap_ys)
-    all_xs = np.hstack((extrap_xs, interp_xs))
+    return np.hstack((extrap_xs, interp_xs))
+
+
+def sample_lane(points, sample_ys, img_w):
+    """
+    Sample lane points on the horizontal grids, split into outside / inside the image.
+    Adapted from:
+    https://github.com/lucastabelini/LaneATT/blob/main/lib/datasets/lane_dataset.py
+
+    Args:
+        points (List[numpy.float64]): lane point coordinate list (length = Np * 2).
+          The values are treated as (x0, y0, x1, y1, ...., xp-1, yp-1).
+          y0 ~ yp-1 must be sorted in descending order (y1 > y0).
+        sample_ys (numpy.ndarray): shape (Nr,).
+        img_w (int): image width.
+
+    Returns:
+        numpy.ndarray: x coordinates outside the image, shape (No,).
+        numpy.ndarray: x coordinates inside the image, shape (Ni,).
+    Np: number of input lane points, Nr: number of rows,
+    No and Ni: number of x coordinates outside and inside image.
+    The two arrays lose the row order; use sample_lane_rows to keep it.
+    """
+    all_xs = sample_lane_rows(points, sample_ys, img_w)
 
     # separate between inside and outside points
     inside_mask = (all_xs >= 0) & (all_xs < img_w)

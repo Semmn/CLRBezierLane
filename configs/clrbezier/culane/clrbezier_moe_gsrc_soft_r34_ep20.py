@@ -210,17 +210,10 @@ model = dict(
                 num_heads=4,
                 fuse="gate",               # "concat" reproduces the v2-head style fusion
                 gate_init=1e-2,             # 1e-2 to make GSRC active from iteration 0
-                query_self_attention=False,  # separate ablation for the one-to-one branch
+                query_self_attention=True,  # separate ablation for the one-to-one branch
             ),
         ),
-        query_attn_cfg=dict(
-            stages=[0, 1, 2],
-            num_heads=4,
-            use_state_embedding=True,
-            use_pairwise_bias=True,
-            gate_init=0.0,
-            detach_state=True,
-        ),
+        query_attn_cfg=None
     ),
     test_cfg=dict(
         # Default CLRerNet uses conf_threshold=0.41
