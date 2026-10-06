@@ -40,6 +40,7 @@ from .curve_deformable_roi_gather import (CurveAlignedDeformableROIGather,
                                             build_clr_curve_reference_points)
 from .gliou import GeneralizedLaneIoULoss, pairwise_generalized_lane_iou
 from .modules import ROIGather, SegDecoder, linear_relu, pool_prior_features
+from .moe import MoEGate
 from .priors import BezierPriorBank, StructuredPriorPerturbation
 
 
@@ -245,7 +246,21 @@ class CLRBezierHead(_OfficialHead):
             self.roi_gather = CurveAlignedDeformableROIGather(**rg_common, **rg_cfg)
         else:
             raise ValueError(f"Unknown roi_gather type {rg_type!r}")
-        self.look_forward_twice = bool(look_forward_twice)
+        # look_forward_twice: False, True / "dino", or "chain".
+        # "dino" (what True means): each stage's prediction is built on the
+        # previous stage's *live* update, which itself starts from a detached
+        # input, so stage i's delta gets its own loss plus stage i+1's loss and
+        # nothing further (DINO, dino_layers.py). Pooling, q2q, lateral, the
+        # preconditioner and the state supervision use detached values.
+        # "chain" is the earlier behaviour: the whole state, including the
+        # RoI pooling grid, keeps its graph across all stages. The forward pass
+        # is identical in all three modes; only the gradients differ.
+        if look_forward_twice is True:
+            look_forward_twice = "dino"
+        if look_forward_twice not in (False, None, "dino", "chain"):
+            raise ValueError("look_forward_twice must be False, True, 'dino' or 'chain'")
+        self.lft_mode = look_forward_twice or None
+        self.look_forward_twice = self.lft_mode is not None
         # Control-point preconditioning (off unless configured).
         self.cp_precond = (ControlPointPreconditioner(n_strips=self.n_strips,
                                                       **dict(cp_precond_cfg))
@@ -270,6 +285,13 @@ class CLRBezierHead(_OfficialHead):
         if self.rank_loss_enabled and rank_cfg.get("cluster_mode", "distance") == "distance":
             rank_cfg.setdefault("nms_thres", float(
                 (test_cfg or {}).get("nms_thres", 50.0)))
+        # Opt-in: score each prediction only on its own predicted rows
+        # [start, start + length), as the metric does. Default off (all GT rows,
+        # as the QFL / gate qualities do), so existing rank runs are unchanged.
+        self.rank_quality_extent = bool(rank_cfg.pop("quality_use_extent", False))
+        if rank_cfg.get("positives_only", False):
+            # the head has no assignment at this point to build positive_mask from
+            raise ValueError("rank_loss_cfg.positives_only is not supported by CLRBezierHead")
         self.rank_loss_kwargs = rank_cfg
         cls_modules, reg_modules = [], []
         for _ in range(num_fc):
@@ -368,6 +390,15 @@ class CLRBezierHead(_OfficialHead):
         if query_attn_cfg:
             query_attn_cfg = dict(query_attn_cfg)
             self.query_attn_stages = [int(s) for s in query_attn_cfg.pop("stages", [0, 1, 2])]
+            # Frame of the control points the pairwise geometry compares.
+            # "global" (default): every query's curve on the image frame [0, 1],
+            # so two queries drawing the same curve get the same control points.
+            # "native": the earlier input, the per-query anchored frame
+            # [0, y_start] (support CPs were moved onto it), where the same
+            # curve with starts 1.0 vs 0.9 differs by ~47 px in control points.
+            self.q2q_geometry_frame = query_attn_cfg.pop("geometry_frame", "global")
+            if self.q2q_geometry_frame not in ("global", "native"):
+                raise ValueError("query_attn_cfg.geometry_frame must be 'global' or 'native'")
             query_attn_cfg.setdefault("dim", self.fc_hidden_dim)
             query_attn_cfg.setdefault("state_dim", 5)  # [y_start, P0x..P3x]
             share = bool(query_attn_cfg.pop("share_across_stages", False))
@@ -495,6 +526,11 @@ class CLRBezierHead(_OfficialHead):
         if self.aux_cls_layers is not None:
             for p in self.aux_cls_layers.parameters():
                 nn.init.normal_(p, mean=0.0, std=1.0e-3)
+        # MoE routers (deformable offsets, GSRC) start uniform; the Linear sweep
+        # above had given them trunc_normal weights.
+        for m in self.modules():
+            if isinstance(m, MoEGate):
+                m.zero_init()
 
     def init_weights(self):
         # Do not call the official head's init_weights (it touches the anchor
@@ -543,6 +579,9 @@ class CLRBezierHead(_OfficialHead):
         pooled_stages, preds, states = [], [], []
         input_xs, reproj_stats, precond_stats, moe_stats = [], [], [], []
         step = self._step_cache
+        # lft_mode == "dino": the previous stage's update, live w.r.t. that
+        # stage's delta only (same values as the detached cp_x/y_start/...).
+        live = None
         for stage in range(self.refine_layers):
             if self._need_input_xs:
                 # full-row x of the reference this stage samples from (gate_on="input")
@@ -569,10 +608,13 @@ class CLRBezierHead(_OfficialHead):
             if self.query_attn is not None and stage in self.query_attn_stages:
                 # geometry of the anchors these RoI features were sampled from
                 anchor_cp = cp_x
-                if self.cp_frame == "support":
+                if self.cp_frame != "global" and self.q2q_geometry_frame == "global":
                     # The pairwise geometry bias compares control points across
-                    # queries, so give it one shared frame: the anchored one
-                    # ([0, y_start]), with the same 5-column layout.
+                    # queries, so give it one frame shared by all of them.
+                    anchor_cp = transport_cp(cp_x, frame_top.detach(), y_start.detach(),
+                                             torch.zeros_like(y_start),
+                                             torch.ones_like(y_start))
+                elif self.cp_frame == "support":
                     anchor_cp = transport_cp(cp_x, frame_top.detach(), y_start.detach(),
                                              torch.zeros_like(y_start), y_start.detach())
                 anchor_state = torch.cat([y_start.unsqueeze(-1), anchor_cp], dim=-1)
@@ -617,13 +659,24 @@ class CLRBezierHead(_OfficialHead):
                     y_start, self._precond_length(length, reg),
                     scores=cls_logits[..., 1] - cls_logits[..., 0], frame=self.cp_frame))
 
+            base_x, base_y, base_len, base_top = (
+                (cp_x, y_start, length, frame_top) if live is None
+                else (live["cp_x"], live["y_start"], live["length"], live["frame_top"]))
+            dino_next = self.lft_mode == "dino" and stage != self.refine_layers - 1
             if self.framed_update:
-                upd = update_framed_state(
-                    cp_x, y_start, length, frame_top, reg_ref[..., :6], self.n_strips,
-                    self.cp_x_margin, self.cp_frame, self.support_min_span,
-                    self.cp_transport, self.length_mode, detach_frame=not self.frame_grad)
+                framed_kw = dict(n_strips=self.n_strips, margin=self.cp_x_margin,
+                                 cp_frame=self.cp_frame, min_span=self.support_min_span,
+                                 transport=self.cp_transport, length_mode=self.length_mode,
+                                 detach_frame=not self.frame_grad)
+                upd = update_framed_state(base_x, base_y, base_len, base_top,
+                                          reg_ref[..., :6], **framed_kw)
                 new_x, new_y, new_top = upd["cp_x"], upd["y_start"], upd["frame_top"]
                 new_len = upd["length"]
+                if dino_next:
+                    nxt = update_framed_state(cp_x.detach(), y_start.detach(), length.detach(),
+                                              frame_top.detach(), reg_ref[..., :6], **framed_kw)
+                    live = dict(cp_x=nxt["cp_x"], y_start=nxt["y_start"],
+                                length=nxt["length"], frame_top=nxt["frame_top"])
                 if self.frame_grad:
                     ref, ref_on_map = brr_reference(new_x, new_y, new_len, **geo,
                                                     frame_top=new_top)
@@ -641,10 +694,16 @@ class CLRBezierHead(_OfficialHead):
                                          new_top.detach().unsqueeze(-1),
                                          new_y.detach().unsqueeze(-1)], dim=-1))
             else:
-                new_x, new_y, _, _ = update_brr_state(cp_x, y_start, reg_ref[..., :6],
+                new_x, new_y, _, _ = update_brr_state(base_x, base_y, reg_ref[..., :6],
                                                       self.n_strips, self.cp_x_margin)
                 new_len = reg_ref[..., 1]
                 new_top = frame_top
+                if dino_next:
+                    nx, ny, _, _ = update_brr_state(cp_x.detach(), y_start.detach(),
+                                                    reg_ref[..., :6], self.n_strips,
+                                                    self.cp_x_margin)
+                    live = dict(cp_x=nx, y_start=ny, length=new_len,
+                                frame_top=frame_top.detach())
                 ref, ref_on_map = brr_reference(new_x, new_y, new_len, **geo)
                 # Direct-supervision state: detached input + raw (unclamped) delta.
                 raw_y = y_start.detach() + reg[..., 0]
@@ -661,14 +720,15 @@ class CLRBezierHead(_OfficialHead):
                                                               step, self.training)
                     # keep the gradient path through new_x when LFT is on: the
                     # re-projection correction itself is a constant
-                    next_x = new_x + (projected - new_x.detach()) if self.look_forward_twice \
+                    next_x = new_x + (projected - new_x.detach()) if self.lft_mode == "chain" \
                         else projected
+                    if live is not None:
+                        live["cp_x"] = live["cp_x"] + (projected - live["cp_x"].detach())
                     next_map = sampling_xs(next_x, self.prior_ys, self.sample_x_indices)
                     reproj_stats.append(stats)
-                if self.look_forward_twice:
-                    # DINO: the next stage's reference keeps the graph, so this
-                    # stage's parameters also receive the next stage's gradient.
-                    # State supervision still uses the detached input state.
+                if self.lft_mode == "chain":
+                    # Earlier behaviour: the whole next-stage reference keeps the
+                    # graph, back through every stage and the RoI pooling grid.
                     cp_x, y_start, on_map = next_x, new_y, next_map
                     length, frame_top = new_len, new_top
                 else:
@@ -874,6 +934,7 @@ class CLRBezierHead(_OfficialHead):
         # versions cannot disagree about the key set.
         stats = {}
         counted = 0
+        empty = None
         for stage in sorted(self.rank_loss_stages):
             if stage >= len(preds):
                 continue
@@ -889,13 +950,23 @@ class CLRBezierHead(_OfficialHead):
                         continue
                     geo_p = pred_xs[b] * (float(self.img_w - 1) / float(self.img_w))
                     geo_t = target[:, 6:] / float(self.img_w)
+                    extent = {}
+                    if self.rank_quality_extent:
+                        start = (1.0 - pred[b, :, 2].float()).clamp(0.0, 1.0)
+                        extent = dict(start=start,
+                                      end=(start + pred[b, :, 5].float().clamp(0.0, 1.0))
+                                      .clamp(0.0, 1.0))
                     iou = pairwise_lane_iou(geo_p, geo_t, self.lane_width,
-                                            self.iou_w, self.iou_h)
+                                            self.iou_w, self.iou_h, **extent)
                     quality[b] = torch.nan_to_num(iou, nan=0.0).max(dim=1).values
             loss, agg = batch_cluster_rank_loss(
                 score, pred_xs, quality,
                 lane_width=self.lane_width, img_w=self.img_w, img_h=self.img_h,
                 **self.rank_loss_kwargs)
+            if float(agg["rank_pairs"]) <= 0:
+                # no supervised pair at this stage: do not dilute the others
+                empty = {k: torch.zeros_like(v) for k, v in agg.items()}
+                continue
             total = total + loss
             for key, value in agg.items():
                 stats[key] = stats.get(key, torch.zeros_like(value)) + value
@@ -903,6 +974,8 @@ class CLRBezierHead(_OfficialHead):
         if counted:
             total = total / counted
             stats = {k: v / counted for k, v in stats.items()}
+        elif empty is not None:
+            stats = empty  # keep the logged key set stable
         return total, stats
 
     def _cls_loss(self, logits, cls_targets, gt_counts, quality=None, ignore=None):

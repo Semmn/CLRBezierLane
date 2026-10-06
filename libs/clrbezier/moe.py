@@ -117,11 +117,15 @@ class MoEGate(nn.Module):
         else:
             top_val, top_idx = logits.topk(self.top_k, dim=-1)
             if self.top_k == 1:
-                # Switch Transformer: keep the chosen expert's own probability.
                 # Renormalizing a single value gives a constant 1.0, which has
                 # exactly zero gradient, so the router (and the load term built
-                # from these weights) would never learn from the task.
-                top_w = probs.gather(-1, top_idx)
+                # from these weights) would never learn from the task. Scaling
+                # the expert by its probability (Switch Transformer) fixes the
+                # gradient but also scales the output by ~1/E, and by a
+                # different amount in train (noise) and eval. Straight-through
+                # keeps the forward weight at exactly 1 and the gradient of p.
+                p = probs.gather(-1, top_idx)
+                top_w = p - p.detach() + 1.0
             else:
                 # Renormalize within the selected set, then scatter back. Gradient
                 # reaches the router through these values; the argmax itself is

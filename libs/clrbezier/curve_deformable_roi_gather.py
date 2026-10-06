@@ -226,9 +226,13 @@ class CurveDeformableSampler(nn.Module):
     def reset_offsets(self):
         """Set the offset head's starting fan. Called from ``__init__`` and from
         the gather's ``zero_init``, so a later blanket re-init cannot undo it."""
-        pattern = self.fan.repeat_interleave(self.offset_dim)
+        # The fan goes on the normal channel only; in "tangent_normal" mode the
+        # interleaved tangent channel starts at 0 (on the normal, as documented).
+        pattern = (self.fan if self.offset_dim == 1 else
+                   torch.stack((self.fan, torch.zeros_like(self.fan)), dim=-1).flatten())
         with torch.no_grad():
             if self.moe_cfg:
+                self.offset_head.gate.zero_init()
                 weight, bias = self.offset_head.experts.weight, self.offset_head.experts.bias
                 for e in range(weight.shape[0]):
                     # Re-initialize rather than scale in place, so a second call
@@ -240,8 +244,13 @@ class CurveDeformableSampler(nn.Module):
                     bias.copy_(pattern.to(bias).expand_as(bias))
                 return
             if self.init_mode == "zero":
-                nn.init.zeros_(self.offset_head.weight)
-                nn.init.zeros_(self.offset_head.bias)
+                # The old degenerate init zeroed the attention and pooling
+                # scores and the curve/output projections too; zeroing only the
+                # offsets lets the trunc_normal weight_head untie the offsets.
+                for module in (self.offset_head, self.weight_head, self.pool_score,
+                               self.curve_pw, self.out_proj):
+                    nn.init.zeros_(module.weight)
+                    nn.init.zeros_(module.bias)
                 return
             nn.init.kaiming_uniform_(self.offset_head.weight, a=math.sqrt(5))
             self.offset_head.weight.mul_(self.offset_init_gain)
@@ -342,7 +351,9 @@ class CurveDeformableSampler(nn.Module):
             stats["deform_offset_px"] = disp[..., 1:, :].norm(dim=-1).mean()
             # The spread across offsets is the symmetry check: ~0 means the fan
             # collapsed and the branch is one bilinear sample again.
-            spread = disp[..., 1:, 0]
+            # Signed normal offsets in feature px; the x-component of disp
+            # would scale this by |normal_x| and read ~0 on flat lanes.
+            spread = torch.tanh(raw[..., 0]) * self.max_normal_offset
             stats["deform_offset_spread"] = (spread.std(dim=-1).mean()
                                              if spread.shape[-1] >= 2
                                              else spread.new_zeros(()))

@@ -4,9 +4,12 @@
    The next stage pools features along the Bezier reference, but a stage's
    prediction is reference + 72-row dense residual, and the residual is never
    propagated. Re-projection fits global cubic control points to the stage's
-   full prediction (same ridge-to-affine objective used for GT control points)
-   and hands that curve to the next stage, so the next stage samples along what
-   was actually predicted.
+   full prediction and hands that curve to the next stage, so the next stage
+   samples along what was actually predicted. The ridge pulls toward the
+   stage's own Bezier control points (ridge_to="bezier"), so a zero dense
+   residual returns them unchanged. ridge_to="affine" is the earlier objective
+   (the one used for GT control points); it moved the reference by ~15 px per
+   control point even with a zero residual.
 
    Cost: masked least squares with a fixed, precomputed Bernstein basis
    (one [R] x [R, 16] product and one 4x4 solve per lane), run under no_grad
@@ -37,8 +40,12 @@ class ReferenceReprojector(nn.Module):
     """Fit fixed-global-y cubic CPs to predicted rows (batched, no grad)."""
 
     def __init__(self, prior_ys, img_w, n_strips, ridge=1e-2, margin=0.5,
-                 min_rows=4, blend=1.0, warmup_iters=0, max_shift_px=None):
+                 min_rows=4, blend=1.0, warmup_iters=0, max_shift_px=None,
+                 ridge_to="bezier"):
         super().__init__()
+        if ridge_to not in ("bezier", "affine"):
+            raise ValueError("ridge_to must be 'bezier' or 'affine'")
+        self.ridge_to = ridge_to
         ys = prior_ys.detach().float().clone()
         basis = bernstein_basis(ys)                               # [R, 4]
         self.register_buffer("ys", ys, persistent=False)
@@ -62,8 +69,11 @@ class ReferenceReprojector(nn.Module):
         return self.blend * min(1.0, float(step) / float(self.warmup_iters))
 
     @torch.no_grad()
-    def fit(self, xs, mask):
-        """xs: [N, R] normalized x; mask: [N, R] bool -> (cp [N, 4], ok [N])."""
+    def fit(self, xs, mask, prior_cp=None):
+        """xs: [N, R] normalized x; mask: [N, R] bool -> (cp [N, 4], ok [N]).
+
+        ``prior_cp`` [N, 4]: ridge target. None uses the least-squares line.
+        """
         w = mask.to(xs.dtype)
         x = torch.where(mask, xs, torch.zeros_like(xs))
         count = w.sum(-1)
@@ -83,6 +93,8 @@ class ReferenceReprojector(nn.Module):
         b = torch.where(det_ok, (safe_n * syx - sy * sx) / safe_det, torch.zeros_like(det))
         affine = a[:, None] + b[:, None] * self.cp_y.to(xs.dtype)
 
+        if prior_cp is not None:
+            affine = prior_cp.to(xs.dtype)
         eye = torch.eye(4, device=xs.device, dtype=xs.dtype)
         cp = torch.linalg.solve(btb + self.ridge * eye, (btx + self.ridge * affine)[..., None])[..., 0]
         ok = (count >= float(self.min_rows)) & torch.isfinite(cp).all(-1)
@@ -110,7 +122,8 @@ class ReferenceReprojector(nn.Module):
         length = torch.round(pred[..., 5] * n).clamp(min=0).reshape(-1, 1)
         idx = torch.arange(rows, device=xs.device, dtype=xs.dtype).view(1, -1)
         mask = (idx >= start) & (idx < start + length) & (xs >= 0.0) & (xs < 1.0)
-        refit, ok = self.fit(xs.float(), mask)
+        prior = bezier_cp.reshape(-1, 4).float() if self.ridge_to == "bezier" else None
+        refit, ok = self.fit(xs.float(), mask, prior)
         refit = refit.view(batch, num_q, 4)
         ok = ok.view(batch, num_q, 1)
 

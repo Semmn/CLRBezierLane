@@ -97,6 +97,7 @@ model = dict(
             blend=1.0,             # final weight of the refit
             warmup_iters=1500,     # blend ramps from 0
             max_shift_px=20.0,     # per-control-point trust region (None disables)
+            ridge_to="affine",  # reproduces checkpoints trained before the fix; drop for new runs
         ),
         aux_cfg=dict(
             enabled=False, # Disable Auxiliary branch

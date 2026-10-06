@@ -180,6 +180,7 @@ model = dict(
         ),
         gsrc_cfg=None,
         query_attn_cfg=dict(
+            geometry_frame="native",  # reproduces checkpoints trained before the fix; drop for new runs
             stages=[0, 1, 2],
             num_heads=2,
             use_state_embedding=True,

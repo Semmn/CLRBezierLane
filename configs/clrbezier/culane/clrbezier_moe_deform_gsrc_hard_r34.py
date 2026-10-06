@@ -168,8 +168,12 @@ model = dict(
             use_focal=False,
             iou_loss_type="laneiou",     # regression loss = 1 - GLIoU
             cost_iou_type="laneiou",     # "laneiou" or "gliou"
+            # NOTE: quality focal loss is smaller in scale than the weighted CE.
+            # Retune cls_loss_weight after the first run (try 2.0 -> 4.0).
+            cls_loss_weight=2.0,
             cls_bg_weight=0.4,
             iou_loss_weight=4.0,
+            iou_eval_shape=(320, 1640),
             lane_width=7.5 / 800,        # half-width, paper w_lane = 15/800
             lane_width_cost=30.0 / 800,  # half-width, paper w_lane = 60/800
             seg_loss_weight=1.0,
@@ -190,9 +194,6 @@ model = dict(
             task_align_beta=6.0,
             # None disables; 0.7-0.8 is a reasonable starting band
             ignore_iou_thr=None,
-            # NOTE: quality focal loss is smaller in scale than the weighted CE.
-            # Retune cls_loss_weight after the first run (try 2.0 -> 4.0).
-            cls_loss_weight=2.0,
         ),
         target_adapter=dict(
             lane_keys=None,             # pin after running the probe, e.g. ["lanes"]

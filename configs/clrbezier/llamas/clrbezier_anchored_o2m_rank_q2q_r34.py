@@ -105,7 +105,7 @@ model = dict(
             cluster_mode="distance", # CLRNet's lane NMS merges by mean |dx|, not
                                      # by IoU; "iou" can only reach 2*lane_width
                                      # (15 px) and misses most of each cluster
-            nms_thres=50,            # defaults to model.test_cfg.nms_thres
+            nms_thres=60,            # = test_cfg.nms_thres (LLAMAS); runs before 2026-10-06 used 50
             margin=0.05,
             score_space="logit",  # NOT "prob": in probability space the
                                   # loss floors at softplus(-1/tau) and the
@@ -180,6 +180,7 @@ model = dict(
         ),
         gsrc_cfg=None,
         query_attn_cfg=dict(
+            geometry_frame="native",  # reproduces checkpoints trained before the fix; drop for new runs
             stages=[0, 1, 2],
             num_heads=2,
             use_state_embedding=True,

@@ -77,6 +77,7 @@ model = dict(
             blend=1.0,
             warmup_iters=1500,
             max_shift_px=20.0,
+            ridge_to="affine",  # reproduces checkpoints trained before the fix; drop for new runs
         ),
         main_assigner=dict(
             type="HungarianLaneAssigner", cls_weight=1.0, point_weight=2.0, iou_weight=3.0),
