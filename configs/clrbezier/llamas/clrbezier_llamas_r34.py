@@ -111,6 +111,11 @@ model = dict(
         ),
     ),
     test_cfg=dict(
+        # Read by the inherited CLRerHead.predict/get_lanes; this config does not
+        # include base_clrernet*.py, which is where the baseline gets them.
+        use_nms=True,
+        as_lanes=True,
+        extend_bottom=True,
         conf_threshold=0.45,  # CLRNet LLAMAS R18 (select by cross-validation for reporting)
         nms_thres=60,         # CLRNet LLAMAS R18 (DLA34 uses 50)
         nms_topk=4,

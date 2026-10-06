@@ -400,14 +400,22 @@ class CLRBezierHead(_OfficialHead):
         self.qfl = QualityFocalLoss(float(loss_cfg.get("qfl_beta", 2.0)))
         self.lane_width = float(loss_cfg.get("lane_width", 7.5 / 800))
         self.lane_width_cost = float(loss_cfg.get("lane_width_cost", 30.0 / 800))
+        # Image shape (h, w) the LaneIoU tilt-dependent width is computed in.
+        # Official CLRerNet uses the metric crop, eval_shape=(320, 1640) on
+        # CULane; None keeps the network shape (img_h, img_w), which is what
+        # every existing config was trained with. Coordinates stay normalized
+        # either way; only the slanted-lane width changes.
+        eval_shape = loss_cfg.get("iou_eval_shape", None)
+        self.iou_h, self.iou_w = ((int(eval_shape[0]), int(eval_shape[1])) if eval_shape
+                                  else (self.img_h, self.img_w))
         self.iou_loss_type = loss_cfg.get("iou_loss_type", "laneiou")  # laneiou | gliou
         if self.iou_loss_type == "gliou":
             self.iou_loss = GeneralizedLaneIoULoss(
                 loss_weight=float(loss_cfg.get("iou_loss_weight", 4.0)),
-                lane_width=self.lane_width, img_h=self.img_h, img_w=self.img_w)
+                lane_width=self.lane_width, img_h=self.iou_h, img_w=self.iou_w)
         elif self.iou_loss_type == "laneiou":
             self.iou_loss = LaneIoULoss(loss_cfg.get("iou_loss_weight", 4.0), self.lane_width,
-                                        self.img_w, self.img_h)
+                                        self.iou_w, self.iou_h)
         else:
             raise ValueError(f"Unknown iou_loss_type {self.iou_loss_type!r}")
         # assignment costs may use GLIoU independently of the loss
@@ -415,16 +423,16 @@ class CLRBezierHead(_OfficialHead):
         if self.cost_iou_type == "gliou":
             self.iou_fns = dict(
                 dynamic=lambda p, t: pairwise_generalized_lane_iou(
-                    p, t, self.lane_width, self.img_h, self.img_w),
+                    p, t, self.lane_width, self.iou_h, self.iou_w),
                 cost=lambda p, t, s, e: pairwise_generalized_lane_iou(
-                    p, t, self.lane_width_cost, self.img_h, self.img_w,
+                    p, t, self.lane_width_cost, self.iou_h, self.iou_w,
                     use_pred_start_end=True, pred_start=s, pred_end=e))
         elif self.cost_iou_type == "laneiou":
             self.iou_fns = None
         else:
             raise ValueError(f"Unknown cost_iou_type {self.cost_iou_type!r}")
         # aligned narrow LaneIoU for the quality gate (1 - loss with weight 1)
-        self.gate_iou_fn = LaneIoULoss(1.0, self.lane_width, self.img_w, self.img_h)
+        self.gate_iou_fn = LaneIoULoss(1.0, self.lane_width, self.iou_w, self.iou_h)
         self.seg_loss_weight = float(loss_cfg.get("seg_loss_weight", 1.0))
         seg_weights = torch.ones(seg_num_classes)
         seg_weights[0] = float(loss_cfg.get("seg_bg_weight", 0.4))
@@ -568,7 +576,12 @@ class CLRBezierHead(_OfficialHead):
                     anchor_cp = transport_cp(cp_x, frame_top.detach(), y_start.detach(),
                                              torch.zeros_like(y_start), y_start.detach())
                 anchor_state = torch.cat([y_start.unsqueeze(-1), anchor_cp], dim=-1)
-                roi = self.query_attn[str(stage)](roi, anchor_state, num_groups)
+                # The auxiliary groups are packed into the batch dimension
+                # (forward_train repeat_interleaves the features), so each batch
+                # row already holds exactly one group. A group mask over the K
+                # queries would cut that one group into num_groups arbitrary
+                # blocks, so attention always runs unmasked.
+                roi = self.query_attn[str(stage)](roi, anchor_state, 1)
             cls_roi = reg_roi = roi
             if self.lateral is not None and stage in self.lateral_stages:
                 evidence = self.lateral[str(stage)](feats[stage], prior_xs, self.prior_feat_ys)
@@ -877,7 +890,7 @@ class CLRBezierHead(_OfficialHead):
                     geo_p = pred_xs[b] * (float(self.img_w - 1) / float(self.img_w))
                     geo_t = target[:, 6:] / float(self.img_w)
                     iou = pairwise_lane_iou(geo_p, geo_t, self.lane_width,
-                                            self.img_w, self.img_h)
+                                            self.iou_w, self.iou_h)
                     quality[b] = torch.nan_to_num(iou, nan=0.0).max(dim=1).values
             loss, agg = batch_cluster_rank_loss(
                 score, pred_xs, quality,
@@ -1005,7 +1018,8 @@ class CLRBezierHead(_OfficialHead):
                     continue
                 cache = build_cost_cache(preds[b].detach(), target, self.img_w, self.img_h,
                                          self.lane_width, self.lane_width_cost, required,
-                                         iou_fns=self.iou_fns)
+                                         iou_fns=self.iou_fns,
+                                         iou_shape=(self.iou_w, self.iou_h))
                 for a, (assigner, weight) in enumerate(pairs):
                     rows, cols = assigner.assign(cache)
                     reg_rows, reg_cols = rows, cols

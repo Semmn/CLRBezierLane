@@ -14,6 +14,7 @@ Never use it for reported numbers.
 import json
 import os
 import os.path as osp
+import shutil
 import tempfile
 from typing import Sequence
 
@@ -132,6 +133,10 @@ class LLAMASMetric(BaseMetric):
     def compute_metrics(self, results):
         logger = MMLogger.get_current_instance()
         out_dir = self.output_dir or tempfile.mkdtemp(prefix="llamas_eval_")
+        # A temporary dir is deleted after scoring (each validation writes one
+        # file per image, ~0.5 GB on LLAMAS valid). Test predictions are kept:
+        # they are the submission. Set output_dir to keep val predictions.
+        cleanup = self.output_dir is None and self.split != "test"
         for output_filename, output in results:
             path = osp.join(out_dir, output_filename)
             os.makedirs(osp.dirname(path), exist_ok=True)
@@ -152,9 +157,15 @@ class LLAMASMetric(BaseMetric):
             anno_dir = subset
 
         from ...datasets.metrics import llamas_eval  # lazy: multiprocessing + p_tqdm
-        result = llamas_eval.eval_predictions(out_dir, anno_dir, width=self.width,
-                                              iou_thresholds=self.iou_thresholds,
-                                              unofficial=self.unofficial)
+        try:
+            result = llamas_eval.eval_predictions(out_dir, anno_dir, width=self.width,
+                                                  iou_thresholds=self.iou_thresholds,
+                                                  unofficial=self.unofficial)
+        finally:
+            if cleanup:
+                shutil.rmtree(out_dir, ignore_errors=True)
+            if self.partial_eval:
+                shutil.rmtree(anno_dir, ignore_errors=True)  # the symlink subset
         out = {}
         for thr, vals in result.items():
             key = "mean" if thr == "mean" else f"{float(thr):.2f}"

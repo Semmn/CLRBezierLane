@@ -16,10 +16,11 @@ from .lane_iou import pairwise_lane_iou
 @torch.no_grad()
 def build_cost_cache(pred, target, img_w, img_h, lane_width, lane_width_cost,
                      required=("cls_cost", "point_cost", "iou_cost_assign", "lane_iou_dynamic"),
-                     cls_eps=1e-6, iou_fns=None):
+                     cls_eps=1e-6, iou_fns=None, iou_shape=None):
     """iou_fns: optional {"dynamic": fn(pred, target),
     "cost": fn(pred, target, start, end)} to replace LaneIoU (e.g. GLIoU)."""
-    """pred: [N, 6+R]; target: [M, 6+R] (valid lanes only)."""
+    """pred: [N, 6+R]; target: [M, 6+R] (valid lanes only).
+    iou_shape: optional (w, h) for the LaneIoU width; default (img_w, img_h)."""
     required = set(required)
     cache = {}
     num_gt = target.shape[0]
@@ -29,6 +30,7 @@ def build_cost_cache(pred, target, img_w, img_h, lane_width, lane_width_cost,
     target_xs_pt = target[:, 6:] / float(img_w - 1)
     pred_geo = pred_xs * (float(img_w - 1) / float(img_w))
     target_geo = target[:, 6:] / float(img_w)
+    iou_w, iou_h = iou_shape if iou_shape is not None else (img_w, img_h)
 
     if "cls_cost" in required:
         fg = F.softmax(pred[:, :2], dim=-1)[:, 1].clamp(cls_eps, 1.0 - cls_eps)
@@ -47,7 +49,7 @@ def build_cost_cache(pred, target, img_w, img_h, lane_width, lane_width_cost,
     if "lane_iou_dynamic" in required:
         fn = iou_fns.get("dynamic")
         iou = (fn(pred_geo, target_geo) if fn is not None
-               else pairwise_lane_iou(pred_geo, target_geo, lane_width, img_w, img_h))
+               else pairwise_lane_iou(pred_geo, target_geo, lane_width, iou_w, iou_h))
         cache["lane_iou_dynamic"] = torch.nan_to_num(iou, nan=0.0, posinf=0.0, neginf=0.0)
 
     if "iou_cost_assign" in required:
@@ -56,7 +58,8 @@ def build_cost_cache(pred, target, img_w, img_h, lane_width, lane_width_cost,
         end = (start + pred[:, 5].clamp(0.0, 1.0)).clamp(0.0, 1.0)
         fn = iou_fns.get("cost")
         iou = (fn(pred_geo, target_geo, start, end) if fn is not None
-               else pairwise_lane_iou(pred_geo, target_geo, lane_width_cost, img_w, img_h, start, end))
+               else pairwise_lane_iou(pred_geo, target_geo, lane_width_cost, iou_w, iou_h,
+                                      start, end))
         cache["iou_cost_assign"] = 1.0 - torch.nan_to_num(iou, nan=0.0, posinf=0.0, neginf=0.0)
     return cache
 

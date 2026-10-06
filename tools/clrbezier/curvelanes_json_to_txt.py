@@ -3,9 +3,10 @@ curvelane code reads (one lane per line: "x0 y0 x1 y1 ...", next to each image).
 
     <root>/<split>/labels/<name>.lines.json  ->  <root>/<split>/images/<name>.lines.txt
 
-Only needed when the dataset copy has no .lines.txt files yet. Points are
-written bottom -> top with duplicate points removed; lanes with fewer than two
-points are dropped. Existing files are kept unless --overwrite is given.
+Only needed when the dataset copy has no .lines.txt files yet. Points keep
+their annotated order, oriented bottom -> top, with duplicate points removed;
+lanes with fewer than two points are dropped. Existing files are kept unless
+--overwrite is given.
 
     python tools/clrbezier/curvelanes_json_to_txt.py /work/dataset/curvelanes --splits train valid
 """
@@ -31,7 +32,13 @@ def convert(json_path, txt_path):
                 continue
             seen.add((x, y))
             pts.append((x, y))
-        pts.sort(key=lambda q: -q[1])
+        # Keep the annotated point order and only orient the whole lane
+        # bottom -> top. Sorting by y (the previous version) zig-zags any lane
+        # that bends back down, in the targets, the seg mask and the eval GT;
+        # the official txts keep the json order and leave such lanes to
+        # LaneAlbumentation's cut_unsorted.
+        if len(pts) >= 2 and pts[0][1] < pts[-1][1]:
+            pts.reverse()
         if len(pts) >= 2:
             out.append(" ".join(f"{x:.5f} {y:.5f}" for x, y in pts))
     txt_path.write_text("\n".join(out) + ("\n" if out else ""))

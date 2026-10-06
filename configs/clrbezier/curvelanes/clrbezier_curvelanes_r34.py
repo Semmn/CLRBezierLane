@@ -113,6 +113,11 @@ model = dict(
         ),
     ),
     test_cfg=dict(
+        # Read by the inherited CLRerHead.predict/get_lanes; this config does not
+        # include base_clrernet*.py, which is where the baseline gets them.
+        use_nms=True,
+        as_lanes=True,
+        extend_bottom=True,
         conf_threshold=0.42,  # curvelane branch
         nms_thres=15,
         nms_topk=16,

@@ -116,10 +116,17 @@ class MoEGate(nn.Module):
             weights = probs
         else:
             top_val, top_idx = logits.topk(self.top_k, dim=-1)
-            # Renormalize within the selected set, then scatter back. Gradient
-            # reaches the router through these values; the argmax itself is not
-            # differentiable, which is standard for sparse MoE.
-            top_w = F.softmax(top_val, dim=-1)
+            if self.top_k == 1:
+                # Switch Transformer: keep the chosen expert's own probability.
+                # Renormalizing a single value gives a constant 1.0, which has
+                # exactly zero gradient, so the router (and the load term built
+                # from these weights) would never learn from the task.
+                top_w = probs.gather(-1, top_idx)
+            else:
+                # Renormalize within the selected set, then scatter back. Gradient
+                # reaches the router through these values; the argmax itself is
+                # not differentiable, which is standard for sparse MoE.
+                top_w = F.softmax(top_val, dim=-1)
             weights = torch.zeros_like(probs).scatter(-1, top_idx, top_w)
 
         stats = self._stats(probs, weights)

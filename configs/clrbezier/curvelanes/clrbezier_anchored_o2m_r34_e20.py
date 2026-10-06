@@ -148,7 +148,8 @@ model = dict(
             cost_iou_type="laneiou",     # "laneiou" or "gliou"
             cls_bg_weight=0.4,
             iou_loss_weight=4.0,
-            lane_width=7.5 / 224,        # half-width, paper w_lane = 15/800
+            lane_width=2.5 / 224,        # half-width at the 224-wide eval space; matches the
+                                         # CurveLanes metric (lane_width=5) and the curvelane branch
             lane_width_cost=10.0 / 224,  # half-width, paper w_lane = 60/800
             seg_loss_weight=2.0,
             seg_bg_weight=0.4,
