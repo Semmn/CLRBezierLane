@@ -90,7 +90,12 @@ class ControlPointPreconditioner(nn.Module):
         #              and a lane reaching the image top covers t = [0, 1]
         #              entirely — no deficit at all, which is the point of the
         #              anchored frame.
-        if frame == "anchored":
+        #   support  : the frame is the visible span itself, t = [0, 1], so
+        #              every gain is 1 and the preconditioner is a no-op.
+        if frame == "support":
+            lo = torch.zeros_like(y_start)[..., None]
+            hi = torch.ones_like(lo)
+        elif frame == "anchored":
             coverage = (length / y_start.clamp_min(1e-3)).clamp(0.0, 1.0)
             lo = (1.0 - coverage)[..., None]
             hi = torch.ones_like(lo)

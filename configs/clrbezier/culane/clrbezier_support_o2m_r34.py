@@ -1,3 +1,22 @@
+# Support-conditioned Bezier frame (cp_frame="support"), otherwise identical to
+# clrbezier_anchored_o2m_r34.py. The four control points sit at the thirds of
+# the lane's own visible span [start_y - span(length), start_y], so the state is
+# (start_y, length, P0x..P3x) and start, length and shape are separate things.
+#
+# brr_cfg knobs (defaults shown) and what to try if training is unstable:
+#   cp_transport=True  : a start/length step moves only the support; the curve
+#                        stays where it was and dP is a pure shape correction.
+#                        False = reinterpret the old coefficients in the new
+#                        frame (the coupled version; ablation).
+#   length_mode="residual": length is persistent state (input + delta), since
+#                        the frame is built from it. "fresh" = CLRerNet's
+#                        per-stage absolute length (starts near 0: the frame
+#                        collapses to min_span at init; ablation only).
+#   min_span=0.1       : smallest frame span in image y (~7 rows). Short lanes
+#                        are fitted on this span instead of on 2-3 rows.
+#   frame_grad=False   : LaneIoU does not reach start/length through the curve;
+#                        they learn from loss_brr_support only, as in "global".
+#                        True = the fully coupled gradient (ablation).
 # Pairwise ranking inside NMS duplicate clusters.
 #
 # F1 at a re-selected threshold depends only on the order of the scores, so a
@@ -10,7 +29,7 @@
 # distribution does not move and the confidence threshold does not need
 # re-tuning when it is switched on.
 _base_ = [
-    "dataset_llamas_clrernet.py",
+    "dataset_culane_clrernet.py",
     "../../_base_/default_runtime.py"
 ]
 
@@ -29,7 +48,7 @@ custom_imports = dict(
     ],
     allow_failed_imports=False,
 )
-cfg_name = "clrbezier_anchored_o2m_r34_e27.py"
+cfg_name = "clrbezier_support_o2m_r34.py"
 
 img_w, img_h, num_points = 800, 320, 72
 _o2m = dict(type="SimOTALaneAssigner", candidate_topk=4, min_dynamic_k=1,
@@ -79,10 +98,8 @@ model = dict(
         lateral_cfg=None,
         look_forward_twice=False,
         prior_cfg=dict(delta_scale=0.1, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),
-        # legacy_anchored_prior=True keeps the anchored side priors exactly as
-        # they were trained before the 2026-10-06 globalize fix, so this config
-        # reproduces its reported results. Drop it for new runs.
-        brr_cfg=dict(cp_x_margin=0.5, legacy_anchored_prior=True),
+        brr_cfg=dict(cp_x_margin=0.5, cp_transport=True, length_mode="residual",
+                     min_span=0.1, frame_grad=False),
         main_assigner=_o2m,
         # per-stage override; stages not listed use main_assigner
         main_stage_assigners={"0": _o2m, "1": _o2m, "2": _o2m},
@@ -95,7 +112,7 @@ model = dict(
             warmup_iters=1500,     # thresholds ramp from 0
         ),
         reproject_cfg=None,
-        cp_frame="anchored", # defaults to "global"
+        cp_frame="support", # "global" | "anchored" | "support"
         cp_precond_cfg=None,
         rank_loss_cfg=dict(
             enabled=False,
@@ -173,36 +190,37 @@ model = dict(
             cls_loss_weight=2.0,
         ),
         target_adapter=dict(
-            lane_keys=["lanes"],
-            seg_keys=["gt_masks"],
-            start_y_convention="image_y",  # official PackCLRNetInputs: y0 = 1 - n_out / n_strips
-            length_unit="count",
+            lane_keys=None,             # pin after running the probe, e.g. ["lanes"]
+            seg_keys=None,              # e.g. ["gt_masks"]
+            start_y_convention="auto",  # verified against x validity, locked on batch 1
+            length_unit="auto",
         ),
         gsrc_cfg=None,
         query_attn_cfg=None,
     ),
     test_cfg=dict(
-        conf_threshold=0.45,  # CLRNet LLAMAS R18 (select by cross-validation for reporting)
+        # Default CLRerNet uses conf_threshold=0.41
+        conf_threshold=0.43,
         use_nms=True,
         as_lanes=True,
         extend_bottom=True,
-        nms_thres=60,         # CLRNet LLAMAS R18 (DLA34 uses 50)
+        nms_thres=50,
         nms_topk=4,
-        ori_img_w=1276,
-        ori_img_h=717,
-        cut_height=300,
+        ori_img_w=1640,
+        ori_img_h=590,
+        cut_height=270,
     ),
 )
 
 # Number of epochs
-total_epochs = 27
+total_epochs = 36
 checkpoint_config = dict(interval=total_epochs)
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=total_epochs, val_interval=3)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
 # Batch size (Number of batch size per GPU)
-train_dataloader=dict(batch_size=32) # Single GPU settings
+train_dataloader=dict(batch_size=32)
 randomness = dict(seed=0, deterministic=True)
 optim_wrapper = dict(type='OptimWrapper', optimizer=dict(type="AdamW", lr=6e-4))
 param_scheduler = [

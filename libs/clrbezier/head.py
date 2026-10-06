@@ -31,7 +31,8 @@ from .gsrc import GSRCModule
 from .lateral import LateralEvidence
 from .query_attention import MaskedQuerySelfAttention
 from .geometry import (brr_reference, fit_global_cubic_to_clr_rows, globalize_local_cp,
-                       reparam_cp_to_frame, update_brr_state)
+                       reparam_cp_to_frame, support_state_from_local, support_top,
+                       transport_cp, update_brr_state, update_framed_state)
 from .lane_iou import LaneIoULoss, pairwise_lane_iou
 from .preconditioner import ControlPointPreconditioner
 from .ranking import batch_cluster_rank_loss
@@ -177,14 +178,48 @@ class CLRBezierHead(_OfficialHead):
         #   "anchored" : image y = 0, y_start/3, 2*y_start/3, y_start — the last
         #                control point IS the lane's start point and the first is
         #                pinned to the image top, matching CLRNet's anchor span.
+        #   "support"  : image y = the thirds of [y_top, y_start], y_top from the
+        #                predicted length — start, length and shape are separate.
         self.cp_frame = str(cp_frame)
-        if self.cp_frame not in ("global", "anchored"):
-            raise ValueError("cp_frame must be 'global' or 'anchored'")
-        if self.cp_frame == "anchored" and reproject_cfg:
+        if self.cp_frame not in ("global", "anchored", "support"):
+            raise ValueError("cp_frame must be 'global', 'anchored' or 'support'")
+        if self.cp_frame != "global" and reproject_cfg:
             # ReferenceReprojector refits control points on the fixed global
             # basis; it would silently write global-frame points into an
-            # anchored state.
-            raise ValueError("reproject_cfg is not supported with cp_frame='anchored'")
+            # anchored/support state.
+            raise ValueError(f"reproject_cfg is not supported with cp_frame='{self.cp_frame}'")
+        # Anchored priors were built without the frame Jacobian before
+        # 2026-10-06 (globalize_local_cp). True reproduces that for evaluating
+        # checkpoints trained with the old code.
+        self.legacy_anchored_prior = bool(brr_cfg.get("legacy_anchored_prior", False))
+        # Support frame (and opt-in for anchored), see update_framed_state:
+        #   cp_transport   : keep the curve when start/length move, so dP is a
+        #                    pure shape correction (default on for "support").
+        #   length_mode    : "residual" (support default) or "fresh" (CLRerNet).
+        #   min_span       : smallest frame span in image y (support only).
+        #   frame_grad     : let the curve's losses (LaneIoU) reach start/length
+        #                    through the frame. Off by default for "support":
+        #                    start/length then learn only from the support
+        #                    loss, as in the global frame.
+        is_support = self.cp_frame == "support"
+        self.cp_transport = bool(brr_cfg.get("cp_transport", is_support))
+        self.length_mode = str(brr_cfg.get("length_mode", "residual" if is_support else "fresh"))
+        if self.length_mode not in ("residual", "fresh"):
+            raise ValueError("brr_cfg.length_mode must be 'residual' or 'fresh'")
+        self.support_min_span = float(brr_cfg.get("min_span", 0.1))
+        self.frame_grad = bool(brr_cfg.get("frame_grad", not is_support))
+        # The framed update path (update_framed_state) is used for "support",
+        # and for "anchored" only when one of its options is switched on, so
+        # existing anchored configs keep their exact behaviour.
+        self.framed_update = is_support or (
+            self.cp_frame == "anchored"
+            and (self.cp_transport or self.length_mode != "fresh" or not self.frame_grad))
+        if self.cp_frame == "global" and any(
+                k in brr_cfg for k in ("cp_transport", "length_mode", "frame_grad", "min_span")):
+            raise ValueError("brr_cfg cp_transport / length_mode / frame_grad / min_span "
+                             "apply to the anchored and support frames only")
+        if self.cp_frame == "anchored" and "min_span" in brr_cfg:
+            raise ValueError("brr_cfg.min_span applies to cp_frame='support' only")
 
         # ---- network ----------------------------------------------------------
         rg_cfg = dict(roi_gather_cfg or {})
@@ -485,9 +520,17 @@ class CLRBezierHead(_OfficialHead):
                    img_w=self.img_w, img_h=self.img_h, n_strips=self.n_strips,
                    cp_frame=self.cp_frame)
 
-        cp_x, y_start = globalize_local_cp(local_cp, self.cp_x_margin, self.eps,
-                                           cp_frame=self.cp_frame)
-        _, on_map = brr_reference(cp_x, y_start, y_start + one_row, **geo)
+        if self.cp_frame == "support":
+            cp_x, y_start, length, frame_top = support_state_from_local(
+                local_cp, self.cp_x_margin, self.n_strips, self.support_min_span, self.eps)
+        else:
+            cp_x, y_start = globalize_local_cp(local_cp, self.cp_x_margin, self.eps,
+                                               cp_frame=self.cp_frame,
+                                               legacy_tangent=self.legacy_anchored_prior)
+            # full height from the start; also the anchored frame's own extent
+            length = y_start + one_row
+            frame_top = torch.zeros_like(y_start)
+        _, on_map = brr_reference(cp_x, y_start, length, **geo, frame_top=frame_top)
 
         pooled_stages, preds, states = [], [], []
         input_xs, reproj_stats, precond_stats, moe_stats = [], [], [], []
@@ -496,7 +539,8 @@ class CLRBezierHead(_OfficialHead):
             if self._need_input_xs:
                 # full-row x of the reference this stage samples from (gate_on="input")
                 input_xs.append(eval_cubic(cp_x.detach(), self.prior_ys.to(cp_x.dtype),
-                                           y_start.detach(), self.cp_frame))
+                                           y_start.detach(), self.cp_frame,
+                                           y_top=frame_top.detach()))
             prior_xs = torch.flip(on_map, dims=[2])
             pooled = pool_prior_features(feats[stage], prior_xs, self.prior_feat_ys,
                                          self.prior_feat_channels)
@@ -516,7 +560,14 @@ class CLRBezierHead(_OfficialHead):
                 roi = self.gsrc.inject(stage, roi, context_tokens)
             if self.query_attn is not None and stage in self.query_attn_stages:
                 # geometry of the anchors these RoI features were sampled from
-                anchor_state = torch.cat([y_start.unsqueeze(-1), cp_x], dim=-1)
+                anchor_cp = cp_x
+                if self.cp_frame == "support":
+                    # The pairwise geometry bias compares control points across
+                    # queries, so give it one shared frame: the anchored one
+                    # ([0, y_start]), with the same 5-column layout.
+                    anchor_cp = transport_cp(cp_x, frame_top.detach(), y_start.detach(),
+                                             torch.zeros_like(y_start), y_start.detach())
+                anchor_state = torch.cat([y_start.unsqueeze(-1), anchor_cp], dim=-1)
                 roi = self.query_attn[str(stage)](roi, anchor_state, num_groups)
             cls_roi = reg_roi = roi
             if self.lateral is not None and stage in self.lateral_stages:
@@ -543,26 +594,51 @@ class CLRBezierHead(_OfficialHead):
                 # visible span. With apply_to="reference" only the curve the
                 # IoU loss sees is rescaled; the BRR state supervision keeps
                 # the raw delta.
-                gains = self.cp_precond.gains(y_start, reg[..., 1],
+                gains = self.cp_precond.gains(y_start, self._precond_length(length, reg),
                                               frame=self.cp_frame)
                 reg_ref = torch.cat(
                     [reg[..., :2], reg[..., 2:6] * gains, reg[..., 6:]], dim=-1)
                 if self.cp_precond.apply_to == "both":
                     reg = reg_ref
                 precond_stats.append(self.cp_precond.diagnostics(
-                    y_start, reg[..., 1], scores=cls_logits[..., 1] - cls_logits[..., 0],
-                    frame=self.cp_frame))
+                    y_start, self._precond_length(length, reg),
+                    scores=cls_logits[..., 1] - cls_logits[..., 0], frame=self.cp_frame))
 
-            new_x, new_y, _, _ = update_brr_state(cp_x, y_start, reg_ref[..., :6],
-                                                  self.n_strips, self.cp_x_margin)
-            length = reg_ref[..., 1]
-            ref, ref_on_map = brr_reference(new_x, new_y, length, **geo)
+            if self.framed_update:
+                upd = update_framed_state(
+                    cp_x, y_start, length, frame_top, reg_ref[..., :6], self.n_strips,
+                    self.cp_x_margin, self.cp_frame, self.support_min_span,
+                    self.cp_transport, self.length_mode, detach_frame=not self.frame_grad)
+                new_x, new_y, new_top = upd["cp_x"], upd["y_start"], upd["frame_top"]
+                new_len = upd["length"]
+                if self.frame_grad:
+                    ref, ref_on_map = brr_reference(new_x, new_y, new_len, **geo,
+                                                    frame_top=new_top)
+                else:
+                    ref, ref_on_map = brr_reference(new_x, new_y, new_len, **geo,
+                                                    frame_top=new_top.detach(),
+                                                    frame_bottom=new_y.detach())
+                # Direct-supervision state: detached input + raw delta, plus the
+                # (detached) frame the control points are expressed in.
+                raw_x = upd["base"].detach() + reg[..., 2:6]
+                raw_y = y_start.detach() + reg[..., 0]
+                raw_len = (length.detach() + reg[..., 1]) if self.length_mode == "residual" \
+                    else reg_ref[..., 1]
+                states.append(torch.cat([raw_y.unsqueeze(-1), raw_len.unsqueeze(-1), raw_x,
+                                         new_top.detach().unsqueeze(-1),
+                                         new_y.detach().unsqueeze(-1)], dim=-1))
+            else:
+                new_x, new_y, _, _ = update_brr_state(cp_x, y_start, reg_ref[..., :6],
+                                                      self.n_strips, self.cp_x_margin)
+                new_len = reg_ref[..., 1]
+                new_top = frame_top
+                ref, ref_on_map = brr_reference(new_x, new_y, new_len, **geo)
+                # Direct-supervision state: detached input + raw (unclamped) delta.
+                raw_y = y_start.detach() + reg[..., 0]
+                raw_x = cp_x.detach() + reg[..., 2:6]
+                states.append(torch.cat([raw_y.unsqueeze(-1), new_len.unsqueeze(-1), raw_x],
+                                        dim=-1))
             pred = torch.cat([cls_logits, ref[..., 2:6], ref[..., 6:] + reg[..., 6:]], dim=-1)
-
-            # Direct-supervision state: detached input + raw (unclamped) delta.
-            raw_y = y_start.detach() + reg[..., 0]
-            raw_x = cp_x.detach() + reg[..., 2:6]
-            states.append(torch.cat([raw_y.unsqueeze(-1), length.unsqueeze(-1), raw_x], dim=-1))
             preds.append(pred)
 
             if stage != self.refine_layers - 1:
@@ -581,10 +657,18 @@ class CLRBezierHead(_OfficialHead):
                     # stage's parameters also receive the next stage's gradient.
                     # State supervision still uses the detached input state.
                     cp_x, y_start, on_map = next_x, new_y, next_map
+                    length, frame_top = new_len, new_top
                 else:
                     cp_x, y_start, on_map = next_x.detach(), new_y.detach(), next_map.detach()
+                    length, frame_top = new_len.detach(), new_top.detach()
         return preds, states, dict(input_xs=input_xs or None, reproj=reproj_stats,
                                    precond=precond_stats, moe=moe_stats)
+
+    def _precond_length(self, length, reg):
+        """The length the preconditioner sees: the stage's predicted length."""
+        if self.framed_update and self.length_mode == "residual":
+            return length + reg[..., 1]
+        return reg[..., 1]
 
     def gsrc_tokens(self, feats):
         """Global context tokens from the coarsest FPN level ([B, H*W, C])."""
@@ -675,7 +759,9 @@ class CLRBezierHead(_OfficialHead):
         valid_targets = [t[t[:, 1] == 1] for t in lanes]
         gt_cps = [fit_global_cubic_to_clr_rows(t[:, 6:], self.prior_ys, self.img_w,
                                                self.brr_cp_fit_ridge, self.cp_x_margin,
-                                               cp_frame=self.cp_frame)
+                                               cp_frame=self.cp_frame, n_strips=self.n_strips,
+                                               min_span=self.support_min_span,
+                                               return_frame=True)
                   for t in valid_targets]
 
         main = self._branch_losses(outs["main_preds"], outs["main_states"], valid_targets, gt_cps,
@@ -830,7 +916,7 @@ class CLRBezierHead(_OfficialHead):
             w = w * (~ignore).to(raw.dtype)
         return (raw * w).sum(-1) / w.sum(-1).clamp_min(1.0)
 
-    def _brr_losses(self, state, target, gt_cp, gt_cp_ok):
+    def _brr_losses(self, state, target, gt_cp, gt_cp_ok, gt_frame=None):
         n = float(self.n_strips)
         pred_start = (1.0 - state[:, 0]) * n
         pred_len = state[:, 1] * n
@@ -845,7 +931,18 @@ class CLRBezierHead(_OfficialHead):
         sup = (sup * sup.new_tensor(self.brr_component_weights)).mean(-1).mean()
 
         scale = float(max(1, self.img_w - 1))
-        if self.cp_frame == "anchored":
+        if self.framed_update:
+            # The GT control points were fitted on the GT's own frame
+            # (gt_frame = [top, start]); the state's control points live on the
+            # frame stored with it (state[:, 6:8]). Move the GT curve into the
+            # prediction's frame (cubic inside its own support, linear
+            # continuation outside, the same curve eval_cubic draws) before
+            # comparing, and clamp to the range the state is kept in.
+            with torch.no_grad():
+                gt_cp = transport_cp(gt_cp, gt_frame[:, 0], gt_frame[:, 1],
+                                     state[:, 6], state[:, 7]).clamp(
+                    -self.cp_x_margin, 1.0 + self.cp_x_margin)
+        elif self.cp_frame == "anchored":
             # The GT control points were fitted in the GT's own frame
             # (t = y / y_start_gt); the state lives in the predicted frame
             # (t = y / y_start_pred). Move the target into the predicted frame
@@ -963,7 +1060,8 @@ class CLRBezierHead(_OfficialHead):
                     iou_sum = iou_sum + weight * per_lane.mean()
                     if use_brr:
                         sup, cp = self._brr_losses(states[b, reg_rows], target[reg_cols],
-                                                   gt_cps[b][0][reg_cols], gt_cps[b][1][reg_cols])
+                                                   gt_cps[b][0][reg_cols], gt_cps[b][1][reg_cols],
+                                                   gt_cps[b][2][reg_cols])
                         sup_sum = sup_sum + weight * sup
                         cp_sum = cp_sum + weight * cp
             weights = preds.new_tensor([w for _, w in pairs]).view(-1, 1)

@@ -79,7 +79,10 @@ model = dict(
         lateral_cfg=None,
         look_forward_twice=False,
         prior_cfg=dict(delta_scale=0.1, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),
-        brr_cfg=dict(cp_x_margin=0.5),
+        # legacy_anchored_prior=True keeps the anchored side priors exactly as
+        # they were trained before the 2026-10-06 globalize fix, so this config
+        # reproduces its reported results. Drop it for new runs.
+        brr_cfg=dict(cp_x_margin=0.5, legacy_anchored_prior=True),
         main_assigner=_o2m,
         # per-stage override; stages not listed use main_assigner
         main_stage_assigners={"0": _o2m, "1": _o2m, "2": _o2m},
