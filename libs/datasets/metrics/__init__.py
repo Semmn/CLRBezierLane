@@ -15,6 +15,7 @@ import json
 import os
 import os.path as osp
 import shutil
+import sys
 import tempfile
 from typing import Sequence
 
@@ -201,13 +202,16 @@ class CurvelanesMetric(BaseMetric):
     """
 
     def __init__(self, eval_width=224, eval_height=224, iou_thresh=0.5, lane_width=5,
-                 y_step=8, collect_device="cpu", prefix=None):
+                 y_step=8, iou_thresholds=(0.5, 0.75), collect_device="cpu", prefix=None):
         super().__init__(collect_device=collect_device, prefix=prefix)
         self.eval_width = eval_width
         self.eval_height = eval_height
         self.iou_thresh = iou_thresh
         self.lane_width = lane_width
         self.y_step = int(y_step)
+        # Extra IoU thresholds reported as F1@50, F1@75, ... next to the
+        # official f1_measure / precision / recall (which stay at iou_thresh).
+        self.iou_thresholds = tuple(float(t) for t in (iou_thresholds or ()))
 
     @staticmethod
     def crop_to_original(lanes, ori_shape, crop_offset):
@@ -259,19 +263,63 @@ class CurvelanesMetric(BaseMetric):
                                      pred=self.convert_coords_laneatt(lanes, ori_shape)))
 
     def compute_metrics(self, results):
+        """vega LaneMetricCore's F1 / precision / recall at ``iou_thresh`` (the
+        official CurveLanes numbers), plus F1@50, F1@75, ... at
+        ``iou_thresholds``. vega matches GT and predictions per image by the
+        Hungarian algorithm on 1 - IoU, which does not depend on the threshold,
+        so one IoU matrix per image gives every threshold (same cost as before).
+        """
         try:
-            from vega.metrics.pytorch.lane_metric import LaneMetricCore
+            from vega.metrics.pytorch.lane_metric import calc_iou, resize_lane  # noqa: F401
         except ImportError as err:
             raise ImportError(
                 "CurvelanesMetric needs vega's LaneMetricCore, as in the CLRerNet "
                 "features/curvelane branch (pip install noah-vega).") from err
-        evaluator = LaneMetricCore(eval_width=self.eval_width, eval_height=self.eval_height,
-                                   iou_thresh=self.iou_thresh, lane_width=self.lane_width)
-        evaluator.reset()
+        thresholds = sorted(set(self.iou_thresholds) | {float(self.iou_thresh)})
+        hits = {t: 0 for t in thresholds}
+        gt_num = pr_num = 0
         for r in results:
             gt_wh = dict(height=r["ori_shape"][0], width=r["ori_shape"][1])
-            evaluator(dict(Lines=self.parse_anno(r["filename"]), Shape=gt_wh),
-                      dict(Lines=r["pred"], Shape=gt_wh))
-        summary = evaluator.summary()
-        print_log(str(summary), logger=MMLogger.get_current_instance())
-        return {k: float(v) for k, v in summary.items() if np.isscalar(v)}
+            gt_lines = [lane for lane in self.parse_anno(r["filename"]) if len(lane) > 0]
+            pr_lines = [lane for lane in r["pred"] if len(lane) > 0]
+            gt_num += len(gt_lines)
+            pr_num += len(pr_lines)
+            matched = self._matched_ious(gt_lines, pr_lines, gt_wh)
+            for t in thresholds:
+                hits[t] += int((matched > t).sum())   # vega: iou_val > iou_thresh
+        precision, recall, f1 = self._prf(hits[float(self.iou_thresh)], pr_num, gt_num)
+        out = dict(f1_measure=f1, precision=precision, recall=recall)
+        for t in sorted(set(self.iou_thresholds)):
+            out[f"F1@{int(round(t * 100))}"] = self._prf(hits[t], pr_num, gt_num)[2]
+        print_log(str(out), logger=MMLogger.get_current_instance())
+        return out
+
+    @staticmethod
+    def _prf(hits, pr_num, gt_num):
+        """Same formula and epsilons as vega LaneMetricCore.summary."""
+        eps = sys.float_info.epsilon
+        precision = hits / (pr_num + eps)
+        recall = hits / (gt_num + eps)
+        f1 = 2 * precision * recall / (precision + recall + eps)
+        return float(precision), float(recall), float(f1)
+
+    def _matched_ious(self, gt_lanes, pr_lanes, gt_wh):
+        """IoU of each Hungarian-matched (GT, prediction) pair of one image,
+        computed exactly as vega's ``evaluate_core`` (GT and prediction share
+        the image's shape here)."""
+        from scipy.optimize import linear_sum_assignment
+        from vega.metrics.pytorch.lane_metric import calc_iou, resize_lane
+        if not gt_lanes or not pr_lanes:
+            return np.zeros((0,))
+        hyperp = dict(eval_width=self.eval_width, eval_height=self.eval_height,
+                      iou_thresh=self.iou_thresh, lane_width=self.lane_width)
+        y_ratio = np.true_divide(gt_wh["height"], self.eval_height)
+        x_ratio = np.true_divide(gt_wh["width"], self.eval_width)
+        gt_lanes = [resize_lane(lane, x_ratio, y_ratio) for lane in gt_lanes]
+        pr_lanes = [resize_lane(lane, x_ratio, y_ratio) for lane in pr_lanes]
+        iou_mat = np.zeros((len(gt_lanes), len(pr_lanes)))
+        for i, gt_lane in enumerate(gt_lanes):
+            for j, pr_lane in enumerate(pr_lanes):
+                iou_mat[i, j] = calc_iou(gt_lane, pr_lane, hyperp)
+        rows, cols = linear_sum_assignment(1 - iou_mat)
+        return iou_mat[rows, cols]
