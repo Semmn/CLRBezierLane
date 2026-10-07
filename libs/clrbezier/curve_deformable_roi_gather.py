@@ -417,8 +417,11 @@ class CurveAlignedDeformableROIGather(ROIGather):
             self.sampler.reset_offsets()
 
     def forward(self, roi_features, x, layer_index, reference_points=None,
-                reference_valid_mask=None, **unused):
-        roi = super().forward(roi_features, x, layer_index)          # [B, K, D]
+                reference_valid_mask=None, query_mixer=None, mixer_position=None, **unused):
+        # query_mixer runs inside the official gather (before or right after its
+        # feature-map attention), so the deformable branch sees its output.
+        roi = super().forward(roi_features, x, layer_index, query_mixer=query_mixer,
+                              mixer_position=mixer_position)          # [B, K, D]
         self.last_stats = {}
         if (self.sampler is None or int(layer_index) not in self.deformable_stages):
             return roi

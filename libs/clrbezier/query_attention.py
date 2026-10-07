@@ -1,7 +1,9 @@
 """Masked query-to-query attention with anchor-geometry positional bias.
 
-Used after ROIGather (and after GSRC injection, when enabled), so anchors can
-see each other before the cls/reg towers.
+Used inside each refinement stage, at ``query_attn_cfg.position``: before
+ROIGather's feature-map attention ("pre_q2g"), right after it ("post_q2g"), or
+after the whole gather and GSRC injection ("post_gather", the default), so
+anchors can see each other before the cls/reg towers.
 
 Masking
 -------

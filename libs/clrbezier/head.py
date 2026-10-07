@@ -399,6 +399,20 @@ class CLRBezierHead(_OfficialHead):
             self.q2q_geometry_frame = query_attn_cfg.pop("geometry_frame", "global")
             if self.q2q_geometry_frame not in ("global", "native"):
                 raise ValueError("query_attn_cfg.geometry_frame must be 'global' or 'native'")
+            # Where q2q runs inside a refinement stage:
+            #   "pre_q2g"     : on the pooled lane features (after ROIGather's
+            #                   fc + LayerNorm), before they attend to the
+            #                   feature map, so q2g is queried with mixed queries;
+            #   "post_q2g"    : right after the feature-map attention's residual,
+            #                   before the deformable branch and GSRC;
+            #   "post_gather" : after the whole gather, deformable branch and
+            #                   GSRC (the original position; the default, so
+            #                   existing checkpoints are unchanged).
+            # Without a deformable branch or GSRC, "post_q2g" == "post_gather".
+            self.q2q_position = query_attn_cfg.pop("position", "post_gather")
+            if self.q2q_position not in ("pre_q2g", "post_q2g", "post_gather"):
+                raise ValueError("query_attn_cfg.position must be 'pre_q2g', 'post_q2g' "
+                                 "or 'post_gather'")
             query_attn_cfg.setdefault("dim", self.fc_hidden_dim)
             query_attn_cfg.setdefault("state_dim", 5)  # [y_start, P0x..P3x]
             share = bool(query_attn_cfg.pop("share_across_stages", False))
@@ -592,19 +606,7 @@ class CLRBezierHead(_OfficialHead):
             pooled = pool_prior_features(feats[stage], prior_xs, self.prior_feat_ys,
                                          self.prior_feat_channels)
             pooled_stages.append(pooled)
-            if self.roi_gather_deformable:
-                deform_xs = prior_xs.detach() if self.deform_detach_reference else prior_xs
-                ref_pts, ref_mask = build_clr_curve_reference_points(
-                    deform_xs, self.prior_feat_ys, self.deform_curve_samples)
-                roi = self.roi_gather(pooled_stages, feats[stage], stage,
-                                      reference_points=ref_pts, reference_valid_mask=ref_mask)
-            else:
-                roi = self.roi_gather(pooled_stages, feats[stage], stage)
-            gather_stats = getattr(self.roi_gather, "last_stats", None)
-            if gather_stats:
-                moe_stats.append(gather_stats)
-            if self.gsrc is not None:
-                roi = self.gsrc.inject(stage, roi, context_tokens)
+            query_mixer = None
             if self.query_attn is not None and stage in self.query_attn_stages:
                 # geometry of the anchors these RoI features were sampled from
                 anchor_cp = cp_x
@@ -623,7 +625,29 @@ class CLRBezierHead(_OfficialHead):
                 # row already holds exactly one group. A group mask over the K
                 # queries would cut that one group into num_groups arbitrary
                 # blocks, so attention always runs unmasked.
-                roi = self.query_attn[str(stage)](roi, anchor_state, 1)
+                q2q_module = self.query_attn[str(stage)]
+
+                def query_mixer(queries, _m=q2q_module, _s=anchor_state):
+                    return _m(queries, _s, 1)
+            in_gather = query_mixer is not None and self.q2q_position != "post_gather"
+            gather_kw = (dict(query_mixer=query_mixer, mixer_position=self.q2q_position)
+                         if in_gather else {})
+            if self.roi_gather_deformable:
+                deform_xs = prior_xs.detach() if self.deform_detach_reference else prior_xs
+                ref_pts, ref_mask = build_clr_curve_reference_points(
+                    deform_xs, self.prior_feat_ys, self.deform_curve_samples)
+                roi = self.roi_gather(pooled_stages, feats[stage], stage,
+                                      reference_points=ref_pts, reference_valid_mask=ref_mask,
+                                      **gather_kw)
+            else:
+                roi = self.roi_gather(pooled_stages, feats[stage], stage, **gather_kw)
+            gather_stats = getattr(self.roi_gather, "last_stats", None)
+            if gather_stats:
+                moe_stats.append(gather_stats)
+            if self.gsrc is not None:
+                roi = self.gsrc.inject(stage, roi, context_tokens)
+            if query_mixer is not None and not in_gather:
+                roi = query_mixer(roi)
             cls_roi = reg_roi = roi
             if self.lateral is not None and stage in self.lateral_stages:
                 evidence = self.lateral[str(stage)](feats[stage], prior_xs, self.prior_feat_ys)

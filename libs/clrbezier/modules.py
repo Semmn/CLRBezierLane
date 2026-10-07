@@ -67,9 +67,16 @@ class ROIGather(nn.Module):
         self.fc = nn.Linear(sample_points * in_channels, fc_hidden_dim)
         self.fc_norm = nn.LayerNorm(fc_hidden_dim)
 
-    def forward(self, roi_features, fmap, layer_index):
+    def forward(self, roi_features, fmap, layer_index, query_mixer=None,
+                mixer_position=None):
         """roi_features: list of [B*N, C, S, 1] for stages 0..layer_index.
-        fmap: current-stage feature map [B, C, H, W]. Returns [B, N, fc_hidden_dim]."""
+        fmap: current-stage feature map [B, C, H, W]. Returns [B, N, fc_hidden_dim].
+
+        query_mixer: optional callable [B, N, D] -> [B, N, D] (the head's
+        query-to-query attention), applied at ``mixer_position``:
+        "pre_q2g" on the pooled lane features, before they query the feature
+        map; "post_q2g" right after the feature-map attention's residual.
+        """
         batch_size = fmap.shape[0]
         num_queries = roi_features[0].shape[0] // batch_size
         feats = [self.convs[i](f) for i, f in enumerate(roi_features)]
@@ -77,8 +84,13 @@ class ROIGather(nn.Module):
         roi = roi.contiguous().view(batch_size * num_queries, -1)
         roi = F.relu(self.fc_norm(self.fc(roi)))
         roi = roi.view(batch_size, num_queries, self.fc_hidden_dim)
+        if query_mixer is not None and mixer_position == "pre_q2g":
+            roi = query_mixer(roi)
         context = F.dropout(self.attention(roi, fmap), p=0.1, training=self.training)
-        return roi + context
+        roi = roi + context
+        if query_mixer is not None and mixer_position == "post_q2g":
+            roi = query_mixer(roi)
+        return roi
 
 
 def linear_relu(dim):
