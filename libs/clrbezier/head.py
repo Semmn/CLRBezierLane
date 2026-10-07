@@ -490,6 +490,10 @@ class CLRBezierHead(_OfficialHead):
         self.brr_component_weights = (float(loss_cfg.get("start_y_component_weight", 1.0)),
                                       float(loss_cfg.get("length_component_weight", 1.0)))
         self.brr_cp_fit_ridge = float(loss_cfg.get("brr_cp_fit_ridge", 1e-2))
+        # True: GT control points that would leave [-cp_x_margin, 1 + cp_x_margin]
+        # are refitted under that bound (closest representable curve) instead of
+        # being clamped one by one. False keeps the old target.
+        self.brr_cp_fit_box = bool(loss_cfg.get("brr_cp_fit_box", False))
         self.brr_loss_stages = [int(s) for s in loss_cfg.get("brr_loss_stages", [0, 1, 2])]
 
         adapter_cfg = dict(target_adapter or {})
@@ -858,7 +862,7 @@ class CLRBezierHead(_OfficialHead):
                                                self.brr_cp_fit_ridge, self.cp_x_margin,
                                                cp_frame=self.cp_frame, n_strips=self.n_strips,
                                                min_span=self.support_min_span,
-                                               return_frame=True)
+                                               return_frame=True, box=self.brr_cp_fit_box)
                   for t in valid_targets]
 
         main = self._branch_losses(outs["main_preds"], outs["main_states"], valid_targets, gt_cps,

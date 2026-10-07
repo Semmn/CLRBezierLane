@@ -444,19 +444,52 @@ def brr_reference(cp_x, y_start, length, prior_ys, sample_x_indices, img_w, img_
 
 def fit_global_cubic_to_clr_rows(target_xs_px, prior_ys, img_w, ridge, margin,
                                  min_valid_points=2, cp_frame="global",
-                                 n_strips=None, min_span=0.1, return_frame=False):
+                                 n_strips=None, min_span=0.1, return_frame=False,
+                                 box=False):
     """See ``_fit_global_cubic_to_clr_rows``. Runs in float32 with autocast off:
     under AMP the einsums would build the 4x4 normal equations in fp16, which
     moves the global-frame CP target by ~16 px on average (as in transport_cp)."""
     with torch.autocast(device_type=target_xs_px.device.type, enabled=False):
         return _fit_global_cubic_to_clr_rows(
             target_xs_px.float(), prior_ys.float(), img_w, ridge, margin,
-            min_valid_points, cp_frame, n_strips, min_span, return_frame)
+            min_valid_points, cp_frame, n_strips, min_span, return_frame, box)
+
+
+# Every free / at-lower / at-upper pattern of the 4 control points (3^4 = 81).
+_BOX_PATTERNS = torch.cartesian_prod(*([torch.arange(3)] * 4))
+
+
+def _box_constrained_solve(system, rhs, lo, hi):
+    """Exact minimizer of 1/2 P'AP - b'P subject to lo <= P <= hi, for SPD 4x4 A.
+
+    Enumerates all 81 active sets: for each, the bound control points are
+    fixed and the free ones solved from their rows of A P = b (the free block
+    of an SPD matrix is SPD, so every solve is well posed). The constrained
+    minimum is the feasible candidate with the lowest objective. Batched over
+    the leading dim: system [N, 4, 4], rhs [N, 4] -> [N, 4].
+    """
+    pat = _BOX_PATTERNS.to(system.device)                       # [K, 4]
+    fixed = pat > 0
+    bound = torch.full(pat.shape, hi, device=system.device, dtype=system.dtype)
+    bound = bound.masked_fill(pat == 1, lo)
+    eye = torch.eye(4, device=system.device, dtype=system.dtype)
+    # Fixed rows become identity rows with the bound as right-hand side.
+    mat = torch.where(fixed[None, :, :, None], eye[None, None], system[:, None])
+    vec = torch.where(fixed[None], bound[None], rhs[:, None])
+    cand = torch.linalg.solve(mat, vec.unsqueeze(-1)).squeeze(-1)  # [N, K, 4]
+    tol = 1e-6
+    feasible = ((cand >= lo - tol) & (cand <= hi + tol)).all(-1)
+    obj = 0.5 * torch.einsum("nki,nij,nkj->nk", cand, system, cand) - (cand * rhs[:, None]).sum(-1)
+    obj = torch.where(feasible, obj, torch.full_like(obj, float("inf")))
+    best = obj.argmin(dim=-1)
+    out = cand[torch.arange(cand.shape[0], device=cand.device), best]
+    return out.clamp(lo, hi)
 
 
 def _fit_global_cubic_to_clr_rows(target_xs_px, prior_ys, img_w, ridge, margin,
                                   min_valid_points=2, cp_frame="global",
-                                  n_strips=None, min_span=0.1, return_frame=False):
+                                  n_strips=None, min_span=0.1, return_frame=False,
+                                  box=False):
     """Fit fixed-global-y cubic CPs to GT CLR rows (batched, differentiable-free).
 
     Same objective as UnLaneDet ``GenerateLaneLine._fit_brr_control_points_x``:
@@ -468,6 +501,14 @@ def _fit_global_cubic_to_clr_rows(target_xs_px, prior_ys, img_w, ridge, margin,
     Args:
         target_xs_px: [N, R] GT x in network-input pixels, bottom -> top.
             Valid rows satisfy 0 <= x < img_w (same rule as LaneIoU).
+        box: when the unconstrained fit has a control point outside
+            [-margin, 1 + margin], return the minimizer of the same objective
+            under that bound instead of clamping each control point on its own.
+            Clamping one point and leaving the other three where they were
+            moves the curve on the visible rows (often by tens of pixels on
+            curved lanes in the global/anchored frames); the constrained
+            minimizer is the closest curve the state can actually represent.
+            Lanes whose fit is already in range are returned unchanged.
     Returns:
         cp_x:  [N, 4] normalized by (img_w - 1), clamped to the BRR margin.
         valid: [N] bool.
@@ -531,6 +572,12 @@ def _fit_global_cubic_to_clr_rows(target_xs_px, prior_ys, img_w, ridge, margin,
     cp_x = torch.linalg.solve(system, rhs.unsqueeze(-1)).squeeze(-1)
 
     ok = (count >= float(min_valid_points)) & torch.isfinite(cp_x).all(-1)
+    if box:
+        lo, hi = -float(margin), 1.0 + float(margin)
+        out = ok & ((cp_x < lo) | (cp_x > hi)).any(-1)
+        if bool(out.any()):
+            cp_x = cp_x.clone()
+            cp_x[out] = _box_constrained_solve(system[out], rhs[out], lo, hi)
     cp_x = torch.where(ok.unsqueeze(-1), cp_x, affine)
     cp_x = torch.nan_to_num(cp_x, nan=0.5, posinf=1.0 + margin, neginf=-margin)
     cp_x = cp_x.clamp(-margin, 1.0 + margin)
