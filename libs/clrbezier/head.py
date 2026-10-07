@@ -494,6 +494,16 @@ class CLRBezierHead(_OfficialHead):
         # are refitted under that bound (closest representable curve) instead of
         # being clamped one by one. False keeps the old target.
         self.brr_cp_fit_box = bool(loss_cfg.get("brr_cp_fit_box", False))
+        # Where the control-point loss compares prediction and GT:
+        #   "pred"   (default) GT control points moved into each prediction's frame;
+        #   "global" prediction moved onto the fixed global frame [0, 1], GT fitted
+        #            there once (a fixed target per lane);
+        #   "rows"   the predicted Bezier curve against the GT x on the GT's visible
+        #            rows, in pixels (no GT fit, no frame, no margin clamp).
+        self.brr_cp_loss_space = str(loss_cfg.get("brr_cp_loss_space", "pred"))
+        if self.brr_cp_loss_space not in ("pred", "global", "rows"):
+            raise ValueError("loss_cfg.brr_cp_loss_space must be 'pred', 'global' or 'rows', "
+                             f"got {self.brr_cp_loss_space!r}")
         self.brr_loss_stages = [int(s) for s in loss_cfg.get("brr_loss_stages", [0, 1, 2])]
 
         adapter_cfg = dict(target_adapter or {})
@@ -858,9 +868,10 @@ class CLRBezierHead(_OfficialHead):
 
     def loss_by_outputs(self, outs, lanes, seg_gt=None):
         valid_targets = [t[t[:, 1] == 1] for t in lanes]
+        fit_frame = "global" if self.brr_cp_loss_space == "global" else self.cp_frame
         gt_cps = [fit_global_cubic_to_clr_rows(t[:, 6:], self.prior_ys, self.img_w,
                                                self.brr_cp_fit_ridge, self.cp_x_margin,
-                                               cp_frame=self.cp_frame, n_strips=self.n_strips,
+                                               cp_frame=fit_frame, n_strips=self.n_strips,
                                                min_span=self.support_min_span,
                                                return_frame=True, box=self.brr_cp_fit_box)
                   for t in valid_targets]
@@ -1045,6 +1056,8 @@ class CLRBezierHead(_OfficialHead):
         sup = (sup * sup.new_tensor(self.brr_component_weights)).mean(-1).mean()
 
         scale = float(max(1, self.img_w - 1))
+        if self.brr_cp_loss_space != "pred":
+            return sup, self._cp_loss_absolute(state, target, gt_cp, gt_cp_ok)
         if self.framed_update:
             # The GT control points were fitted on the GT's own frame
             # (gt_frame = [top, start]); the state's control points live on the
@@ -1075,6 +1088,53 @@ class CLRBezierHead(_OfficialHead):
         ok = gt_cp_ok.float()
         cp = (cp_elem * ok).sum() / ok.sum().clamp_min(1.0)
         return sup, cp
+
+    def _state_frame(self, state):
+        """(top, bottom) of the image-y frame the state's raw control points live in.
+
+        Framed update: stored with the state (columns 6:8). Legacy anchored: [0, y_s]
+        with y_s clamped as the reference clamps it. Global: [0, 1]. Constants.
+        """
+        if self.framed_update:
+            return state[:, 6].detach(), state[:, 7].detach()
+        if self.cp_frame == "anchored":
+            bottom = state[:, 0].detach().clamp(1.0 / float(self.n_strips), 1.0)
+            return torch.zeros_like(bottom), bottom
+        ones = state.new_ones(state.shape[0])
+        return torch.zeros_like(ones), ones
+
+    def _cp_loss_absolute(self, state, target, gt_cp, gt_cp_ok):
+        """Control-point loss in a prediction-independent space (brr_cp_loss_space)."""
+        scale = float(max(1, self.img_w - 1))
+        pred_cp = state[:, 2:6]
+        top, bottom = self._state_frame(state)
+        if self.brr_cp_loss_space == "global":
+            # The predicted curve, as drawn (cubic in its frame, linear continuation
+            # outside), re-expressed on [0, 1]. transport_cp is linear in the
+            # control points, so the gradient reaches them; the frames are constants.
+            if self.cp_frame != "global":
+                pred_cp = transport_cp(pred_cp, top, bottom,
+                                       torch.zeros_like(top), torch.ones_like(bottom))
+            cp_elem = _smooth_l1(pred_cp * scale, gt_cp * scale, self.brr_cp_beta).mean(-1)
+            ok = gt_cp_ok.float()
+            return (cp_elem * ok).sum() / ok.sum().clamp_min(1.0)
+
+        # "rows": the predicted Bezier curve (without the per-row residuals) against
+        # the GT x on every row LaneIoU counts, in pixels.
+        xs_gt = target[:, 6:]
+        valid = torch.isfinite(xs_gt) & (xs_gt >= 0.0) & (xs_gt < float(self.img_w))
+        ys = self.prior_ys.to(pred_cp.dtype)
+        if self.cp_frame == "global":
+            x = eval_global_cubic(pred_cp, ys)
+        else:
+            x = eval_cubic(pred_cp, ys, bottom, "support", y_top=top)
+        row_err = _smooth_l1(x * scale, torch.where(valid, xs_gt, torch.zeros_like(xs_gt)),
+                             self.brr_cp_beta)
+        row_err = torch.where(valid, row_err, torch.zeros_like(row_err))
+        count = valid.sum(-1)
+        per_lane = row_err.sum(-1) / count.clamp_min(1)
+        ok = (count >= 2).float()
+        return (per_lane * ok).sum() / ok.sum().clamp_min(1.0)
 
     def _branch_losses(self, preds_stages, states_stages, valid_targets, gt_cps, pairs_fn,
                        stages, apply_brr, cls_target_mode=None, gate=None, input_xs=None):
