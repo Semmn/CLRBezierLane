@@ -6,14 +6,14 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from mmdet.datasets.builder import DATASETS
+from mmdet.registry  import DATASETS
 from tqdm import tqdm
 from vega.metrics.pytorch.lane_metric import LaneMetricCore
 
 from .culane_dataset import CulaneDataset
 
 
-@DATASETS.register_module
+@DATASETS.register_module()
 class CurvelanesDataset(CulaneDataset):
     def prepare_train_img(self, idx):
         """
