@@ -3,10 +3,13 @@
 Each lane is read from its .lines.txt, cropped like CurvelanesDataset and scaled
 to the 800x320 network input, then checked for:
 
-  zigzag      the x of consecutive points (in file order) reverses direction by
-              more than --zigzag-px. A lane whose points were sorted by y after it
-              bent back looks like this: the row-sampled target jumps between the
-              two branches.
+  zigzag      the polyline (in file order) folds back on itself: two consecutive
+              segments, each longer than --zigzag-px, turn by more than
+              --zigzag-deg. A lane whose points were sorted by y after it bent back
+              (the old converter) looks like this: the row-sampled target jumps
+              between the two branches. A lane that simply curves (its x changes
+              direction gradually, e.g. a left lane bending left) is not flagged;
+              `reversals` in the csv still counts those direction changes.
   unsorted    y is not strictly decreasing in file order, so the training
               pipeline retries augmentation 30 times and then cuts the lane at the
               first reversal (cut_unsorted).
@@ -14,6 +17,11 @@ to the 800x320 network input, then checked for:
               i.e. nearly horizontal: a few rows carry a long x run.
   short       the lane covers fewer than --min-rows of the 72 target rows.
   too_many    the image has more lanes than max_lanes (16); extra ones are dropped.
+  overshoot   the official target sampler (interpolating cubic spline,
+              PackCLRNetInputs lane_interp="spline") departs from the annotated
+              polyline by more than --overshoot-px on some target row. Points
+              close in y with different x make the spline swing wildly. Checked
+              without augmentation, so this is a lower bound.
 
 Usage:
   # whole training list: rates and the worst images
@@ -30,10 +38,12 @@ import os.path as osp
 from collections import Counter
 
 import numpy as np
+from scipy.interpolate import InterpolatedUnivariateSpline
 
 CROP = {(2560, 1440): 640, (1570, 660): 180, (1280, 720): 368}   # (w, h) -> top offset
 IMG_W, IMG_H, N_ROWS = 800, 320, 72
-FLAGS = ("zigzag", "unsorted", "flat", "short", "too_many")
+ROW_YS = np.arange(IMG_H, -1, -IMG_H / (N_ROWS - 1))
+FLAGS = ("zigzag", "unsorted", "flat", "short", "too_many", "overshoot")
 
 
 def image_size(path):
@@ -60,13 +70,19 @@ def lane_flags(pts, args):
     dx = np.diff(xs)
     reversals = 0
     if np.any(np.diff(y) >= 0):
-        # the pipeline cuts such a lane at its first y reversal (cut_unsorted),
-        # so its zig-zag never reaches the target
+        # the pipeline drops the points that do not continue upwards (cut_unsorted)
         flags.add("unsorted")
     else:
         big = dx[np.abs(dx) > args.zigzag_px]
         reversals = int(np.sum(np.sign(big[1:]) != np.sign(big[:-1]))) if big.size > 1 else 0
-        if reversals:
+    # fold-back: angle between consecutive segments (file order)
+    seg = np.diff(pts, axis=0)
+    seg_len = np.linalg.norm(seg, axis=1)
+    if len(seg) > 1:
+        a, b = seg[:-1], seg[1:]
+        long_ = (seg_len[:-1] > args.zigzag_px) & (seg_len[1:] > args.zigzag_px)
+        cos = (a * b).sum(1) / np.maximum(seg_len[:-1] * seg_len[1:], 1e-9)
+        if np.any(long_ & (cos < np.cos(np.deg2rad(args.zigzag_deg)))):
             flags.add("zigzag")
     dys = np.abs(np.diff(ys))
     slope = np.abs(dx) / np.maximum(dys, 1e-6)
@@ -74,11 +90,27 @@ def lane_flags(pts, args):
     max_slope = float(slope[seg_ok].max()) if seg_ok.any() else 0.0
     if max_slope > args.flat_slope:
         flags.add("flat")
+    # what the pipeline samples: cut at the first y reversal, then the spline
+    keep, prev = [], np.inf
+    for i, v in enumerate(y):
+        if v < prev:
+            keep.append(i)
+            prev = v
+    cy, cx = y[keep][::-1], x[keep][::-1]            # increasing y
+    overshoot = 0.0
+    if len(cy) >= 2:
+        g = ROW_YS[(ROW_YS >= cy[0]) & (ROW_YS <= cy[-1]) & (ROW_YS >= 0)]
+        if len(g):
+            sp = InterpolatedUnivariateSpline(cy, cx, k=min(3, len(cy) - 1))
+            overshoot = float(np.abs(sp(g) - np.interp(g, cy, cx)).max())
+    if overshoot > args.overshoot_px:
+        flags.add("overshoot")
     vis = (ys >= 0) & (ys <= IMG_H)
     rows = (ys[vis].max() - ys[vis].min()) / (IMG_H / (N_ROWS - 1)) if vis.sum() > 1 else 0.0
     if rows < args.min_rows:
         flags.add("short")
-    return flags, dict(reversals=reversals, max_slope=max_slope, rows=float(rows))
+    return flags, dict(reversals=reversals, max_slope=max_slope, rows=float(rows),
+                       overshoot=overshoot)
 
 
 def scan_image(root, rel, args):
@@ -101,11 +133,12 @@ def scan_image(root, rel, args):
         per.append(s)
     if len(lanes) > args.max_lanes:
         flags["too_many"] += 1
-    score = (3 * flags["zigzag"] + 2 * flags["flat"] + flags["unsorted"]
+    score = (3 * flags["zigzag"] + 3 * flags["overshoot"] + 2 * flags["flat"] + flags["unsorted"]
              + flags["short"] + flags["too_many"])
     return dict(image=rel, lanes=len(lanes), score=score,
                 max_reversals=max((s["reversals"] for s in per), default=0),
                 max_slope=round(max((s["max_slope"] for s in per), default=0.0), 1),
+                max_overshoot=round(max((s["overshoot"] for s in per), default=0.0), 1),
                 **{k: flags[k] for k in FLAGS})
 
 
@@ -121,9 +154,12 @@ def main():
     ap.add_argument("--spikes", nargs="*", default=None, help="LossSpikeHook jsonl files")
     ap.add_argument("--out", default="curvelanes_lane_scan.csv")
     ap.add_argument("--zigzag-px", type=float, default=8.0)
+    ap.add_argument("--zigzag-deg", type=float, default=120.0,
+                    help="turn between consecutive segments that counts as folding back")
     ap.add_argument("--flat-slope", type=float, default=6.0)
     ap.add_argument("--min-rows", type=float, default=3.0)
     ap.add_argument("--max-lanes", type=int, default=16)
+    ap.add_argument("--overshoot-px", type=float, default=10.0)
     ap.add_argument("--limit", type=int, default=0, help="scan only the first N images")
     args = ap.parse_args()
 
@@ -149,7 +185,7 @@ def main():
         print(f"  {k:9s} {100 * base[k]:6.2f}%")
     print("worst 15:")
     for r in rows[:15]:
-        print("  ", {k: r[k] for k in ("image", "lanes", "score", "max_reversals", "max_slope") + FLAGS})
+        print("  ", {k: r[k] for k in ("image", "lanes", "score", "max_reversals", "max_slope", "max_overshoot") + FLAGS})
 
     if args.spikes:
         by_name = {r["image"]: r for r in rows}
@@ -172,7 +208,7 @@ def main():
         worst = sorted(spike_rows, key=lambda r: -r["score"])[:15]
         print("worst images inside spike batches:")
         for r in worst:
-            print("  ", {k: r[k] for k in ("image", "lanes", "score", "max_reversals", "max_slope") + FLAGS})
+            print("  ", {k: r[k] for k in ("image", "lanes", "score", "max_reversals", "max_slope", "max_overshoot") + FLAGS})
 
 
 if __name__ == "__main__":
