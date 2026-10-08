@@ -1297,3 +1297,65 @@ TRAIN_PID=$!
 echo "Training launcher PID: $TRAIN_PID"
 disown -h "$TRAIN_PID"
 tail -f "$LOG"
+
+# ================================================================================================
+# Visited at the 2026.10.08
+# Threshold Sweep and Test
+CONFIG_NAME="clrbezier_global_rows_o2o_r34"
+MODEL_NAME="clrbezier"
+DATASET="culane"
+TRAIN_EXP_NAME="run1"
+EVAL_EXP_NAME="test1"
+GPU_ID=0
+EPOCHS=36
+CONFIG=/exhdd/seungyu/CLRBezierLane/configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py
+CHECKPOINT=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/$TRAIN_EXP_NAME/epoch_$EPOCHS.pth
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/$EVAL_EXP_NAME
+LOG="$WORK_DIR/test.log"
+mkdir -p "$WORK_DIR"
+
+nohup env \
+    CUDA_VISIBLE_DEVICES=$GPU_ID \
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+    python3 tools/clrbezier/sweep_conf_eval.py \
+    "$CONFIG" \
+    "$CHECKPOINT" \
+    --range 0.80 0.94 \
+    --step 0.02 \
+    --out "$WORK_DIR/threshold_sweep.txt" \
+    --work-dir $WORK_DIR \
+    > "$LOG" 2>&1 < /dev/null &
+TEST_PID=$!
+echo $Testing PID: $TEST_PID"
+disown -h $TEST_PID"
+tail -f "$LOG"
+
+
+CONFIG_NAME="clrbezier_support_rows_o2o_r34"
+MODEL_NAME="clrbezier"
+DATASET="culane"
+TRAIN_EXP_NAME="run1"
+EVAL_EXP_NAME="test1"
+GPU_ID=1
+EPOCHS=36
+CONFIG=/exhdd/seungyu/CLRBezierLane/configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py
+CHECKPOINT=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/$TRAIN_EXP_NAME/epoch_$EPOCHS.pth
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/$EVAL_EXP_NAME
+LOG="$WORK_DIR/test.log"
+mkdir -p "$WORK_DIR"
+
+nohup env \
+    CUDA_VISIBLE_DEVICES=$GPU_ID \
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+    python3 tools/clrbezier/sweep_conf_eval.py \
+    "$CONFIG" \
+    "$CHECKPOINT" \
+    --range 0.80 0.94 \
+    --step 0.02 \
+    --out "$WORK_DIR/threshold_sweep.txt" \
+    --work-dir $WORK_DIR \
+    > "$LOG" 2>&1 < /dev/null &
+TEST_PID=$!
+echo $Testing PID: $TEST_PID"
+disown -h $TEST_PID"
+tail -f "$LOG"

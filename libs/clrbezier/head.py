@@ -16,6 +16,8 @@ returns the official per-stage prediction dicts
 (``cls_logits``, ``anchor_params``, ``lengths``, ``xs``), so NMS, lane decoding,
 coordinate restoration, and result packing are the unmodified official code.
 """
+import contextlib
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -352,6 +354,15 @@ class CLRBezierHead(_OfficialHead):
         self.aux_noise_t = int(aux_cfg.get("noise_t", 50))
         self.aux_random_t = bool(aux_cfg.get("random_t", True))
         self.aux_apply_brr = bool(aux_cfg.get("apply_brr_loss", True))
+        # BatchNorm running statistics. The aux pass is a separate forward call,
+        # so it normalizes with its own batch statistics either way; the switch
+        # only decides whether it also updates the running mean/var that
+        # evaluation uses. "shared" (old behaviour): main and aux both update
+        # them, so eval normalizes with a ~47/53 main/aux blend. "main": the aux
+        # pass leaves them untouched, so eval uses main-branch statistics only.
+        self.aux_bn_stats = str(aux_cfg.get("bn_stats", "shared"))
+        if self.aux_bn_stats not in ("shared", "main"):
+            raise ValueError(f"Unknown aux_cfg bn_stats {self.aux_bn_stats!r}")
         self.perturbation = StructuredPriorPerturbation(eps=self.eps, **perturb_cfg)
 
         # ---- reference re-projection -----------------------------------------
@@ -791,6 +802,23 @@ class CLRBezierHead(_OfficialHead):
         """Global context tokens from the coarsest FPN level ([B, H*W, C])."""
         return None if self.gsrc is None else self.gsrc.tokens(feats[0])
 
+    @contextlib.contextmanager
+    def _frozen_bn_stats(self, enabled):
+        """Run a training-mode pass that normalizes with batch statistics but
+        leaves every BatchNorm running mean/var (and batch counter) untouched."""
+        layers = [m for m in self.modules()
+                  if isinstance(m, nn.modules.batchnorm._BatchNorm) and m.track_running_stats]
+        if not enabled or not layers:
+            yield
+            return
+        for m in layers:
+            m.track_running_stats = False
+        try:
+            yield
+        finally:
+            for m in layers:
+                m.track_running_stats = True
+
     def forward_train(self, feats):
         batch_size = feats[-1].shape[0]
         clean_cp = self.prior_bank(batch_size)
@@ -816,8 +844,9 @@ class CLRBezierHead(_OfficialHead):
             aux_feats = [f.repeat_interleave(m, dim=0) for f in feats]
             # tokens are global: computed once, shared by every perturbed group
             aux_tokens = None if tokens is None else tokens.repeat_interleave(m, dim=0)
-            aux_preds, aux_states, aux_extra = self._refine(aux_feats, aux_cp, aux_tokens,
-                                                            num_groups=m, branch="aux")
+            with self._frozen_bn_stats(self.aux_bn_stats == "main"):
+                aux_preds, aux_states, aux_extra = self._refine(aux_feats, aux_cp, aux_tokens,
+                                                                num_groups=m, branch="aux")
             if aux_extra["input_xs"] is not None:
                 out["aux_input_xs"] = [x.view(batch_size, m * k, -1) for x in aux_extra["input_xs"]]
             out["aux_preds"] = [p.view(batch_size, m * k, -1) for p in aux_preds]
