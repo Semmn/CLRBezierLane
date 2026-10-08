@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 from mmengine.config import Config
 from mmengine.registry import init_default_scope
+from mmengine.utils import import_modules_from_strings
 from mmdet.registry import DATASETS
 from tqdm import tqdm
 
@@ -50,6 +51,12 @@ def main():
     args = parser.parse_args()
 
     cfg = Config.fromfile(args.config)
+    # The dataset-only configs (dataset_curvelanes_clrernet.py) carry no
+    # custom_imports, so register the lane datasets here; honour the config's
+    # custom_imports too when a full model config is passed.
+    if cfg.get("custom_imports"):
+        import_modules_from_strings(**cfg.custom_imports)
+    import libs.datasets  # noqa: F401  (registers CurvelanesDataset)
     init_default_scope(cfg.get("default_scope", "mmdet"))
     ds_cfg = cfg.train_dataloader.dataset.copy()
     ds_cfg["data_list"] = str(Path(ds_cfg["data_root"]) / "train.txt")
