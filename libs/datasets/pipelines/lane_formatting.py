@@ -20,6 +20,7 @@ class PackCLRNetInputs(BaseTransform):
         num_points=72,
         img_w=800,
         img_h=320,
+        lane_interp="spline",
     ):
         #self.keys = keys
         self.meta_keys = meta_keys
@@ -29,6 +30,10 @@ class PackCLRNetInputs(BaseTransform):
         self.strip_size = img_h / self.n_strips
         self.offsets_ys = np.arange(img_h, -1, -self.strip_size)
         self.img_w = img_w
+        # "spline" (official) | "linear" | "pchip"; see sample_lane_rows
+        if lane_interp not in ("spline", "linear", "pchip"):
+            raise ValueError(f"Unknown lane_interp {lane_interp!r}")
+        self.lane_interp = lane_interp
 
     def convert_targets(self, results):
         old_lanes = results["gt_points"]
@@ -47,7 +52,8 @@ class PackCLRNetInputs(BaseTransform):
                 # The official hstack((xs_outside_image, xs_inside_image)) moved every
                 # outside row to the front, which shifts a lane that leaves the image
                 # sideways (above its first visible row) up by that many rows.
-                all_xs = sample_lane_rows(lane, self.offsets_ys, self.img_w)
+                all_xs = sample_lane_rows(lane, self.offsets_ys, self.img_w,
+                                          interp=self.lane_interp)
             except AssertionError:
                 continue
             inside_rows = np.nonzero((all_xs >= 0) & (all_xs < self.img_w))[0]

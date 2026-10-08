@@ -213,6 +213,16 @@ class CLRBezierHead(_OfficialHead):
             raise ValueError("brr_cfg.length_mode must be 'residual' or 'fresh'")
         self.support_min_span = float(brr_cfg.get("min_span", 0.1))
         self.frame_grad = bool(brr_cfg.get("frame_grad", not is_support))
+        #   continuation_grad : "full" (default) or "endpoint". Rows outside the
+        #                    frame are drawn by a linear continuation; with
+        #                    "endpoint" its slope is detached, so far-away rows
+        #                    (a short frame against a long GT) no longer push
+        #                    the control points with weights that grow with the
+        #                    distance. Values are unchanged; anchored/support only.
+        self.continuation_grad = str(brr_cfg.get("continuation_grad", "full"))
+        if self.continuation_grad not in ("full", "endpoint"):
+            raise ValueError("brr_cfg.continuation_grad must be 'full' or 'endpoint'")
+        self.slope_grad = self.continuation_grad == "full"
         # The framed update path (update_framed_state) is used for "support",
         # and for "anchored" only when one of its options is switched on, so
         # existing anchored configs keep their exact behaviour.
@@ -220,8 +230,10 @@ class CLRBezierHead(_OfficialHead):
             self.cp_frame == "anchored"
             and (self.cp_transport or self.length_mode != "fresh" or not self.frame_grad))
         if self.cp_frame == "global" and any(
-                k in brr_cfg for k in ("cp_transport", "length_mode", "frame_grad", "min_span")):
-            raise ValueError("brr_cfg cp_transport / length_mode / frame_grad / min_span "
+                k in brr_cfg for k in ("cp_transport", "length_mode", "frame_grad", "min_span",
+                                       "continuation_grad")):
+            raise ValueError("brr_cfg cp_transport / length_mode / frame_grad / min_span / "
+                             "continuation_grad "
                              "apply to the anchored and support frames only")
         if self.cp_frame == "anchored" and "min_span" in brr_cfg:
             raise ValueError("brr_cfg.min_span applies to cp_frame='support' only")
@@ -502,6 +514,13 @@ class CLRBezierHead(_OfficialHead):
         self.brr_cp_beta = float(loss_cfg.get("brr_cp_smooth_l1_beta", 1.0))
         self.brr_component_weights = (float(loss_cfg.get("start_y_component_weight", 1.0)),
                                       float(loss_cfg.get("length_component_weight", 1.0)))
+        # The length target is shifted by the rounded start-row error (CLRNet's
+        # adjusted length). A prediction that starts far below the GT's top end
+        # gets a target <= 0, which in the support frame collapses the frame to
+        # min_span. A number (2.0 recommended) clamps the target at that many
+        # rows; None keeps the old target.
+        v = loss_cfg.get("brr_length_target_min", None)
+        self.brr_length_target_min = None if v is None else float(v)
         self.brr_cp_fit_ridge = float(loss_cfg.get("brr_cp_fit_ridge", 1e-2))
         # True: GT control points that would leave [-cp_x_margin, 1 + cp_x_margin]
         # are refitted under that bound (closest representable curve) instead of
@@ -607,7 +626,7 @@ class CLRBezierHead(_OfficialHead):
         one_row = 1.0 / float(self.n_strips)
         geo = dict(prior_ys=self.prior_ys, sample_x_indices=self.sample_x_indices,
                    img_w=self.img_w, img_h=self.img_h, n_strips=self.n_strips,
-                   cp_frame=self.cp_frame)
+                   cp_frame=self.cp_frame, slope_grad=self.slope_grad)
 
         if self.cp_frame == "support":
             cp_x, y_start, length, frame_top = support_state_from_local(
@@ -1096,6 +1115,8 @@ class CLRBezierHead(_OfficialHead):
             p_round = pred_start.detach().round().clamp(0, n)
             t_round = tgt_start.round().clamp(0, n)
             adj_len = tgt_len - (p_round - t_round)
+            if self.brr_length_target_min is not None:
+                adj_len = adj_len.clamp_min(self.brr_length_target_min)
         sup = _smooth_l1(torch.stack([pred_start, pred_len], -1),
                          torch.stack([tgt_start, adj_len], -1), self.brr_support_beta)
         sup = (sup * sup.new_tensor(self.brr_component_weights)).mean(-1)
@@ -1175,7 +1196,7 @@ class CLRBezierHead(_OfficialHead):
         if self.cp_frame == "global":
             x = eval_global_cubic(pred_cp, ys)
         else:
-            x = eval_cubic(pred_cp, ys, bottom, "support", y_top=top)
+            x = eval_cubic(pred_cp, ys, bottom, "support", y_top=top, slope_grad=self.slope_grad)
         row_err = _smooth_l1(x * scale, torch.where(valid, xs_gt, torch.zeros_like(xs_gt)),
                              self.brr_cp_beta)
         row_err = torch.where(valid, row_err, torch.zeros_like(row_err))

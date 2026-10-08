@@ -109,10 +109,15 @@ def bezier_t(query_y, y_start=None, frame="global", eps=1e-3, y_top=None):
     return (y - top) / denom
 
 
-def eval_cubic(cp_x, query_y, y_start=None, frame="global", eps=1e-3, y_top=None):
+def eval_cubic(cp_x, query_y, y_start=None, frame="global", eps=1e-3, y_top=None,
+               slope_grad=True):
     """x(y) in any frame, with a linear continuation outside the frame.
 
     ``y_top`` is needed (and only used) by the support frame.
+    ``slope_grad=False`` keeps the values but stops the gradient through the
+    continuation's slope: a row at distance d (in frame spans) outside the frame
+    then reaches the control points only through the endpoint x, instead of
+    with weights that grow like 3d.
     """
     y = torch.as_tensor(query_y, device=cp_x.device, dtype=cp_x.dtype)
     while y.ndim < cp_x.ndim:
@@ -131,6 +136,8 @@ def eval_cubic(cp_x, query_y, y_start=None, frame="global", eps=1e-3, y_top=None
     slope = 3.0 * (omt.pow(2) * (cp_x[..., 1:2] - cp_x[..., 0:1])
                    + 2.0 * omt * t_in * (cp_x[..., 2:3] - cp_x[..., 1:2])
                    + t_in.pow(2) * (cp_x[..., 3:4] - cp_x[..., 2:3]))
+    if not slope_grad:
+        slope = slope.detach()
     return x + slope * (t - t_in)
 
 
@@ -396,7 +403,8 @@ def update_brr_state(cp_x, y_start, delta, n_strips, margin):
 
 
 def brr_reference(cp_x, y_start, length, prior_ys, sample_x_indices, img_w, img_h,
-                  n_strips, cp_frame="global", frame_top=None, frame_bottom=None):
+                  n_strips, cp_frame="global", frame_top=None, frame_bottom=None,
+                  slope_grad=True):
     """Decode BRR state into a CLRerNet-layout prediction tensor.
 
     Port of V11 ``_brr_reference_from_cp`` with official start_y.
@@ -404,6 +412,7 @@ def brr_reference(cp_x, y_start, length, prior_ys, sample_x_indices, img_w, img_
     ``frame_bottom`` / ``frame_top`` are the frame the control points are
     evaluated in (default: ``y_start`` and, for "support", required top).
     Passing detached copies keeps the curve's gradient out of start/length.
+    ``slope_grad``: see ``eval_cubic``.
 
     Returns:
         reference:        [..., 6 + R] (cls slots zero)
@@ -412,7 +421,7 @@ def brr_reference(cp_x, y_start, length, prior_ys, sample_x_indices, img_w, img_
     n_rows = int(prior_ys.numel())
     ys = prior_ys.to(device=cp_x.device, dtype=cp_x.dtype)
     fb = y_start if frame_bottom is None else frame_bottom
-    x_full = eval_cubic(cp_x, ys, fb, cp_frame, y_top=frame_top)
+    x_full = eval_cubic(cp_x, ys, fb, cp_frame, y_top=frame_top, slope_grad=slope_grad)
     length = torch.as_tensor(length, device=cp_x.device, dtype=cp_x.dtype)
 
     reference = cp_x.new_zeros(cp_x.shape[:-1] + (6 + n_rows,))
@@ -427,8 +436,10 @@ def brr_reference(cp_x, y_start, length, prior_ys, sample_x_indices, img_w, img_
     safe_len = torch.minimum(length.clamp_min(2.0 * one_row), max_len)
     span = (safe_len - one_row).clamp_min(0.0)
     y_top = (y_bottom - span).clamp(0.0, 1.0)
-    start_x = eval_cubic(cp_x, y_bottom.unsqueeze(-1), fb, cp_frame, y_top=frame_top).squeeze(-1)
-    top_x = eval_cubic(cp_x, y_top.unsqueeze(-1), fb, cp_frame, y_top=frame_top).squeeze(-1)
+    start_x = eval_cubic(cp_x, y_bottom.unsqueeze(-1), fb, cp_frame, y_top=frame_top,
+                         slope_grad=slope_grad).squeeze(-1)
+    top_x = eval_cubic(cp_x, y_top.unsqueeze(-1), fb, cp_frame, y_top=frame_top,
+                       slope_grad=slope_grad).squeeze(-1)
     dx_pix = (top_x - start_x) * float(img_w - 1)
     dy_pix = span * float(img_h - 1)
     theta = torch.atan2(dy_pix.clamp_min(1.0e-6), dx_pix) / math.pi

@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.interpolate import InterpolatedUnivariateSpline, splev, splprep
+from scipy.interpolate import InterpolatedUnivariateSpline, PchipInterpolator, splev, splprep
 
 
 class Lane:
@@ -60,7 +60,7 @@ def interp(points, n=5):
     return output
 
 
-def sample_lane_rows(points, sample_ys, img_w):
+def sample_lane_rows(points, sample_ys, img_w, interp="spline"):
     """
     Sample lane x coordinates on the horizontal grids, keeping the row order.
     Adapted from:
@@ -72,6 +72,14 @@ def sample_lane_rows(points, sample_ys, img_w):
           y0 ~ yp-1 must be sorted in descending order (y1 > y0).
         sample_ys (numpy.ndarray): shape (Nr,), bottom -> top.
         img_w (int): image width (unused; kept for the sample_lane signature).
+        interp (str): how x is read between annotated points.
+          "spline" (official): interpolating cubic spline. It passes through
+            every point, so two points close in y with different x make it
+            overshoot, by hundreds of pixels for irregularly spaced points.
+          "linear": the annotated polyline itself (straight segments between
+            the points); never overshoots.
+          "pchip": monotone cubic; smooth, never leaves the range of the two
+            neighbouring points.
 
     Returns:
         numpy.ndarray: x at sample_ys[0], sample_ys[1], ... up to the lane top,
@@ -85,14 +93,22 @@ def sample_lane_rows(points, sample_ys, img_w):
 
     # interpolate points inside domain
     assert len(points) > 1
-    interp = InterpolatedUnivariateSpline(y[::-1], x[::-1], k=min(3, len(points) - 1))
+    if interp == "spline":
+        interp_fn = InterpolatedUnivariateSpline(y[::-1], x[::-1], k=min(3, len(points) - 1))
+    elif interp == "linear":
+        yi, xi = y[::-1], x[::-1]
+        interp_fn = lambda q: np.interp(q, yi, xi)  # noqa: E731
+    elif interp == "pchip":
+        interp_fn = PchipInterpolator(y[::-1], x[::-1])
+    else:
+        raise ValueError(f"Unknown lane interpolation {interp!r}")
     domain_min_y = y.min()
     domain_max_y = y.max()
     mask_inside_domain = (sample_ys >= domain_min_y) & (sample_ys <= domain_max_y)
     sample_ys_inside_domain = sample_ys[mask_inside_domain]
     if len(sample_ys_inside_domain) == 0:
         return np.zeros(0)
-    interp_xs = interp(sample_ys_inside_domain)
+    interp_xs = interp_fn(sample_ys_inside_domain)
 
     # extrapolate lane to the bottom of the image with a straight line using the 2 points closest to the bottom
     two_closest_points = points[:2]
