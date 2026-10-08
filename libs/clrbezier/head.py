@@ -23,6 +23,8 @@ from mmengine.model import BaseModule
 from mmdet.registry import MODELS
 
 from .assigners import build_cost_cache, build_lane_assigner
+from .batched_loss import (GTLayout, batched_assign, batched_cost_cache, batched_keep_mask,
+                           per_image_spearman, per_image_sum)
 from .data_adapters import CLRTargetAdapter
 from .alignment import QualityFocalLoss, ignore_unmatched, quality_targets
 from .cascade import QualityGate, ReferenceReprojector, sampling_xs
@@ -505,6 +507,10 @@ class CLRBezierHead(_OfficialHead):
             raise ValueError("loss_cfg.brr_cp_loss_space must be 'pred', 'global' or 'rows', "
                              f"got {self.brr_cp_loss_space!r}")
         self.brr_loss_stages = [int(s) for s in loss_cfg.get("brr_loss_stages", [0, 1, 2])]
+        # Compute the cost cache, assignment and losses for the whole batch at
+        # once (batched_loss.py) instead of looping over images. Same values;
+        # False keeps the per-image loop.
+        self.batched_loss = bool(loss_cfg.get("batched_loss", True))
 
         adapter_cfg = dict(target_adapter or {})
         self.target_adapter = CLRTargetAdapter(
@@ -868,17 +874,20 @@ class CLRBezierHead(_OfficialHead):
 
     def loss_by_outputs(self, outs, lanes, seg_gt=None):
         valid_targets = [t[t[:, 1] == 1] for t in lanes]
+        layout = GTLayout(valid_targets, outs["main_preds"][0].device)
         fit_frame = "global" if self.brr_cp_loss_space == "global" else self.cp_frame
-        gt_cps = [fit_global_cubic_to_clr_rows(t[:, 6:], self.prior_ys, self.img_w,
+        # Every lane is fitted independently, so one call covers the batch.
+        gt_flat = fit_global_cubic_to_clr_rows(layout.flat[:, 6:], self.prior_ys, self.img_w,
                                                self.brr_cp_fit_ridge, self.cp_x_margin,
                                                cp_frame=fit_frame, n_strips=self.n_strips,
                                                min_span=self.support_min_span,
                                                return_frame=True, box=self.brr_cp_fit_box)
-                  for t in valid_targets]
+        gt_cps = list(zip(*(torch.split(x, layout.counts) for x in gt_flat)))
 
         main = self._branch_losses(outs["main_preds"], outs["main_states"], valid_targets, gt_cps,
                                    self._main_pairs, list(range(self.refine_layers)), apply_brr=True,
-                                   gate=self.main_gate, input_xs=outs.get("main_input_xs"))
+                                   gate=self.main_gate, input_xs=outs.get("main_input_xs"),
+                                   layout=layout, gt_flat=gt_flat)
         cls, iou, sup, cp = main["cls"], main["iou"], main["support"], main["cp"]
         diag = {"main_iou": main["iou"].detach(), "main_num_pos": main["num_pos"],
                 "main_conf_iou_l1": main["conf_iou_l1"],
@@ -922,7 +931,8 @@ class CLRBezierHead(_OfficialHead):
             aux = self._branch_losses(outs["aux_preds"], outs["aux_states"], valid_targets, gt_cps,
                                       self._aux_pairs, self.aux_stages, apply_brr=self.aux_apply_brr,
                                       cls_target_mode=self.aux_cls_target_mode,
-                                      gate=self.aux_gate, input_xs=outs.get("aux_input_xs"))
+                                      gate=self.aux_gate, input_xs=outs.get("aux_input_xs"),
+                                      layout=layout, gt_flat=gt_flat)
             cls = cls + self.aux_cls_loss_weight * aux["cls"]
             iou = iou + self.aux_reg_loss_weight * aux["iou"]
             sup = sup + self.aux_reg_loss_weight * aux["support"]
@@ -1042,6 +1052,12 @@ class CLRBezierHead(_OfficialHead):
         return (raw * w).sum(-1) / w.sum(-1).clamp_min(1.0)
 
     def _brr_losses(self, state, target, gt_cp, gt_cp_ok, gt_frame=None):
+        """(support loss, CP loss) averaged over the given lanes."""
+        sup, cp, ok = self._brr_lane_terms(state, target, gt_cp, gt_cp_ok, gt_frame)
+        return sup.mean(), (cp * ok).sum() / ok.sum().clamp_min(1.0)
+
+    def _brr_lane_terms(self, state, target, gt_cp, gt_cp_ok, gt_frame=None):
+        """Per-lane BRR terms: support [P], CP [P] and the CP term's weight [P]."""
         n = float(self.n_strips)
         pred_start = (1.0 - state[:, 0]) * n
         pred_len = state[:, 1] * n
@@ -1053,11 +1069,12 @@ class CLRBezierHead(_OfficialHead):
             adj_len = tgt_len - (p_round - t_round)
         sup = _smooth_l1(torch.stack([pred_start, pred_len], -1),
                          torch.stack([tgt_start, adj_len], -1), self.brr_support_beta)
-        sup = (sup * sup.new_tensor(self.brr_component_weights)).mean(-1).mean()
+        sup = (sup * sup.new_tensor(self.brr_component_weights)).mean(-1)
 
         scale = float(max(1, self.img_w - 1))
         if self.brr_cp_loss_space != "pred":
-            return sup, self._cp_loss_absolute(state, target, gt_cp, gt_cp_ok)
+            cp_lane, ok = self._cp_lane_absolute(state, target, gt_cp, gt_cp_ok)
+            return sup, cp_lane, ok
         if self.framed_update:
             # The GT control points were fitted on the GT's own frame
             # (gt_frame = [top, start]); the state's control points live on the
@@ -1085,9 +1102,7 @@ class CLRBezierHead(_OfficialHead):
                 gt_cp = reparam_cp_to_frame(gt_cp, ratio).clamp(
                     -self.cp_x_margin, 1.0 + self.cp_x_margin)
         cp_elem = _smooth_l1(state[:, 2:6] * scale, gt_cp * scale, self.brr_cp_beta).mean(-1)
-        ok = gt_cp_ok.float()
-        cp = (cp_elem * ok).sum() / ok.sum().clamp_min(1.0)
-        return sup, cp
+        return sup, cp_elem, gt_cp_ok.float()
 
     def _state_frame(self, state):
         """(top, bottom) of the image-y frame the state's raw control points live in.
@@ -1105,6 +1120,11 @@ class CLRBezierHead(_OfficialHead):
 
     def _cp_loss_absolute(self, state, target, gt_cp, gt_cp_ok):
         """Control-point loss in a prediction-independent space (brr_cp_loss_space)."""
+        cp, ok = self._cp_lane_absolute(state, target, gt_cp, gt_cp_ok)
+        return (cp * ok).sum() / ok.sum().clamp_min(1.0)
+
+    def _cp_lane_absolute(self, state, target, gt_cp, gt_cp_ok):
+        """Per-lane CP term and its weight for brr_cp_loss_space 'global' / 'rows'."""
         scale = float(max(1, self.img_w - 1))
         pred_cp = state[:, 2:6]
         top, bottom = self._state_frame(state)
@@ -1116,8 +1136,7 @@ class CLRBezierHead(_OfficialHead):
                 pred_cp = transport_cp(pred_cp, top, bottom,
                                        torch.zeros_like(top), torch.ones_like(bottom))
             cp_elem = _smooth_l1(pred_cp * scale, gt_cp * scale, self.brr_cp_beta).mean(-1)
-            ok = gt_cp_ok.float()
-            return (cp_elem * ok).sum() / ok.sum().clamp_min(1.0)
+            return cp_elem, gt_cp_ok.float()
 
         # "rows": the predicted Bezier curve (without the per-row residuals) against
         # the GT x on every row LaneIoU counts, in pixels.
@@ -1133,11 +1152,144 @@ class CLRBezierHead(_OfficialHead):
         row_err = torch.where(valid, row_err, torch.zeros_like(row_err))
         count = valid.sum(-1)
         per_lane = row_err.sum(-1) / count.clamp_min(1)
-        ok = (count >= 2).float()
-        return (per_lane * ok).sum() / ok.sum().clamp_min(1.0)
+        return per_lane, (count >= 2).float()
 
     def _branch_losses(self, preds_stages, states_stages, valid_targets, gt_cps, pairs_fn,
-                       stages, apply_brr, cls_target_mode=None, gate=None, input_xs=None):
+                       stages, apply_brr, cls_target_mode=None, gate=None, input_xs=None,
+                       layout=None, gt_flat=None):
+        if self.batched_loss and layout is not None:
+            return self._branch_losses_batched(preds_stages, states_stages, layout, gt_flat,
+                                               pairs_fn, stages, apply_brr, cls_target_mode,
+                                               gate, input_xs)
+        return self._branch_losses_loop(preds_stages, states_stages, valid_targets, gt_cps,
+                                        pairs_fn, stages, apply_brr, cls_target_mode, gate,
+                                        input_xs)
+
+    def _branch_losses_batched(self, preds_stages, states_stages, layout, gt_flat, pairs_fn,
+                               stages, apply_brr, cls_target_mode=None, gate=None, input_xs=None):
+        """_branch_losses_loop for the whole batch at once.
+
+        Per-image means are kept: each image's matched pairs are averaged, then
+        the images are summed, exactly as the loop does.
+        """
+        device = preds_stages[0].device
+        batch_size = preds_stages[0].shape[0]
+        zero = preds_stages[0].new_zeros(())
+        active = [s for s in stages if len(pairs_fn(s)) > 0]
+        normalizer = float(max(1, batch_size * len(active)))
+        gt_counts = torch.tensor([float(c) for c in layout.counts], device=device)
+        scale = float(self.img_w - 1) / float(self.img_w)
+        gt_cp_all, gt_ok_all, gt_frame_all = gt_flat
+
+        cls_sum, iou_sum, sup_sum, cp_sum = zero, zero, zero, zero
+        num_pos = 0
+        align_err, align_cnt = zero, 0
+        rank_sum, rank_cnt = zero, zero
+        pos_stage = [0] * self.refine_layers
+        step = self._step_cache
+        for stage in active:
+            pairs = pairs_fn(stage)
+            preds = preds_stages[stage]
+            states = states_stages[stage]
+            required = set()
+            for assigner, _ in pairs:
+                required |= set(assigner.required_cache_keys)
+            mode = cls_target_mode or self.cls_target_mode
+            use_quality = mode != "hard"
+            use_ignore = self.ignore_iou_thr is not None
+            gate_thr = gate.threshold(stage, step, self.training) if gate is not None else 0.0
+            if use_quality or use_ignore or gate_thr > 0.0:
+                required.add("lane_iou_dynamic")
+            cls_targets = torch.zeros((len(pairs), batch_size, preds.shape[1]),
+                                      dtype=torch.long, device=device)
+            quality = torch.zeros(cls_targets.shape, dtype=preds.dtype, device=device) \
+                if use_quality else None
+            ignore = torch.zeros(cls_targets.shape, dtype=torch.bool, device=device) \
+                if use_ignore else None
+            use_brr = apply_brr and stage in self.brr_loss_stages
+            cache = batched_cost_cache(preds.detach(), layout, self.img_w, self.img_h,
+                                       self.lane_width, self.lane_width_cost, required,
+                                       iou_shape=(self.iou_w, self.iou_h),
+                                       iou_kind=self.cost_iou_type) if layout.num else {}
+            for a, (assigner, weight) in enumerate(pairs):
+                if layout.num == 0:
+                    continue
+                b, n, g = batched_assign(assigner, cache, layout)
+                rb, rn, rg = b, n, g
+                if gate_thr > 0.0 and b.numel() > 0:
+                    if gate.gate_on == "output":
+                        gate_iou = cache["lane_iou_dynamic"][b, n, g]
+                    else:
+                        with torch.no_grad():
+                            gate_iou = 1.0 - self.gate_iou_fn(
+                                input_xs[stage][b, n] * scale,
+                                layout.flat[layout.flat_index(b, g), 6:] / float(self.img_w))
+                    keep = batched_keep_mask(gate, gate_iou, layout.flat_index(b, g),
+                                             layout.num, gate_thr)
+                    b, n, g = b[keep], n[keep], g[keep]
+                    if gate.mode == "cls_and_reg":
+                        rb, rn, rg = b, n, g
+                if use_ignore:
+                    thr = self.ignore_iou_thr
+                    if thr is not None and float(thr) < 1.0:
+                        best = cache["lane_iou_dynamic"].masked_fill(
+                            ~layout.mask[:, None, :], float("-inf")).max(dim=2).values
+                        mask = best > float(thr)
+                        mask[b, n] = False
+                        ignore[a] = mask
+                count = int(b.numel())
+                pos_stage[stage] += count
+                num_pos += count
+                if count > 0:
+                    cls_targets[a, b, n] = 1
+                    j = layout.flat_index(b, g)
+                if count > 0 and "lane_iou_dynamic" in cache:
+                    with torch.no_grad():
+                        conf = F.softmax(preds[b, n, :2].detach(), dim=-1)[:, 1]
+                        pair_q = cache["lane_iou_dynamic"][b, n, g]
+                        align_err = align_err + (conf - pair_q).abs().sum()
+                        align_cnt += count
+                        r_sum, r_cnt = per_image_spearman(conf, pair_q, b, batch_size)
+                        rank_sum = rank_sum + r_sum
+                        rank_cnt = rank_cnt + r_cnt
+                if count > 0 and use_quality:
+                    pair_iou = cache["lane_iou_dynamic"][b, n, g]
+                    pair_scores = None
+                    if mode == "task_aligned":
+                        pair_scores = F.softmax(preds[b, n, :2].detach(), dim=-1)[:, 1]
+                    quality[a, b, n] = quality_targets(
+                        pair_iou, pair_scores, mode, self.task_align_alpha,
+                        self.task_align_beta, j, layout.num)
+                if rb.numel() == 0:
+                    continue
+                rj = layout.flat_index(rb, rg)
+                target = layout.flat[rj]
+                per_lane = self.iou_loss(preds[rb, rn, 6:] * scale,
+                                         target[:, 6:] / float(self.img_w))
+                lanes_per_img = per_image_sum(torch.ones_like(per_lane), rb, batch_size)
+                denom = lanes_per_img.clamp_min(1.0)
+                iou_sum = iou_sum + weight * (per_image_sum(per_lane, rb, batch_size) / denom).sum()
+                if use_brr:
+                    sup, cp, ok = self._brr_lane_terms(states[rb, rn], target, gt_cp_all[rj],
+                                                       gt_ok_all[rj], gt_frame_all[rj])
+                    sup_img = per_image_sum(sup, rb, batch_size) / denom
+                    cp_img = (per_image_sum(cp * ok, rb, batch_size)
+                              / per_image_sum(ok, rb, batch_size).clamp_min(1.0))
+                    sup_sum = sup_sum + weight * sup_img.sum()
+                    cp_sum = cp_sum + weight * cp_img.sum()
+            weights = preds.new_tensor([w for _, w in pairs]).view(-1, 1)
+            cls_sum = cls_sum + (self._cls_loss(preds[..., :2], cls_targets, gt_counts,
+                                                quality, ignore) * weights).sum()
+
+        return dict(cls=cls_sum / normalizer, iou=iou_sum / normalizer,
+                    support=sup_sum / normalizer, cp=cp_sum / normalizer,
+                    num_pos=torch.tensor(float(num_pos), device=device),
+                    conf_iou_l1=(align_err / max(1, align_cnt)).detach(),
+                    conf_iou_rank=(rank_sum / rank_cnt.clamp_min(1.0)).detach(),
+                    pos_stage=[torch.tensor(float(c), device=device) for c in pos_stage])
+
+    def _branch_losses_loop(self, preds_stages, states_stages, valid_targets, gt_cps, pairs_fn,
+                            stages, apply_brr, cls_target_mode=None, gate=None, input_xs=None):
         device = preds_stages[0].device
         batch_size = preds_stages[0].shape[0]
         zero = preds_stages[0].new_zeros(())

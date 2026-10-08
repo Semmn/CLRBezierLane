@@ -63,3 +63,6 @@ cache
 # patch history
 patch
 .patch
+
+# .dist_test temporary
+.dist_test
