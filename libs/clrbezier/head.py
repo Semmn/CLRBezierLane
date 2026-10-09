@@ -237,6 +237,28 @@ class CLRBezierHead(_OfficialHead):
                              "apply to the anchored and support frames only")
         if self.cp_frame == "anchored" and "min_span" in brr_cfg:
             raise ValueError("brr_cfg.min_span applies to cp_frame='support' only")
+        #   stage_jitter   : None (default, off) or a dict. Training only: the
+        #                    detached state a stage hands to the next one is
+        #                    randomly shifted, tilted about its start point,
+        #                    bent, and its start_y moved, before the next stage
+        #                    samples features along it. Each later stage then
+        #                    learns to refine from a spread of inputs instead
+        #                    of exactly its predecessor's output. Length is
+        #                    predicted fresh at every stage and is not touched.
+        #                    Keys (defaults):
+        #                      branches    ["aux"]  "main" and/or "aux"
+        #                      after_stages [0, 1]  handoffs to jitter (the
+        #                                           stage that produced it)
+        #                      translate 0.01, slope 0.02, curve 0.01,
+        #                      y_shift 0.02: half-widths of uniform draws, in
+        #                      normalized image units (x: / (img_w - 1),
+        #                      y: / img_h). slope is the x change per unit of
+        #                      image height; curve is the bow at the middle of
+        #                      the control-point frame.
+        #                      prob 1.0: fraction of queries jittered.
+        #                    stage_jitter=True or dict() switches it on with
+        #                    these defaults.
+        self.stage_jitter = self._parse_stage_jitter(brr_cfg.get("stage_jitter"))
 
         # ---- network ----------------------------------------------------------
         rg_cfg = dict(roi_gather_cfg or {})
@@ -277,6 +299,11 @@ class CLRBezierHead(_OfficialHead):
             raise ValueError("look_forward_twice must be False, True, 'dino' or 'chain'")
         self.lft_mode = look_forward_twice or None
         self.look_forward_twice = self.lft_mode is not None
+        if self.stage_jitter is not None and self.lft_mode is not None:
+            # LFT routes the next stage's loss through the un-jittered update;
+            # combining the two would make that gradient refer to a state the
+            # next stage never sampled.
+            raise ValueError("brr_cfg.stage_jitter cannot be combined with look_forward_twice")
         # Control-point preconditioning (off unless configured).
         self.cp_precond = (ControlPointPreconditioner(n_strips=self.n_strips,
                                                       **dict(cp_precond_cfg))
@@ -808,8 +835,91 @@ class CLRBezierHead(_OfficialHead):
                 else:
                     cp_x, y_start, on_map = next_x.detach(), new_y.detach(), next_map.detach()
                     length, frame_top = new_len.detach(), new_top.detach()
+                if self._jitter_active(branch, stage):
+                    cp_x, y_start = self._jitter_state(cp_x, y_start)
+                    _, on_map = brr_reference(cp_x, y_start, length, **geo, frame_top=frame_top)
         return preds, states, dict(input_xs=input_xs or None, reproj=reproj_stats,
                                    precond=precond_stats, moe=moe_stats)
+
+    _JITTER_DEFAULTS = dict(branches=("aux",), after_stages=(0, 1), translate=0.01,
+                            slope=0.02, curve=0.01, y_shift=0.02, prob=1.0)
+
+    def _parse_stage_jitter(self, cfg):
+        """Validated brr_cfg.stage_jitter, or None when it is off.
+
+        None / False: off. True or a dict (an empty dict included): on, with
+        the defaults for any key not given.
+        """
+        if cfg is None or cfg is False:
+            return None
+        cfg = {} if cfg is True else dict(cfg)
+        unknown = set(cfg) - set(self._JITTER_DEFAULTS)
+        if unknown:
+            raise ValueError(f"brr_cfg.stage_jitter: unknown keys {sorted(unknown)}")
+        if self.framed_update:
+            # The framed state carries its own frame (top/bottom) and transports
+            # the curve when start moves; a start jitter there is not a plain
+            # shift of y_start.
+            raise ValueError("brr_cfg.stage_jitter supports the global and anchored frames "
+                             "(without the framed-update options) only")
+        out = dict(self._JITTER_DEFAULTS, **cfg)
+        branches = (out["branches"],) if isinstance(out["branches"], str) else out["branches"]
+        out["branches"] = frozenset(str(b) for b in branches)
+        if not out["branches"] or not out["branches"] <= {"main", "aux"}:
+            raise ValueError("brr_cfg.stage_jitter.branches must be 'main' and/or 'aux'")
+        out["after_stages"] = frozenset(int(s) for s in out["after_stages"])
+        if not out["after_stages"] or not all(
+                0 <= s < self.refine_layers - 1 for s in out["after_stages"]):
+            raise ValueError("brr_cfg.stage_jitter.after_stages must name stages "
+                             f"0..{self.refine_layers - 2} (the last stage hands nothing on)")
+        for key in ("translate", "slope", "curve", "y_shift"):
+            out[key] = float(out[key])
+            if out[key] < 0.0:
+                raise ValueError(f"brr_cfg.stage_jitter.{key} must be >= 0")
+        out["prob"] = float(out["prob"])
+        if not 0.0 <= out["prob"] <= 1.0:
+            raise ValueError("brr_cfg.stage_jitter.prob must be in [0, 1]")
+        return out
+
+    def _jitter_active(self, branch, stage):
+        return (self.training and self.stage_jitter is not None
+                and branch in self.stage_jitter["branches"]
+                and stage in self.stage_jitter["after_stages"])
+
+    @torch.no_grad()
+    def _jitter_state(self, cp_x, y_start):
+        """Structured random jitter of a detached BRR state (brr_cfg.stage_jitter).
+
+        cp_x [..., 4] (top -> bottom), y_start [...]. A linear change of x in y
+        is added exactly by adding it at the control points' own y (they are
+        equally spaced in the curve parameter), so translate and slope move the
+        drawn curve by exactly a + b * (y_start - y); curve adds a bow of the
+        drawn size at the middle of the control-point frame.
+        """
+        cfg = self.stage_jitter
+        shape = y_start.shape
+
+        def draw(half_width):
+            return (torch.rand(shape, device=cp_x.device, dtype=cp_x.dtype) * 2.0 - 1.0) * half_width
+
+        one_row = 1.0 / float(self.n_strips)
+        frac = cp_x.new_tensor([0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0])
+        bottom = torch.ones_like(y_start) if self.cp_frame == "global" else y_start
+        cp_y = bottom.unsqueeze(-1) * frac
+        start = y_start.clamp(one_row, 1.0).unsqueeze(-1)
+        # Bernstein weights of P1 + P2 sum to 3t(1 - t) = 3/4 at t = 1/2.
+        bow = cp_x.new_tensor([0.0, 4.0 / 3.0, 4.0 / 3.0, 0.0])
+        dx = (draw(cfg["translate"]).unsqueeze(-1)
+              + draw(cfg["slope"]).unsqueeze(-1) * (start - cp_y)
+              + draw(cfg["curve"]).unsqueeze(-1) * bow)
+        dy = draw(cfg["y_shift"])
+        if cfg["prob"] < 1.0:
+            keep = (torch.rand(shape, device=cp_x.device) < cfg["prob"]).to(cp_x.dtype)
+            dx = dx * keep.unsqueeze(-1)
+            dy = dy * keep
+        new_x = (cp_x + dx).clamp(-self.cp_x_margin, 1.0 + self.cp_x_margin)
+        new_y = (y_start + dy).clamp(one_row, 1.0)
+        return new_x, new_y
 
     def _precond_length(self, length, reg):
         """The length the preconditioner sees: the stage's predicted length."""
