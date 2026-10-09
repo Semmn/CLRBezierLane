@@ -856,12 +856,11 @@ class CLRBezierHead(_OfficialHead):
         unknown = set(cfg) - set(self._JITTER_DEFAULTS)
         if unknown:
             raise ValueError(f"brr_cfg.stage_jitter: unknown keys {sorted(unknown)}")
-        if self.framed_update:
-            # The framed state carries its own frame (top/bottom) and transports
-            # the curve when start moves; a start jitter there is not a plain
-            # shift of y_start.
-            raise ValueError("brr_cfg.stage_jitter supports the global and anchored frames "
-                             "(without the framed-update options) only")
+        if self.cp_frame == "support":
+            # The support frame's top depends on start and length; the jitter
+            # below assumes a frame from the image top (anchored) or the full
+            # image (global).
+            raise ValueError("brr_cfg.stage_jitter supports the global and anchored frames only")
         out = dict(self._JITTER_DEFAULTS, **cfg)
         branches = (out["branches"],) if isinstance(out["branches"], str) else out["branches"]
         out["branches"] = frozenset(str(b) for b in branches)
@@ -895,6 +894,10 @@ class CLRBezierHead(_OfficialHead):
         equally spaced in the curve parameter), so translate and slope move the
         drawn curve by exactly a + b * (y_start - y); curve adds a bow of the
         drawn size at the middle of the control-point frame.
+
+        Anchored frame with cp_transport=True: the y_shift moves only the
+        lane's start, and the curve is transported into the new frame
+        [0, y_start] as the stage updates do, instead of being stretched.
         """
         cfg = self.stage_jitter
         shape = y_start.shape
@@ -917,8 +920,12 @@ class CLRBezierHead(_OfficialHead):
             keep = (torch.rand(shape, device=cp_x.device) < cfg["prob"]).to(cp_x.dtype)
             dx = dx * keep.unsqueeze(-1)
             dy = dy * keep
-        new_x = (cp_x + dx).clamp(-self.cp_x_margin, 1.0 + self.cp_x_margin)
+        new_x = cp_x + dx
         new_y = (y_start + dy).clamp(one_row, 1.0)
+        if self.framed_update and self.cp_transport and cfg["y_shift"] > 0.0:
+            top = torch.zeros_like(y_start)
+            new_x = transport_cp(new_x, top, y_start, top, new_y).to(cp_x.dtype)
+        new_x = new_x.clamp(-self.cp_x_margin, 1.0 + self.cp_x_margin)
         return new_x, new_y
 
     def _precond_length(self, length, reg):

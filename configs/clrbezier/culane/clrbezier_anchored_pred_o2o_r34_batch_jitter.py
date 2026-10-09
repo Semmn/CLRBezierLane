@@ -96,7 +96,17 @@ model = dict(
         lateral_cfg=None,
         look_forward_twice=False,
         prior_cfg=dict(delta_scale=0.2, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),
-        brr_cfg=dict(cp_x_margin=0.1, cp_transport=True, length_mode="fresh", frame_grad=False), # cp_transport, length_mode, min_span, frame_grad apply to cp_frame="anchored"/"support" only (rejected for "global").
+        brr_cfg=dict(cp_x_margin=0.1, cp_transport=True, length_mode="fresh", frame_grad=False,
+            stage_jitter=dict(
+                branches=["aux"],      # Hungarian (main) branch stays clean
+                after_stages=[0, 1],   # stage 0 -> 1 and 1 -> 2 handoffs ([0] keeps 1 -> 2 clean)
+                translate=0.01,        # ± fraction of width   (~8 px)
+                slope=0.02,            # ± x per image height  (~16 px at the far end)
+                curve=0.01,            # ± bow at frame middle (~8 px)
+                y_shift=0.02,          # ± start_y             (~1.4 rows)
+                prob=1.0,
+            )
+        ), # cp_transport, length_mode, min_span, frame_grad apply to cp_frame="anchored"/"support" only (rejected for "global").
         main_assigner=dict(type="HungarianLaneAssigner", cls_weight=1.0, point_weight=0.0, iou_weight=3.0),
         # per-stage override; stages not listed use main_assigner
         main_stage_assigners=None,
