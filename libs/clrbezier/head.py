@@ -1241,6 +1241,17 @@ class CLRBezierHead(_OfficialHead):
             for m in layers:
                 m.track_running_stats = True
 
+    @contextlib.contextmanager
+    def _as_eval(self):
+        """Run a pass of the head in eval mode, then restore every module's mode."""
+        modes = [(m, m.training) for m in self.modules()]
+        self.eval()
+        try:
+            yield
+        finally:
+            for m, mode in modes:
+                m.training = mode
+
     def forward_train(self, feats):
         batch_size = feats[-1].shape[0]
         clean_cp = self.prior_bank(batch_size)
@@ -1318,8 +1329,10 @@ class CLRBezierHead(_OfficialHead):
 
         Without a rollout: anchor + sigma(t) * eps, t uniform in 0..T per query.
         With one: the first k sampler steps run without gradient from anchor +
-        sigma(T) * eps, and the returned input is their DDIM output (it keeps
-        the live path from the anchor, so the prior bank still gets gradient).
+        sigma(T) * eps, exactly as at test time (eval mode, so neither the stage
+        jitter nor dropout touches them), and the returned input is their DDIM
+        output (it keeps the live path from the anchor, so the prior bank still
+        gets gradient).
         """
         dif = self.diffusion
         one_row = 1.0 / float(self.n_strips)
@@ -1340,7 +1353,8 @@ class CLRBezierHead(_OfficialHead):
         t = torch.full(y0.shape, steps[0], dtype=torch.long, device=y0.device)
         x, y = dif.perturb(cp_x, y0, t, eps_x, eps_y, **kw)
         for i in range(k):
-            with torch.no_grad(), self._frozen_bn_stats(True):
+            # run as at test time: no stage jitter, no dropout, BN running stats
+            with torch.no_grad(), self._as_eval():
                 _, _, extra = self._refine(feats, clean_cp, tokens,
                                            init_state=(x.detach(), y.detach()), diff_t=t)
             x0, y0_hat = (v.detach() for v in extra["final_state"])

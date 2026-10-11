@@ -34,7 +34,9 @@ seed. infer_steps=1 costs what the base head costs.
 Training rollouts (``rollout_prob``): with that probability an iteration runs
 the first k sampler steps without gradient (k uniform in 1..S-1) and trains the
 next step on their DDIM output, so the later steps see at training time the
-inputs they get at test time. 0 = DiffusionDrive (noisy anchors only).
+inputs they get at test time. Those steps run in eval mode, as at test time:
+the stage jitter (brr_cfg.stage_jitter) and dropout act only on the trained
+pass. 0 = DiffusionDrive (noisy anchors only).
 """
 from __future__ import annotations
 

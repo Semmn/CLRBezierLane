@@ -220,7 +220,7 @@ model = dict(
 )
 
 # Number of epochs
-total_epochs = 15
+total_epochs = 25
 checkpoint_config = dict(interval=total_epochs)
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=total_epochs, val_interval=3)
 val_cfg = dict(type='ValLoop')
@@ -229,7 +229,7 @@ test_cfg = dict(type='TestLoop')
 # Batch size (Number of batch size per GPU)
 train_dataloader=dict(batch_size=32)
 randomness = dict(seed=0, deterministic=True)
-optim_wrapper = dict(type='OptimWrapper', optimizer=dict(type="AdamW", lr=1e-4))
+optim_wrapper = dict(type='OptimWrapper', optimizer=dict(type="AdamW", lr=6e-4))
 param_scheduler = [
     dict(type='CosineAnnealingLR', eta_min=0, begin=0, T_max=total_epochs, end=total_epochs, by_epoch=True, convert_to_iter_based=True),
 ]

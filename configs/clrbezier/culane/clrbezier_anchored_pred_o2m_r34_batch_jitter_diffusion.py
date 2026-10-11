@@ -8,7 +8,9 @@
 # t = trunc_t its std is sigma_x_px in x and sigma_y in start y. The cascade
 # predicts the clean lane and its score; a zero-initialised timestep embedding
 # scales and shifts every stage's RoI feature. Assignment is unchanged: SimOTA on
-# each stage's predictions.
+# each stage's predictions. The base's main-branch stage jitter (after stages 0
+# and 1) stays on: the noise moves the stage-0 input, the jitter the later
+# handoffs. Rollout passes run as at test time, without jitter or dropout.
 # Inference: DDIM over the whole cascade at infer_steps timesteps from the clean
 # anchors (t = 50 -> 25 with 2 steps). infer_steps=1 costs what the base costs.
 _base_ = ["./clrbezier_anchored_pred_o2m_r34_batch_jitter.py"]
