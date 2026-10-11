@@ -45,6 +45,7 @@ from .curve_deformable_roi_gather import (CurveAlignedDeformableROIGather,
 from .gliou import GeneralizedLaneIoULoss, pairwise_generalized_lane_iou
 from .modules import ROIGather, SegDecoder, linear_relu, pool_prior_features
 from .curv_moe import CurvatureMoEClassifier
+from .slot_experts import LaneSlotExperts, base_name
 from .moe import MoEGate
 from .priors import BezierPriorBank, StructuredPriorPerturbation
 
@@ -129,6 +130,7 @@ class CLRBezierHead(_OfficialHead):
         lateral_cfg=None,
         aux_cls_head=False,
         curv_moe_cfg=None,
+        slot_expert_cfg=None,
         target_adapter=None,
         train_cfg=None,
         test_cfg=None,
@@ -599,6 +601,45 @@ class CLRBezierHead(_OfficialHead):
             if not aux_active and self.curv_moe.expert_type == "tower":
                 self.cls_modules.requires_grad_(False)
 
+        # ---- lane-slot experts (slot_experts.py) -------------------------------
+        # slot_expert_cfg: None (default, off) or a dict for LaneSlotExperts. Each
+        # query is routed, at every stage, by the slot of the lane it samples at
+        # that stage, and that slot's own copies of the lane embedding (RoIGather
+        # fc), the cls tower + output and the reg tower + output process it, so
+        # the expert controls localization as well as the score. Loading a
+        # checkpoint without experts copies the base layers into each.
+        self.slot_experts = None
+        if slot_expert_cfg:
+            if curv_moe_cfg:
+                raise ValueError("slot_expert_cfg and curv_moe_cfg cannot be combined")
+            aux_active = self.aux_enabled and self.aux_num_groups > 0
+            self.slot_experts = LaneSlotExperts(
+                self.roi_gather.fc, self.roi_gather.fc_norm, self.cls_modules, self.cls_layers,
+                self.aux_cls_layers if aux_active else None, self.reg_modules, self.reg_layers,
+                **dict(slot_expert_cfg))
+            se = self.slot_experts
+            if not aux_active or "aux" in se.branches:
+                # no branch runs the base layers of the expert parts any more
+                frozen = []
+                if se.has("embed"):
+                    frozen += [self.roi_gather.fc, self.roi_gather.fc_norm]
+                if se.has("cls"):
+                    frozen += [self.cls_modules, self.cls_layers]
+                    if self.aux_cls_layers is not None:
+                        frozen.append(self.aux_cls_layers)
+                if se.has("reg"):
+                    frozen += [self.reg_modules, self.reg_layers]
+            else:
+                # the auxiliary branch still runs the base layers; only the
+                # one-to-one output layer is unused when aux has its own
+                frozen = ([self.cls_layers] if se.has("cls") and self.aux_cls_layers is not None
+                          else [])
+            for m in frozen:
+                m.requires_grad_(False)
+            self._register_load_state_dict_pre_hook(self._slot_experts_load_hook)
+        else:
+            self._register_load_state_dict_pre_hook(self._slot_experts_absent_hook)
+
         self._init_clrernet_weights()
 
     # ======================================================================
@@ -645,6 +686,9 @@ class CLRBezierHead(_OfficialHead):
                 nn.init.normal_(p, mean=0.0, std=1.0e-3)
         if self.curv_moe is not None:
             self.curv_moe.init_experts()
+        if getattr(self, "slot_experts", None) is not None:
+            # every expert starts as the base layers it replaces
+            self.slot_experts.copy_from_base(self)
         # MoE routers (deformable offsets, GSRC) start uniform; the Linear sweep
         # above had given them trunc_normal weights.
         for m in self.modules():
@@ -699,6 +743,9 @@ class CLRBezierHead(_OfficialHead):
         input_xs, reproj_stats, precond_stats, moe_stats = [], [], [], []
         curv_logits, curv_inputs, curv_rule, curv_own = [], [], [], []
         moe_main = self.curv_moe is not None and branch == "main"
+        slot = (self.slot_experts if self.slot_experts is not None
+                and branch in self.slot_experts.branches else None)
+        slot_routes = []
         step = self._step_cache
         # lft_mode == "dino": the previous stage's update, live w.r.t. that
         # stage's delta only (same values as the detached cp_x/y_start/...).
@@ -709,6 +756,17 @@ class CLRBezierHead(_OfficialHead):
                 input_xs.append(eval_cubic(cp_x.detach(), self.prior_ys.to(cp_x.dtype),
                                            y_start.detach(), self.cp_frame,
                                            y_top=frame_top.detach()))
+            route = None
+            if slot is not None:
+                # the slot of the lane this stage samples (its input reference),
+                # known before the stage runs, so it can pick the regression too
+                with torch.no_grad():
+                    ref_in, _ = brr_reference(cp_x.detach(), y_start.detach(), length.detach(),
+                                              **geo, frame_top=frame_top.detach())
+                    route, _ = slot.route(ref_in[..., 6:], ref_in[..., 2], ref_in[..., 5],
+                                          self.prior_ys, self.img_w, self.img_h, self.n_strips)
+                slot_routes.append(route)
+                route = route.reshape(-1)
             prior_xs = torch.flip(on_map, dims=[2])
             pooled = pool_prior_features(feats[stage], prior_xs, self.prior_feat_ys,
                                          self.prior_feat_channels)
@@ -739,6 +797,8 @@ class CLRBezierHead(_OfficialHead):
             in_gather = query_mixer is not None and self.q2q_position != "post_gather"
             gather_kw = (dict(query_mixer=query_mixer, mixer_position=self.q2q_position)
                          if in_gather else {})
+            if slot is not None and slot.has("embed"):
+                gather_kw["embed_fn"] = lambda flat, _r=route: slot.embed(flat, _r)
             if self.roi_gather_deformable:
                 deform_xs = prior_xs.detach() if self.deform_detach_reference else prior_xs
                 ref_pts, ref_mask = build_clr_curve_reference_points(
@@ -765,20 +825,27 @@ class CLRBezierHead(_OfficialHead):
                     reg_roi = module.fuse(reg_roi, evidence)
             cls_f = cls_roi.reshape(batch_size * num_q, self.fc_hidden_dim)
             reg_f = reg_roi.reshape(batch_size * num_q, self.fc_hidden_dim)
-            if not (moe_main and self.curv_moe.expert_type == "tower"):
+            slot_cls = slot is not None and slot.has("cls")
+            slot_reg = slot is not None and slot.has("reg")
+            if not (moe_main and self.curv_moe.expert_type == "tower") and not slot_cls:
                 for m in self.cls_modules:
                     cls_f = m(cls_f)
-            for m in self.reg_modules:
-                reg_f = m(reg_f)
+            if not slot_reg:
+                for m in self.reg_modules:
+                    reg_f = m(reg_f)
             if moe_main:
                 # scored below, once the stage output (the router's geometry) exists
                 cls_logits = None
+            elif slot_cls:
+                cls_logits = slot.cls(cls_f, route, aux=branch == "aux").view(
+                    batch_size, num_q, 2).float()
             else:
                 cls_head = (self.aux_cls_layers
                             if (branch == "aux" and self.aux_cls_layers is not None)
                             else self.cls_layers)
                 cls_logits = cls_head(cls_f).view(batch_size, num_q, 2).float()
-            reg = self.reg_layers(reg_f).view(batch_size, num_q, -1).float()
+            reg = (slot.reg(reg_f, route) if slot_reg else self.reg_layers(reg_f)).view(
+                batch_size, num_q, -1).float()
 
             reg_ref = reg
             if self.cp_precond is not None:
@@ -899,7 +966,7 @@ class CLRBezierHead(_OfficialHead):
         return preds, states, dict(input_xs=input_xs or None, reproj=reproj_stats,
                                    precond=precond_stats, moe=moe_stats,
                                    curv=curv_logits, curv_in=curv_inputs, curv_rule=curv_rule,
-                                   curv_own=curv_own)
+                                   curv_own=curv_own, slot=slot_routes)
 
     def _curv_moe_load_hook(self, state_dict, prefix, local_metadata, strict, missing_keys,
                             unexpected_keys, error_msgs):
@@ -970,10 +1037,64 @@ class CLRBezierHead(_OfficialHead):
                               unexpected_keys, error_msgs):
         """A curv_moe checkpoint loaded into a head without curv_moe_cfg would be
         scored by the base classifier, which the MoE run did not train (or froze)."""
+        if getattr(self, "slot_experts", None) is not None:
+            return  # slot experts take the base weights from a router checkpoint
         if any(k.startswith(prefix + "curv_moe.") for k in state_dict):
             print("[CLRBezierHead] WARNING: this checkpoint was trained with curv_moe_cfg, "
                   "but the config has none; the main branch is scored by the base "
                   "classifier, not the experts. Evaluate with the MoE config.")
+
+    def _slot_experts_load_hook(self, state_dict, prefix, local_metadata, strict, missing_keys,
+                                unexpected_keys, error_msgs):
+        """Loading into a head with slot experts.
+
+        A checkpoint without experts (a base model, or a curv_moe router
+        checkpoint, which holds the base weights) fills every expert with a copy
+        of the base layers, so predictions start exactly where that model was.
+        A slot-expert checkpoint must match this config's expert count,
+        measure and bin edges: its experts were trained for those slots.
+        """
+        from .curv_moe import MEASURES
+        se = self.slot_experts
+        base = prefix + "slot_experts."
+        saved_k = {int(k[len(base + "experts."):].split(".")[0]) for k in state_dict
+                   if k.startswith(base + "experts.")}
+        if saved_k and saved_k != set(range(se.num_experts)):
+            raise ValueError(f"slot_experts: the checkpoint has {len(saved_k)} experts, this "
+                             f"config {se.num_experts} (slot_expert_cfg.num_experts)")
+        code_key = base + "measure_code"
+        if code_key in state_dict:
+            saved = MEASURES[int(state_dict[code_key])]
+            if saved != se.measure:
+                raise ValueError(f"slot_experts: the checkpoint's experts were trained on measure "
+                                 f"{saved!r}, this config uses {se.measure!r}")
+        else:
+            state_dict[code_key] = se.measure_code.detach().clone()
+        edge_key = base + "bin_edges"
+        if edge_key in state_dict:
+            saved = state_dict[edge_key].detach().float().cpu()
+            mine = se.bin_edges.detach().float().cpu()
+            if saved.shape != mine.shape or not torch.allclose(saved, mine, rtol=1e-4, atol=1e-6):
+                raise ValueError(f"slot_experts: checkpoint bin edges {saved.tolist()} differ from "
+                                 f"slot_expert_cfg.bin_edges {mine.tolist()}; the experts were "
+                                 "trained for the checkpoint's slots")
+        else:
+            state_dict[edge_key] = se.bin_edges.detach().clone()
+        for k, expert in enumerate(se.experts):
+            for name, _ in expert.named_parameters():
+                key = f"{base}experts.{k}.{name}"
+                src = prefix + base_name(name)
+                if key not in state_dict and src in state_dict:
+                    state_dict[key] = state_dict[src].clone()
+
+    def _slot_experts_absent_hook(self, state_dict, prefix, local_metadata, strict,
+                                  missing_keys, unexpected_keys, error_msgs):
+        """A slot-expert checkpoint loaded into a head without slot_expert_cfg would
+        run the base layers, which the slot-expert run froze."""
+        if any(k.startswith(prefix + "slot_experts.") for k in state_dict):
+            print("[CLRBezierHead] WARNING: this checkpoint was trained with slot_expert_cfg, "
+                  "but the config has none; the head runs the frozen base layers, not the "
+                  "slot experts. Evaluate with the slot-expert config.")
 
     _JITTER_DEFAULTS = dict(branches=("aux",), after_stages=(0, 1), translate=0.01,
                             slope=0.02, curve=0.01, y_shift=0.02, prob=1.0)
@@ -1099,6 +1220,8 @@ class CLRBezierHead(_OfficialHead):
                    precond=main_extra["precond"], moe=main_extra.get("moe", []))
         if self.gsrc is not None and getattr(self.gsrc, "last_stats", None):
             out["moe_gsrc"] = dict(self.gsrc.last_stats)
+        if main_extra.get("slot"):
+            out["slot_routes"] = main_extra["slot"]
         if main_extra.get("curv"):
             out["curv_router_logits"] = main_extra["curv"]
             if not self._curv_warned:
@@ -1260,6 +1383,14 @@ class CLRBezierHead(_OfficialHead):
                 self.prior_ys, self.img_w, self.img_h, self.lane_width, (self.iou_w, self.iou_h))
             diag.update(curv_stats)
             diag["curv_router_ce"] = curv_loss.detach()
+
+        if outs.get("slot_routes"):
+            # share of the main queries each slot expert ran at the last stage
+            last = outs["slot_routes"][-1].reshape(-1)
+            share = torch.bincount(last, minlength=self.slot_experts.num_experts).float()
+            share = share / max(int(last.numel()), 1)
+            for k in range(self.slot_experts.num_experts):
+                diag[f"slot_share_e{k}"] = share[k]
 
         if self.rank_loss_enabled:
             rank, rank_stats = self._rank_loss(outs["main_preds"], valid_targets)

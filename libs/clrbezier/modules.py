@@ -68,7 +68,7 @@ class ROIGather(nn.Module):
         self.fc_norm = nn.LayerNorm(fc_hidden_dim)
 
     def forward(self, roi_features, fmap, layer_index, query_mixer=None,
-                mixer_position=None):
+                mixer_position=None, embed_fn=None):
         """roi_features: list of [B*N, C, S, 1] for stages 0..layer_index.
         fmap: current-stage feature map [B, C, H, W]. Returns [B, N, fc_hidden_dim].
 
@@ -76,13 +76,15 @@ class ROIGather(nn.Module):
         query-to-query attention), applied at ``mixer_position``:
         "pre_q2g" on the pooled lane features, before they query the feature
         map; "post_q2g" right after the feature-map attention's residual.
+        embed_fn: optional callable [B*N, S*C] -> [B*N, D] replacing fc + fc_norm
+        (the head's lane-slot experts, slot_experts.py); None = fc + fc_norm.
         """
         batch_size = fmap.shape[0]
         num_queries = roi_features[0].shape[0] // batch_size
         feats = [self.convs[i](f) for i, f in enumerate(roi_features)]
         roi = self.catconv[layer_index](torch.cat(feats, dim=1))
         roi = roi.contiguous().view(batch_size * num_queries, -1)
-        roi = F.relu(self.fc_norm(self.fc(roi)))
+        roi = F.relu(self.fc_norm(self.fc(roi)) if embed_fn is None else embed_fn(roi))
         roi = roi.view(batch_size, num_queries, self.fc_hidden_dim)
         if query_mixer is not None and mixer_position == "pre_q2g":
             roi = query_mixer(roi)

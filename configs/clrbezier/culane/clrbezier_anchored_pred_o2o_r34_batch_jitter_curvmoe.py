@@ -33,7 +33,7 @@ custom_imports = dict(
     ],
     allow_failed_imports=False,
 )
-cfg_name = "clrbezier_anchored_pred_o2o_r34_batch_jitter.py"
+cfg_name = "clrbezier_anchored_pred_o2o_r34_batch_jitter_curvmoe.py"
 
 img_w, img_h, num_points = 800, 320, 72
 model = dict(

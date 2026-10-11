@@ -1647,7 +1647,7 @@ CONFIG_NAME="clrbezier_anchored_pred_o2o_r34_batch_jitter_slotmoe"
 MODEL_NAME="clrbezier"
 DATASET="culane"
 BASE_CHECKPOINT=work_dirs/clrbezier/culane/clrbezier_anchored_pred_o2o_r34_batch_jitter/run1/epoch_15.pth
-WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/curv_router/$CONFIG_NAME
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/slot_router/$CONFIG_NAME
 LOG="$WORK_DIR/train_router.log"
 mkdir -p "$WORK_DIR"
 nohup env CUDA_VISIBLE_DEVICES=0 \
