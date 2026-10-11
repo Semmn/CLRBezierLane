@@ -367,6 +367,8 @@ class CLRBezierHead(_OfficialHead):
             self.curv_moe = CurvatureMoEClassifier(self.cls_modules, self.cls_layers,
                                                    self.fc_hidden_dim, **dict(curv_moe_cfg))
             self._register_load_state_dict_pre_hook(self._curv_moe_load_hook)
+        else:
+            self._register_load_state_dict_pre_hook(self._curv_moe_absent_hook)
         self._curv_warned = False
 
         # ---- lateral evidence -------------------------------------------------
@@ -695,7 +697,7 @@ class CLRBezierHead(_OfficialHead):
 
         pooled_stages, preds, states = [], [], []
         input_xs, reproj_stats, precond_stats, moe_stats = [], [], [], []
-        curv_logits, curv_inputs = [], []
+        curv_logits, curv_inputs, curv_rule = [], [], []
         moe_main = self.curv_moe is not None and branch == "main"
         step = self._step_cache
         # lft_mode == "dino": the previous stage's update, live w.r.t. that
@@ -769,13 +771,8 @@ class CLRBezierHead(_OfficialHead):
             for m in self.reg_modules:
                 reg_f = m(reg_f)
             if moe_main:
-                # hard top-1: each query is scored by its curvature bin's expert
-                roi_f = roi.reshape(batch_size * num_q, self.fc_hidden_dim)
-                cls_flat, router_logits, _ = self.curv_moe(roi_f, cls_f)
-                cls_logits = cls_flat.view(batch_size, num_q, 2).float()
-                curv_logits.append(router_logits.view(batch_size, num_q, -1))
-                if self.curv_moe.capture:
-                    curv_inputs.append(roi_f.detach().view(batch_size, num_q, -1))
+                # scored below, once the stage output (the router's geometry) exists
+                cls_logits = None
             else:
                 cls_head = (self.aux_cls_layers
                             if (branch == "aux" and self.aux_cls_layers is not None)
@@ -795,9 +792,7 @@ class CLRBezierHead(_OfficialHead):
                     [reg[..., :2], reg[..., 2:6] * gains, reg[..., 6:]], dim=-1)
                 if self.cp_precond.apply_to == "both":
                     reg = reg_ref
-                precond_stats.append(self.cp_precond.diagnostics(
-                    y_start, self._precond_length(length, reg),
-                    scores=cls_logits[..., 1] - cls_logits[..., 0], frame=self.cp_frame))
+                precond_args = (y_start, self._precond_length(length, reg))
 
             base_x, base_y, base_len, base_top = (
                 (cp_x, y_start, length, frame_top) if live is None
@@ -850,7 +845,29 @@ class CLRBezierHead(_OfficialHead):
                 raw_x = cp_x.detach() + reg[..., 2:6]
                 states.append(torch.cat([raw_y.unsqueeze(-1), new_len.unsqueeze(-1), raw_x],
                                         dim=-1))
-            pred = torch.cat([cls_logits, ref[..., 2:6], ref[..., 6:] + reg[..., 6:]], dim=-1)
+            out_xs = ref[..., 6:] + reg[..., 6:]
+            if moe_main:
+                # hard top-1: each query is scored by its curvature bin's expert
+                moe = self.curv_moe
+                roi_f = roi.reshape(batch_size * num_q, self.fc_hidden_dim)
+                lane_geo = own_bin = None
+                if moe.use_geometry or moe.capture:
+                    lane_geo, own_bin = moe.geometry(out_xs.detach(), ref[..., 2].detach(),
+                                                     ref[..., 5].detach(), self.prior_ys,
+                                                     self.img_w, self.img_h, self.n_strips)
+                    lane_geo = lane_geo.reshape(batch_size * num_q, -1)
+                router_x = moe.router_x(roi_f, lane_geo)
+                cls_flat, router_logits, _ = moe(router_x, cls_f, own_bin)
+                cls_logits = cls_flat.view(batch_size, num_q, 2).float()
+                curv_logits.append(router_logits.view(batch_size, num_q, -1))
+                if moe.capture:
+                    curv_inputs.append(router_x.detach().view(batch_size, num_q, -1))
+                    curv_rule.append(own_bin.view(batch_size, num_q))
+            if self.cp_precond is not None:
+                precond_stats.append(self.cp_precond.diagnostics(
+                    *precond_args, scores=cls_logits[..., 1] - cls_logits[..., 0],
+                    frame=self.cp_frame))
+            pred = torch.cat([cls_logits, ref[..., 2:6], out_xs], dim=-1)
             preds.append(pred)
 
             if stage != self.refine_layers - 1:
@@ -879,7 +896,7 @@ class CLRBezierHead(_OfficialHead):
                     _, on_map = brr_reference(cp_x, y_start, length, **geo, frame_top=frame_top)
         return preds, states, dict(input_xs=input_xs or None, reproj=reproj_stats,
                                    precond=precond_stats, moe=moe_stats,
-                                   curv=curv_logits, curv_in=curv_inputs)
+                                   curv=curv_logits, curv_in=curv_inputs, curv_rule=curv_rule)
 
     def _curv_moe_load_hook(self, state_dict, prefix, local_metadata, strict, missing_keys,
                             unexpected_keys, error_msgs):
@@ -892,6 +909,15 @@ class CLRBezierHead(_OfficialHead):
         """
         moe = self.curv_moe
         base = prefix + "curv_moe."
+        for name, param in moe.router.named_parameters():
+            key = f"{base}router.{name}"
+            if key in state_dict and tuple(state_dict[key].shape) != tuple(param.shape):
+                raise ValueError(
+                    f"curv_moe: the checkpoint's router ({key}, shape "
+                    f"{tuple(state_dict[key].shape)}) does not fit this config's router "
+                    f"(shape {tuple(param.shape)}, router_input={moe.router_input!r}); it was "
+                    "trained with another router_input or router_hidden. Rerun "
+                    "tools/clrbezier/pretrain_curvature_router.py on the base checkpoint.")
         for k, expert in enumerate(moe.experts):
             for name, _ in expert.named_parameters():
                 key = f"{base}experts.{k}.{name}"
@@ -918,6 +944,15 @@ class CLRBezierHead(_OfficialHead):
             # a checkpoint without the MoE: keep this head's buffers
             state_dict[edge_key] = moe.bin_edges.detach().clone()
             state_dict.setdefault(base + "router_trained", moe.router_trained.detach().clone())
+
+    def _curv_moe_absent_hook(self, state_dict, prefix, local_metadata, strict, missing_keys,
+                              unexpected_keys, error_msgs):
+        """A curv_moe checkpoint loaded into a head without curv_moe_cfg would be
+        scored by the base classifier, which the MoE run did not train (or froze)."""
+        if any(k.startswith(prefix + "curv_moe.") for k in state_dict):
+            print("[CLRBezierHead] WARNING: this checkpoint was trained with curv_moe_cfg, "
+                  "but the config has none; the main branch is scored by the base "
+                  "classifier, not the experts. Evaluate with the MoE config.")
 
     _JITTER_DEFAULTS = dict(branches=("aux",), after_stages=(0, 1), translate=0.01,
                             slope=0.02, curve=0.01, y_shift=0.02, prob=1.0)

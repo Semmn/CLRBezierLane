@@ -1,6 +1,7 @@
 """Pretrain the curvature router of ``bbox_head.curv_moe_cfg`` on a trained checkpoint.
 
-The router reads the head's own RoI features, so it is trained on top of a
+The router reads the head's own RoI features and the geometry of each query's
+stage output (curv_moe_cfg.router_input), so it is trained on top of a
 detector that is already trained, with everything else frozen and in eval mode
 (BatchNorm statistics and dropout untouched). The output checkpoint holds the
 base weights, the experts (copies of the base classifier), the trained router
@@ -16,8 +17,9 @@ Steps:
      bin of the GT lane its stage output overlaps most (LaneIoU >= label_iou_thr);
      other queries are ignored. Cross-entropy on the router only.
   3. Optional router accuracy on a held-out list (--val-list; list/val_gt.txt
-     for CULane, same format as train_gt.txt), per bin and per stage, with the
-     majority-class baseline.
+     for CULane, same format as train_gt.txt), per bin and per stage, with two
+     baselines: the majority class, and the rule "route by the bin of the
+     query's own predicted curvature" (no learning).
 
     python tools/clrbezier/pretrain_curvature_router.py \\
         MOE_CONFIG.py BASE_CHECKPOINT.pth --out work_dirs/router/router.pth \\
@@ -66,7 +68,7 @@ def parse_args(argv=None):
                    help="annotated list for router accuracy, relative to data_root")
     p.add_argument("--val-batches", type=int, default=None, help="default: the whole list")
     p.add_argument("--device", default="cuda")
-    p.add_argument("--amp", action="store_true", help="fp16 autocast for the frozen network")
+    p.add_argument("--amp", action="store_true", help="fp16 autocast for the frozen backbone/neck")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-interval", type=int, default=50)
     return p.parse_args(argv)
@@ -141,14 +143,23 @@ def gt_padded(head, data_samples, device):
 
 
 def frozen_forward(model, head, batch, amp):
-    """Stage outputs and router inputs of the main branch, no gradient."""
+    """Stage outputs and router inputs of the main branch, no gradient.
+
+    --amp covers the backbone and neck only: the head's curve geometry (and the
+    LaneIoU the labels come from) stays in fp32, as in training.
+    """
     data = model.data_preprocessor(batch, False)
     device_type = next(model.parameters()).device.type
-    with torch.no_grad(), torch.autocast(device_type=device_type, enabled=bool(amp)):
-        feats = head._select_features(model.extract_feat(data["inputs"]))
+    with torch.no_grad():
+        with torch.autocast(device_type=device_type, enabled=bool(amp)):
+            feats = model.extract_feat(data["inputs"])
+        if isinstance(feats, dict):
+            feats = list(feats.values())
+        feats = head._select_features([f.float() for f in feats])
         preds, _, extra = head._refine(feats, head.prior_bank(feats[-1].shape[0]),
                                        head.gsrc_tokens(feats))
-    return data, [p.float() for p in preds], [x.float() for x in extra["curv_in"]]
+    return (data, [p.float() for p in preds], [x.float() for x in extra["curv_in"]],
+            extra["curv_rule"])
 
 
 def stage_labels(head, preds, gt, mask):
@@ -210,26 +221,33 @@ def evaluate(model, head, loader, device, args, max_batches=None):
     K = moe.num_experts
     S = head.refine_layers
     conf = torch.zeros(S, K, K, dtype=torch.long)          # [stage, true, pred]
+    conf_rule = torch.zeros(S, K, K, dtype=torch.long)     # own-curvature rule
     for i, batch in enumerate(loader):
         if max_batches is not None and i >= max_batches:
             break
-        data, preds, inputs = frozen_forward(model, head, batch, args.amp)
+        data, preds, inputs, rules = frozen_forward(model, head, batch, args.amp)
         gt, mask = gt_padded(head, data["data_samples"], device)
         labels = stage_labels(head, preds, gt, mask)
-        for s, (x, lab) in enumerate(zip(inputs, labels)):
-            pred = moe.router(x).argmax(-1)
+        for s, (x, rule, lab) in enumerate(zip(inputs, rules, labels)):
+            pred = moe.logits(x.reshape(-1, x.shape[-1]), rule).argmax(-1).view(lab.shape)
             keep = lab >= 0
             idx = (lab[keep] * K + pred[keep]).cpu()
             conf[s] += torch.bincount(idx, minlength=K * K).view(K, K)
+            idx = (lab[keep] * K + rule[keep]).cpu()
+            conf_rule[s] += torch.bincount(idx, minlength=K * K).view(K, K)
     out = {}
     for s in range(S):
         c = conf[s].double()
         n = c.sum().clamp_min(1)
         recall = (c.diag() / c.sum(1).clamp_min(1)).tolist()
+        r = conf_rule[s].double()
+        rule_recall = (r.diag() / r.sum(1).clamp_min(1)).tolist()
         out[f"stage{s}"] = dict(
             acc=float(c.diag().sum() / n), majority_acc=float(c.sum(1).max() / n),
             balanced_acc=float(sum(recall) / K), recall=recall,
-            labelled=int(c.sum()), confusion=conf[s].tolist())
+            labelled=int(c.sum()), confusion=conf[s].tolist(),
+            rule_acc=float(r.diag().sum() / n), rule_balanced_acc=float(sum(rule_recall) / K),
+            rule_recall=rule_recall, rule_confusion=conf_rule[s].tolist())
     return out
 
 
@@ -238,6 +256,9 @@ def _print_eval(res, K):
         print(f"  {s}: acc {r['acc']:.3f} (majority class {r['majority_acc']:.3f}), "
               f"balanced {r['balanced_acc']:.3f}, {r['labelled']} labelled queries; "
               "recall per bin " + ", ".join(f"{v:.2f}" for v in r["recall"]))
+        print(f"          own-curvature rule (no learning): acc {r['rule_acc']:.3f}, "
+              f"balanced {r['rule_balanced_acc']:.3f}; recall per bin "
+              + ", ".join(f"{v:.2f}" for v in r["rule_recall"]))
     last = list(res.values())[-1]
     print("  final-stage confusion (rows: true bin, columns: routed expert):")
     for k, row in enumerate(last["confusion"]):
@@ -282,6 +303,8 @@ def main(argv=None, build=build_all):
         raise SystemExit(f"bin edges must be >= 0 and increasing: {edges}")
     moe.bin_edges.copy_(torch.tensor(edges, dtype=moe.bin_edges.dtype))
     print("bin edges:", [round(e, 6) for e in edges], f"({edge_info['source']})")
+    print(f"router input: {moe.router_input} ({next(moe.router.parameters()).shape[1]} "
+          f"values per query), rule prior {moe.rule_prior}")
 
     # 2. router training
     per_epoch = len(train_loader)
@@ -300,10 +323,11 @@ def main(argv=None, build=build_all):
         for batch in train_loader:
             if it >= total:
                 break
-            data, preds, inputs = frozen_forward(model, head, batch, args.amp)
+            data, preds, inputs, rules = frozen_forward(model, head, batch, args.amp)
             gt, mask = gt_padded(head, data["data_samples"], device)
             labels = stage_labels(head, preds, gt, mask)
-            logits = torch.cat([moe.router(x).reshape(-1, K) for x in inputs])
+            logits = torch.cat([moe.logits(x.reshape(-1, x.shape[-1]), r)
+                                for x, r in zip(inputs, rules)])
             lab = torch.cat([l.reshape(-1) for l in labels])
             keep = lab >= 0
             n = int(keep.sum())
@@ -338,6 +362,7 @@ def main(argv=None, build=build_all):
     moe.capture = False
     state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     meta = dict(curv_router=dict(edges=edges, edge_info=edge_info, measure=moe.measure,
+                                 router_input=moe.router_input, rule_prior=moe.rule_prior,
                                  num_experts=K, base_checkpoint=args.checkpoint,
                                  iterations=total, val=val))
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)

@@ -23,6 +23,19 @@ input frame (img_w x img_h px):
         curvature of the circle through the two ends and the farthest point.
         Unlike the sagitta it does not grow with lane length.
 
+Router input (``router_input``): "feature" is the RoI feature alone; "geometry"
+describes the query's own stage-output lane (its signed curvature over its
+visible rows, the bin that curvature falls in, its bottom y and its span);
+"both" (default) concatenates the two. The RoI feature is pooled along the
+query's own reference curve, so it shows what the lane looks like relative to
+that curve, not how curved the curve itself is: a router on the feature alone
+learns little beyond the class prior. The geometry carries the curvature
+directly. With the geometry, ``rule_prior`` adds a fixed logit to the bin of
+the query's own predicted curvature and the router's last layer starts at zero,
+so the untrained router routes by that rule and training only overrides it
+where the labels disagree (a plain router under the ~88% straight imbalance
+tends to merge the narrow 2 px .. 1 sigma bin into the straight one).
+
 Router labels: a query is labelled with the bin of the GT lane its stage
 output overlaps most, if that LaneIoU (narrow width, GT rows) is at least
 ``label_iou_thr``; other queries carry no label. Only the main branch is
@@ -45,6 +58,33 @@ from .lane_iou import _lane_half_widths
 
 MEASURES = ("sagitta_px", "curvature")
 EXPERT_TYPES = ("tower", "linear")
+ROUTER_INPUTS = ("feature", "geometry", "both")
+
+
+def geometry_dim(num_experts: int) -> int:
+    """Width of the geometry router input: curvature, |curvature|, the bin one-hot,
+    bottom y and span."""
+    return int(num_experts) + 4
+
+
+@torch.no_grad()
+def visible_lane_px(xs, y_start, length, prior_ys, img_w, n_strips):
+    """Row x in px of predicted lanes, invalid (-1) outside each lane's visible span.
+
+    xs: [..., R] normalized x (x_px / (img_w - 1)); y_start / length: [...] image-y
+    bottom and span as in ``brr_reference`` (same clamps). Returns (xs_px, y_bottom,
+    span).
+    """
+    one_row = 1.0 / float(n_strips)
+    y_bottom = y_start.float().clamp(one_row, 1.0)
+    safe_len = torch.minimum(length.float().clamp_min(2.0 * one_row), y_bottom + one_row)
+    span = (safe_len - one_row).clamp_min(0.0)
+    y_top = (y_bottom - span).clamp(0.0, 1.0)
+    ys = prior_ys.to(device=xs.device, dtype=torch.float32)
+    eps = 0.25 * one_row
+    vis = (ys <= y_bottom[..., None] + eps) & (ys >= y_top[..., None] - eps)
+    px = torch.nan_to_num(xs.float() * float(img_w - 1), nan=-1.0, posinf=-1.0, neginf=-1.0)
+    return torch.where(vis, px, torch.full_like(px, -1.0)), y_bottom, span
 
 
 @torch.no_grad()
@@ -174,14 +214,21 @@ class CurvatureMoEClassifier(nn.Module):
         freeze_router: keep the pretrained router fixed.
         label_iou_thr: LaneIoU a query's stage output needs with a GT lane to
             get that lane's bin as its router label.
+        router_input: "feature" | "geometry" | "both" (see the module docstring).
+        rule_prior: logit added to the query's own-curvature bin (None: 4.0 when
+            the geometry is used, else 0; needs the geometry).
     """
 
     def __init__(self, cls_modules: nn.ModuleList, cls_layers: nn.Linear, in_dim: int,
                  num_experts: int = 4, bin_edges=None, measure: str = "sagitta_px",
                  expert: str = "tower", router_hidden: int = 64, router_detach: bool = True,
                  router_loss_weight: float = 1.0, freeze_router: bool = False,
-                 label_iou_thr: float = 0.5):
+                 label_iou_thr: float = 0.5, router_input: str = "both",
+                 rule_prior: Optional[float] = None):
         super().__init__()
+        if router_input not in ROUTER_INPUTS:
+            raise ValueError(f"curv_moe_cfg.router_input must be one of {ROUTER_INPUTS}, "
+                             f"got {router_input!r}")
         if measure not in MEASURES:
             raise ValueError(f"curv_moe_cfg.measure must be one of {MEASURES}, got {measure!r}")
         if expert not in EXPERT_TYPES:
@@ -209,6 +256,17 @@ class CurvatureMoEClassifier(nn.Module):
         self.router_loss_weight = float(router_loss_weight)
         self.freeze_router = bool(freeze_router) or self.router_loss_weight == 0.0
         self.label_iou_thr = float(label_iou_thr)
+        self.router_input = router_input
+        self.use_feature = router_input in ("feature", "both")
+        self.use_geometry = router_input in ("geometry", "both")
+        if rule_prior is None:
+            rule_prior = 4.0 if self.use_geometry else 0.0
+        if rule_prior < 0 or (rule_prior > 0 and not self.use_geometry):
+            raise ValueError("curv_moe_cfg.rule_prior must be >= 0 and needs router_input "
+                             "'geometry' or 'both'")
+        self.rule_prior = float(rule_prior)
+        in_dim = ((int(in_dim) if self.use_feature else 0)
+                  + (geometry_dim(self.num_experts) if self.use_geometry else 0))
         hidden = int(router_hidden)
         self.router = (nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU(inplace=True),
                                      nn.Linear(hidden, self.num_experts))
@@ -229,17 +287,57 @@ class CurvatureMoEClassifier(nn.Module):
                 "curv_moe_cfg.bin_edges.")
         return self.bin_edges
 
-    def route(self, roi_f: torch.Tensor):
+    @torch.no_grad()
+    def geometry(self, xs, y_start, length, prior_ys, img_w, img_h, n_strips):
+        """Geometry router input of predicted lanes [..., geometry_dim] and the bin of
+        each lane's own curvature [...] (the rule a router without learning would use).
+
+        xs: [..., R] normalized row x of the stage output; y_start / length: its
+        bottom and span (prediction slots 2 and 5).
+        """
+        px, y_bottom, span = visible_lane_px(xs, y_start, length, prior_ys, img_w, n_strips)
+        c = lane_curvature(px, prior_ys, img_w, img_h, self.measure)
+        edges = self.edges()
+        own_bin = curvature_bins(c, edges)
+        scale = float(edges[-1]) if edges.numel() and float(edges[-1]) > 0 else 1.0
+        z = (c / scale).clamp(-8.0, 8.0)
+        onehot = F.one_hot(own_bin, self.num_experts).float()
+        feats = torch.cat([z[..., None], z.abs()[..., None], onehot,
+                           y_bottom[..., None], span[..., None]], dim=-1)
+        return feats, own_bin
+
+    def router_x(self, roi_f: Optional[torch.Tensor], geo: Optional[torch.Tensor]):
+        """The router's input [N, D] from the RoI feature [N, C] and the geometry
+        [N, G] (either may be None when ``router_input`` does not use it)."""
+        parts = []
+        if self.use_feature:
+            parts.append(roi_f.detach() if self.router_detach else roi_f)
+        if self.use_geometry:
+            parts.append(geo.detach())
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat([p.float() for p in parts], dim=-1)
+
+    def logits(self, x: torch.Tensor, own_bin: Optional[torch.Tensor] = None):
+        """Router logits [N, K] (float) for router input x [N, D] and the bin of each
+        query's own predicted curvature [N] (needed when rule_prior > 0)."""
+        out = self.router(x).float()
+        if self.rule_prior > 0:
+            out = out + self.rule_prior * F.one_hot(own_bin.reshape(-1), self.num_experts).to(out)
+        return out
+
+    def route(self, x: torch.Tensor, own_bin: Optional[torch.Tensor] = None):
         """Router logits [N, K] (float) and the expert index [N]."""
-        x = roi_f.detach() if self.router_detach else roi_f
-        logits = self.router(x).float()
+        logits = self.logits(x, own_bin)
         return logits, logits.argmax(-1)
 
-    def forward(self, roi_f: torch.Tensor, cls_f: torch.Tensor):
-        """roi_f: router input [N, C]; cls_f: classifier input [N, C] (the shared
-        tower's output when expert="linear"). Returns cls logits [N, 2], router
-        logits [N, K] and the route [N]."""
-        logits, route = self.route(roi_f)
+    def forward(self, x: torch.Tensor, cls_f: torch.Tensor,
+                own_bin: Optional[torch.Tensor] = None):
+        """x: router input [N, D] (``router_x``); cls_f: classifier input [N, C] (the
+        shared tower's output when expert="linear"); own_bin: [N] bin of each
+        query's own predicted curvature. Returns cls logits [N, 2], router logits
+        [N, K] and the route [N]."""
+        logits, route = self.route(x, own_bin)
         outs = torch.stack([e(cls_f) for e in self.experts], dim=1)       # [N, K, 2]
         cls = outs.gather(1, route.view(-1, 1, 1).expand(-1, 1, outs.shape[-1])).squeeze(1)
         return cls, logits, route
@@ -250,6 +348,11 @@ class CurvatureMoEClassifier(nn.Module):
         for e in self.experts:
             for p in e.out.parameters():
                 nn.init.normal_(p, mean=0.0, std=1.0e-3)
+        if self.rule_prior > 0:
+            # the untrained router routes by the own-curvature rule
+            last = self.router[-1] if isinstance(self.router, nn.Sequential) else self.router
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
 
     def lane_bins(self, xs_px, prior_ys, img_w, img_h):
         values = lane_curvature(xs_px, prior_ys, img_w, img_h, self.measure)
