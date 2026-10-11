@@ -216,4 +216,4 @@ log_config = dict(
     ]
 )
 
-load_from = "work_dirs/curv_router/base_router_k1.pth"
+load_from = "work_dirs/clrbezier/culane/clrbezier_anchored_pred_o2o_r34_batch_jitter/run1/epoch_15.pth"

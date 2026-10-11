@@ -1628,14 +1628,19 @@ tail -f "$LOG"
 # ================================================================================================
 # Visited at the 2026.10.11
 # Pretrain Router and fine-tune MoE adapted network.
-
 CONFIG_NAME="clrbezier_anchored_pred_o2o_r34_batch_jitter_curvmoe"
 MODEL_NAME="clrbezier"
 DATASET="culane"
-nohup env CUDA_VISIBLE_DEVICES=0 PORT=$PORT \
+BASE_CHECKPOINT=work_dirs/clrbezier/culane/clrbezier_anchored_pred_o2o_r34_batch_jitter/run1/epoch_15.pth
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/curv_router/$CONFIG_NAME
+LOG="$WORK_DIR/train_router.log"
+mkdir -p "$WORK_DIR"
+nohup env CUDA_VISIBLE_DEVICES=0 \
     python tools/clrbezier/pretrain_curvature_router.py \
     configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py \
-    BASE_CHECKPOINT.pth --out work_dirs/curv_router/router.pth --val-list list/val_gt.txt
+    $BASE_CHECKPOINT --out $WORK_DIR/router.pth --val-list list/val_gt.txt \
+    > "$LOG" 2>&1 < /dev/null &
+
 
 CONFIG_NAME="clrbezier_anchored_pred_o2o_r34_batch_jitter_curvmoe"
 MODEL_NAME="clrbezier"

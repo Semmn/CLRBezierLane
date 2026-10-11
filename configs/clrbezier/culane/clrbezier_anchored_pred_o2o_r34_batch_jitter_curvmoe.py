@@ -237,4 +237,4 @@ log_config = dict(
         dict(type="TensorboardLoggerHookEpoch"),
     ]
 )
-load_from = "work_dirs/curv_router/router.pth"
+load_from = "work_dirs/curv_router/clrbezier_anchored_pred_o2o_r34_batch_jitter_curvmoe/router.pth"
