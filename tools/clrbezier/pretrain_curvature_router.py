@@ -159,16 +159,22 @@ def frozen_forward(model, head, batch, amp):
         preds, _, extra = head._refine(feats, head.prior_bank(feats[-1].shape[0]),
                                        head.gsrc_tokens(feats))
     return (data, [p.float() for p in preds], [x.float() for x in extra["curv_in"]],
-            extra["curv_rule"])
+            extra["curv_rule"], extra["curv_own"])
 
 
-def stage_labels(head, preds, gt, mask):
+def stage_labels(head, preds, gt, mask, with_curvature=False):
+    """Router labels per stage; with_curvature also returns, per stage, the
+    curvature of the GT lane each query overlaps most [B, Q]."""
     from libs.clrbezier.curv_moe import router_labels
     moe = head.curv_moe
-    bins, _ = moe.lane_bins(gt[..., 6:], head.prior_ys, head.img_w, head.img_h)
+    bins, values = moe.lane_bins(gt[..., 6:], head.prior_ys, head.img_w, head.img_h)
     bins = torch.where(mask, bins, torch.zeros_like(bins))
-    return [router_labels(p, gt, bins, mask, head.lane_width, head.img_w, head.img_h,
-                          (head.iou_w, head.iou_h), moe.label_iou_thr) for p in preds]
+    out = [router_labels(p, gt, bins, mask, head.lane_width, head.img_w, head.img_h,
+                         (head.iou_w, head.iou_h), moe.label_iou_thr, return_index=True)
+           for p in preds]
+    if with_curvature:
+        return [lab for lab, _ in out], [values.gather(1, j) for _, j in out]
+    return [lab for lab, _ in out]
 
 
 def estimate_edges(head, loader, device, args):
@@ -222,12 +228,15 @@ def evaluate(model, head, loader, device, args, max_batches=None):
     S = head.refine_layers
     conf = torch.zeros(S, K, K, dtype=torch.long)          # [stage, true, pred]
     conf_rule = torch.zeros(S, K, K, dtype=torch.long)     # own-curvature rule
+    conf_hi = torch.zeros(2, K, K, dtype=torch.long)       # final stage, score >= conf thr
+    pairs = [[] for _ in range(S)]                         # (own |c|, GT |c|) of labelled queries
+    thr = float((head.test_cfg or {}).get("conf_threshold", 0.4))   # as get_lanes scores
     for i, batch in enumerate(loader):
         if max_batches is not None and i >= max_batches:
             break
-        data, preds, inputs, rules = frozen_forward(model, head, batch, args.amp)
+        data, preds, inputs, rules, owns = frozen_forward(model, head, batch, args.amp)
         gt, mask = gt_padded(head, data["data_samples"], device)
-        labels = stage_labels(head, preds, gt, mask)
+        labels, gt_c = stage_labels(head, preds, gt, mask, with_curvature=True)
         for s, (x, rule, lab) in enumerate(zip(inputs, rules, labels)):
             pred = moe.logits(x.reshape(-1, x.shape[-1]), rule).argmax(-1).view(lab.shape)
             keep = lab >= 0
@@ -235,6 +244,13 @@ def evaluate(model, head, loader, device, args, max_batches=None):
             conf[s] += torch.bincount(idx, minlength=K * K).view(K, K)
             idx = (lab[keep] * K + rule[keep]).cpu()
             conf_rule[s] += torch.bincount(idx, minlength=K * K).view(K, K)
+            pairs[s].append(torch.stack([owns[s][keep].abs(), gt_c[s][keep].abs()], -1).cpu())
+            if s == S - 1:
+                score = preds[s][..., :2].softmax(-1)[..., 1]
+                hi = keep & (score >= thr)
+                for r, routed in enumerate((pred, rule)):
+                    idx = (lab[hi] * K + routed[hi]).cpu()
+                    conf_hi[r] += torch.bincount(idx, minlength=K * K).view(K, K)
     out = {}
     for s in range(S):
         c = conf[s].double()
@@ -248,10 +264,27 @@ def evaluate(model, head, loader, device, args, max_batches=None):
             labelled=int(c.sum()), confusion=conf[s].tolist(),
             rule_acc=float(r.diag().sum() / n), rule_balanced_acc=float(sum(rule_recall) / K),
             rule_recall=rule_recall, rule_confusion=conf_rule[s].tolist())
+        pr = torch.cat(pairs[s]).double() if pairs[s] else torch.zeros(0, 2, dtype=torch.float64)
+        if len(pr) > 1:
+            out[f"stage{s}"].update(
+                own_vs_gt_median_abs_diff=float((pr[:, 0] - pr[:, 1]).abs().median()),
+                own_vs_gt_corr=float(torch.corrcoef(pr.T)[0, 1]),
+                own_median=float(pr[:, 0].median()), gt_median=float(pr[:, 1].median()))
+    hi = {}
+    for r, name in enumerate(("router", "rule")):
+        c = conf_hi[r].double()
+        rec = (c.diag() / c.sum(1).clamp_min(1)).tolist()
+        hi[name] = dict(acc=float(c.diag().sum() / c.sum().clamp_min(1)),
+                        balanced_acc=float(sum(rec) / K), recall=rec, confusion=conf_hi[r].tolist())
+    out["final_scored"] = dict(conf_threshold=thr, labelled=int(conf_hi[0].sum()),
+                               majority_acc=float(conf_hi[0].sum(1).max() / conf_hi[0].sum().clamp_min(1)),
+                               **hi)
     return out
 
 
 def _print_eval(res, K):
+    res = dict(res)
+    hi = res.pop("final_scored", None)
     for s, r in res.items():
         print(f"  {s}: acc {r['acc']:.3f} (majority class {r['majority_acc']:.3f}), "
               f"balanced {r['balanced_acc']:.3f}, {r['labelled']} labelled queries; "
@@ -259,6 +292,19 @@ def _print_eval(res, K):
         print(f"          own-curvature rule (no learning): acc {r['rule_acc']:.3f}, "
               f"balanced {r['rule_balanced_acc']:.3f}; recall per bin "
               + ", ".join(f"{v:.2f}" for v in r["rule_recall"]))
+        if "own_vs_gt_corr" in r:
+            corr = r["own_vs_gt_corr"]
+            corr = "n/a" if corr != corr else f"{corr:.2f}"
+            print(f"          own |c| vs matched GT |c| (px): median |diff| "
+                  f"{r['own_vs_gt_median_abs_diff']:.2f}, corr {corr} "
+                  f"(medians {r['own_median']:.2f} / {r['gt_median']:.2f})")
+    if hi is not None:
+        print(f"  final stage, queries scored >= {hi['conf_threshold']:.2f} ({hi['labelled']} "
+              f"labelled; majority class {hi['majority_acc']:.3f}):")
+        for name in ("router", "rule"):
+            h = hi[name]
+            print(f"    {name}: acc {h['acc']:.3f}, balanced {h['balanced_acc']:.3f}; recall per bin "
+                  + ", ".join(f"{v:.2f}" for v in h["recall"]))
     last = list(res.values())[-1]
     print("  final-stage confusion (rows: true bin, columns: routed expert):")
     for k, row in enumerate(last["confusion"]):
@@ -304,7 +350,8 @@ def main(argv=None, build=build_all):
     moe.bin_edges.copy_(torch.tensor(edges, dtype=moe.bin_edges.dtype))
     print("bin edges:", [round(e, 6) for e in edges], f"({edge_info['source']})")
     print(f"router input: {moe.router_input} ({next(moe.router.parameters()).shape[1]} "
-          f"values per query), rule prior {moe.rule_prior}")
+          f"values per query), rule prior {moe.rule_prior}, curvature measured on the "
+          f"{moe.geometry_curve} curve")
 
     # 2. router training
     per_epoch = len(train_loader)
@@ -323,7 +370,7 @@ def main(argv=None, build=build_all):
         for batch in train_loader:
             if it >= total:
                 break
-            data, preds, inputs, rules = frozen_forward(model, head, batch, args.amp)
+            data, preds, inputs, rules, _ = frozen_forward(model, head, batch, args.amp)
             gt, mask = gt_padded(head, data["data_samples"], device)
             labels = stage_labels(head, preds, gt, mask)
             logits = torch.cat([moe.logits(x.reshape(-1, x.shape[-1]), r)
@@ -363,6 +410,7 @@ def main(argv=None, build=build_all):
     state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     meta = dict(curv_router=dict(edges=edges, edge_info=edge_info, measure=moe.measure,
                                  router_input=moe.router_input, rule_prior=moe.rule_prior,
+                                 geometry_curve=moe.geometry_curve,
                                  num_experts=K, base_checkpoint=args.checkpoint,
                                  iterations=total, val=val))
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)

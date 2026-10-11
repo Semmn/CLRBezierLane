@@ -25,7 +25,10 @@ input frame (img_w x img_h px):
 
 Router input (``router_input``): "feature" is the RoI feature alone; "geometry"
 describes the query's own stage-output lane (its signed curvature over its
-visible rows, the bin that curvature falls in, its bottom y and its span);
+visible rows, the bin that curvature falls in, its bottom y and its span; the
+curvature is measured on the stage's smooth Bezier curve by default,
+``geometry_curve``, because the per-row offsets on top of it carry ~1 px of row
+noise and the largest-deviation sagitta turns that into ~2 px of fake curvature);
 "both" (default) concatenates the two. The RoI feature is pooled along the
 query's own reference curve, so it shows what the lane looks like relative to
 that curve, not how curved the curve itself is: a router on the feature alone
@@ -59,6 +62,7 @@ from .lane_iou import _lane_half_widths
 MEASURES = ("sagitta_px", "curvature")
 EXPERT_TYPES = ("tower", "linear")
 ROUTER_INPUTS = ("feature", "geometry", "both")
+GEOMETRY_CURVES = ("bezier", "output")
 
 
 def geometry_dim(num_experts: int) -> int:
@@ -160,15 +164,18 @@ def batched_lane_iou(pred_geo, gt_geo, lane_width, img_w, img_h):
 
 
 @torch.no_grad()
-def router_labels(pred, gt_pad, gt_bins, gt_mask, lane_width, img_w, img_h, iou_shape, thr):
+def router_labels(pred, gt_pad, gt_bins, gt_mask, lane_width, img_w, img_h, iou_shape, thr,
+                  return_index=False):
     """Router label of every query, [B, Q] (long, -1 = no label).
 
     pred: [B, Q, 6+R] stage output (normalized xs); gt_pad: [B, M, 6+R] GT
-    (xs in px, padded slots invalid); gt_bins / gt_mask: [B, M].
+    (xs in px, padded slots invalid); gt_bins / gt_mask: [B, M]. With
+    return_index, also the index of the GT lane each query overlaps most [B, Q].
     """
     B, Q = pred.shape[:2]
     if gt_pad.shape[1] == 0:
-        return torch.full((B, Q), -1, dtype=torch.long, device=pred.device)
+        empty = torch.full((B, Q), -1, dtype=torch.long, device=pred.device)
+        return (empty, torch.zeros_like(empty)) if return_index else empty
     iou_w, iou_h = iou_shape
     pred_geo = pred[..., 6:].float() * (float(img_w - 1) / float(img_w))
     gt_geo = gt_pad[..., 6:].float() / float(img_w)
@@ -176,7 +183,8 @@ def router_labels(pred, gt_pad, gt_bins, gt_mask, lane_width, img_w, img_h, iou_
     iou = iou.masked_fill(~gt_mask[:, None, :], -1.0)
     best, j = iou.max(-1)
     labels = gt_bins.gather(1, j)
-    return torch.where(best >= thr, labels, torch.full_like(labels, -1))
+    labels = torch.where(best >= thr, labels, torch.full_like(labels, -1))
+    return (labels, j) if return_index else labels
 
 
 class _ClsExpert(nn.Module):
@@ -217,6 +225,8 @@ class CurvatureMoEClassifier(nn.Module):
         router_input: "feature" | "geometry" | "both" (see the module docstring).
         rule_prior: logit added to the query's own-curvature bin (None: 4.0 when
             the geometry is used, else 0; needs the geometry).
+        geometry_curve: "bezier" (the stage's updated Bezier curve, smooth) |
+            "output" (Bezier + the per-row offsets, i.e. the decoded lane).
     """
 
     def __init__(self, cls_modules: nn.ModuleList, cls_layers: nn.Linear, in_dim: int,
@@ -224,7 +234,7 @@ class CurvatureMoEClassifier(nn.Module):
                  expert: str = "tower", router_hidden: int = 64, router_detach: bool = True,
                  router_loss_weight: float = 1.0, freeze_router: bool = False,
                  label_iou_thr: float = 0.5, router_input: str = "both",
-                 rule_prior: Optional[float] = None):
+                 rule_prior: Optional[float] = None, geometry_curve: str = "bezier"):
         super().__init__()
         if router_input not in ROUTER_INPUTS:
             raise ValueError(f"curv_moe_cfg.router_input must be one of {ROUTER_INPUTS}, "
@@ -265,6 +275,10 @@ class CurvatureMoEClassifier(nn.Module):
             raise ValueError("curv_moe_cfg.rule_prior must be >= 0 and needs router_input "
                              "'geometry' or 'both'")
         self.rule_prior = float(rule_prior)
+        if geometry_curve not in GEOMETRY_CURVES:
+            raise ValueError(f"curv_moe_cfg.geometry_curve must be one of {GEOMETRY_CURVES}, "
+                             f"got {geometry_curve!r}")
+        self.geometry_curve = geometry_curve
         in_dim = ((int(in_dim) if self.use_feature else 0)
                   + (geometry_dim(self.num_experts) if self.use_geometry else 0))
         hidden = int(router_hidden)
@@ -289,11 +303,13 @@ class CurvatureMoEClassifier(nn.Module):
 
     @torch.no_grad()
     def geometry(self, xs, y_start, length, prior_ys, img_w, img_h, n_strips):
-        """Geometry router input of predicted lanes [..., geometry_dim] and the bin of
-        each lane's own curvature [...] (the rule a router without learning would use).
+        """Geometry router input of predicted lanes [..., geometry_dim], the bin of
+        each lane's own curvature [...] (the rule a router without learning would
+        use) and that curvature [...].
 
-        xs: [..., R] normalized row x of the stage output; y_start / length: its
-        bottom and span (prediction slots 2 and 5).
+        xs: [..., R] normalized row x of the curve to measure (``geometry_curve``);
+        y_start / length: the stage output's bottom and span (prediction slots 2
+        and 5, length as a fraction of the rows, as get_lanes decodes it).
         """
         px, y_bottom, span = visible_lane_px(xs, y_start, length, prior_ys, img_w, n_strips)
         c = lane_curvature(px, prior_ys, img_w, img_h, self.measure)
@@ -304,7 +320,7 @@ class CurvatureMoEClassifier(nn.Module):
         onehot = F.one_hot(own_bin, self.num_experts).float()
         feats = torch.cat([z[..., None], z.abs()[..., None], onehot,
                            y_bottom[..., None], span[..., None]], dim=-1)
-        return feats, own_bin
+        return feats, own_bin, c
 
     def router_x(self, roi_f: Optional[torch.Tensor], geo: Optional[torch.Tensor]):
         """The router's input [N, D] from the RoI feature [N, C] and the geometry

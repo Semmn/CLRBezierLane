@@ -697,7 +697,7 @@ class CLRBezierHead(_OfficialHead):
 
         pooled_stages, preds, states = [], [], []
         input_xs, reproj_stats, precond_stats, moe_stats = [], [], [], []
-        curv_logits, curv_inputs, curv_rule = [], [], []
+        curv_logits, curv_inputs, curv_rule, curv_own = [], [], [], []
         moe_main = self.curv_moe is not None and branch == "main"
         step = self._step_cache
         # lft_mode == "dino": the previous stage's update, live w.r.t. that
@@ -852,9 +852,10 @@ class CLRBezierHead(_OfficialHead):
                 roi_f = roi.reshape(batch_size * num_q, self.fc_hidden_dim)
                 lane_geo = own_bin = None
                 if moe.use_geometry or moe.capture:
-                    lane_geo, own_bin = moe.geometry(out_xs.detach(), ref[..., 2].detach(),
-                                                     ref[..., 5].detach(), self.prior_ys,
-                                                     self.img_w, self.img_h, self.n_strips)
+                    curve = ref[..., 6:] if moe.geometry_curve == "bezier" else out_xs
+                    lane_geo, own_bin, own_c = moe.geometry(
+                        curve.detach(), ref[..., 2].detach(), ref[..., 5].detach(),
+                        self.prior_ys, self.img_w, self.img_h, self.n_strips)
                     lane_geo = lane_geo.reshape(batch_size * num_q, -1)
                 router_x = moe.router_x(roi_f, lane_geo)
                 cls_flat, router_logits, _ = moe(router_x, cls_f, own_bin)
@@ -863,6 +864,7 @@ class CLRBezierHead(_OfficialHead):
                 if moe.capture:
                     curv_inputs.append(router_x.detach().view(batch_size, num_q, -1))
                     curv_rule.append(own_bin.view(batch_size, num_q))
+                    curv_own.append(own_c.view(batch_size, num_q))
             if self.cp_precond is not None:
                 precond_stats.append(self.cp_precond.diagnostics(
                     *precond_args, scores=cls_logits[..., 1] - cls_logits[..., 0],
@@ -896,7 +898,8 @@ class CLRBezierHead(_OfficialHead):
                     _, on_map = brr_reference(cp_x, y_start, length, **geo, frame_top=frame_top)
         return preds, states, dict(input_xs=input_xs or None, reproj=reproj_stats,
                                    precond=precond_stats, moe=moe_stats,
-                                   curv=curv_logits, curv_in=curv_inputs, curv_rule=curv_rule)
+                                   curv=curv_logits, curv_in=curv_inputs, curv_rule=curv_rule,
+                                   curv_own=curv_own)
 
     def _curv_moe_load_hook(self, state_dict, prefix, local_metadata, strict, missing_keys,
                             unexpected_keys, error_msgs):
