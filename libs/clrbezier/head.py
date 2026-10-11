@@ -930,6 +930,24 @@ class CLRBezierHead(_OfficialHead):
                        else prefix + "cls_layers." + name[len("out."):])
                 if src in state_dict:
                     state_dict[key] = state_dict[src].clone()
+        from .curv_moe import MEASURES, SLOT_MEASURES
+        code_key = base + "measure_code"
+        if code_key in state_dict:
+            saved_measure = MEASURES[int(state_dict[code_key])]
+            if saved_measure != moe.measure:
+                raise ValueError(f"curv_moe: the checkpoint's router and bin edges were made for "
+                                 f"measure {saved_measure!r}, this config uses {moe.measure!r}. "
+                                 "Rerun tools/clrbezier/pretrain_curvature_router.py with this "
+                                 "config on the base checkpoint.")
+        elif base + "bin_edges" in state_dict:
+            # written before slot measures existed: a curvature router
+            if moe.measure in SLOT_MEASURES:
+                raise ValueError("curv_moe: the checkpoint holds a curvature router, this config "
+                                 f"uses the slot measure {moe.measure!r}. Rerun "
+                                 "tools/clrbezier/pretrain_curvature_router.py with this config.")
+            state_dict[code_key] = moe.measure_code.detach().clone()
+        else:
+            state_dict[code_key] = moe.measure_code.detach().clone()
         edge_key = base + "bin_edges"
         if edge_key in state_dict:
             saved = state_dict[edge_key].detach().float().cpu()

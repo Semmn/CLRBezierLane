@@ -1628,6 +1628,7 @@ tail -f "$LOG"
 # ================================================================================================
 # Visited at the 2026.10.11
 # Pretrain Router and fine-tune MoE adapted network.
+# But router runs to classify the curvature since most of the lane in the CULane dataset is straight-line.
 CONFIG_NAME="clrbezier_anchored_pred_o2o_r34_batch_jitter_curvmoe"
 MODEL_NAME="clrbezier"
 DATASET="culane"
@@ -1641,8 +1642,22 @@ nohup env CUDA_VISIBLE_DEVICES=0 \
     $BASE_CHECKPOINT --out $WORK_DIR/router.pth --val-list list/val_gt.txt \
     > "$LOG" 2>&1 < /dev/null &
 
+# Now we use the slot-based MoE approach
+CONFIG_NAME="clrbezier_anchored_pred_o2o_r34_batch_jitter_slotmoe"
+MODEL_NAME="clrbezier"
+DATASET="culane"
+BASE_CHECKPOINT=work_dirs/clrbezier/culane/clrbezier_anchored_pred_o2o_r34_batch_jitter/run1/epoch_15.pth
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/curv_router/$CONFIG_NAME
+LOG="$WORK_DIR/train_router.log"
+mkdir -p "$WORK_DIR"
+nohup env CUDA_VISIBLE_DEVICES=0 \
+    python tools/clrbezier/pretrain_curvature_router.py \
+    configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py \
+    $BASE_CHECKPOINT --out $WORK_DIR/router.pth --val-list list/val_gt.txt \
+    > "$LOG" 2>&1 < /dev/null &
 
-CONFIG_NAME="clrbezier_anchored_pred_o2o_r34_batch_jitter_curvmoe"
+
+CONFIG_NAME="clrbezier_anchored_pred_o2o_r34_batch_jitter_slotmoe"
 MODEL_NAME="clrbezier"
 PORT=25000
 DATASET=culane
@@ -1659,22 +1674,3 @@ TRAIN_PID=$!
 echo "Training launcher PID: $TRAIN_PID"
 disown -h "$TRAIN_PID"
 tail -f "$LOG"
-
-CONFIG_NAME="clrbezier_anchored_pred_o2o_r34_batch_jitter_curvmoe_k1"
-MODEL_NAME="clrbezier"
-PORT=25001
-DATASET=culane
-WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/run1
-LOG="$WORK_DIR/train.log"
-mkdir -p "$WORK_DIR"
-nohup env CUDA_VISIBLE_DEVICES=4,5,6,7 PORT=$PORT \
-    bash tools/dist_train.sh \
-    /exhdd/seungyu/CLRBezierLane/configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py \
-    4 \
-    --work-dir "$WORK_DIR" \
-    > "$LOG" 2>&1 < /dev/null &
-TRAIN_PID=$!
-echo "Training launcher PID: $TRAIN_PID"
-disown -h "$TRAIN_PID"
-tail -f "$LOG"
-

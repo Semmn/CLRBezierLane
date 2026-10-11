@@ -39,6 +39,17 @@ so the untrained router routes by that rule and training only overrides it
 where the labels disagree (a plain router under the ~88% straight imbalance
 tends to merge the narrow 2 px .. 1 sigma bin into the straight one).
 
+Lane-slot measures (the same machinery with another lane property):
+    "angle": angle of the chord from the lane's bottom point to its top point,
+        in degrees in (0, 180) in the input frame; 90 is vertical, below 90 the
+        lane leans right going up (a lane left of the ego car), above 90 it
+        leans left (right of the car). With a shared vanishing point it orders
+        the lanes like their slot (outer left, ego left, ego right, outer right).
+    "x_bottom": x in px where the chord, extended, meets the image bottom.
+Slot measures are binned on the signed value (curvature measures on |value|),
+and the router script sets their edges at quantiles so every expert gets an
+equal share of the GT lanes. Endpoints and chords are insensitive to row noise.
+
 Router labels: a query is labelled with the bin of the GT lane its stage
 output overlaps most, if that LaneIoU (narrow width, GT rows) is at least
 ``label_iou_thr``; other queries carry no label. Only the main branch is
@@ -59,15 +70,17 @@ import torch.nn.functional as F
 
 from .lane_iou import _lane_half_widths
 
-MEASURES = ("sagitta_px", "curvature")
+CURVATURE_MEASURES = ("sagitta_px", "curvature")
+SLOT_MEASURES = ("angle", "x_bottom")
+MEASURES = CURVATURE_MEASURES + SLOT_MEASURES
 EXPERT_TYPES = ("tower", "linear")
 ROUTER_INPUTS = ("feature", "geometry", "both")
 GEOMETRY_CURVES = ("bezier", "output")
 
 
 def geometry_dim(num_experts: int) -> int:
-    """Width of the geometry router input: curvature, |curvature|, the bin one-hot,
-    bottom y and span."""
+    """Width of the geometry router input: the measure (normalized), its magnitude,
+    the bin one-hot, bottom y and span."""
     return int(num_experts) + 4
 
 
@@ -100,8 +113,8 @@ def lane_curvature(xs_px: torch.Tensor, prior_ys: torch.Tensor, img_w: int, img_
     y fractions, row 0 at the bottom). Rows outside [0, img_w) are invalid.
     Lanes with fewer than 3 valid rows count as straight (0).
     """
-    if measure not in MEASURES:
-        raise ValueError(f"measure must be one of {MEASURES}, got {measure!r}")
+    if measure not in CURVATURE_MEASURES:
+        raise ValueError(f"measure must be one of {CURVATURE_MEASURES}, got {measure!r}")
     xs = xs_px.float()
     rows = xs.shape[-1]
     valid = (xs >= 0.0) & (xs < float(img_w))
@@ -127,9 +140,65 @@ def lane_curvature(xs_px: torch.Tensor, prior_ys: torch.Tensor, img_w: int, img_
     return torch.where(ok, out, torch.zeros_like(out))
 
 
+@torch.no_grad()
+def lane_slot_value(xs_px: torch.Tensor, prior_ys: torch.Tensor, img_w: int, img_h: int,
+                    measure: str = "angle") -> torch.Tensor:
+    """Lane-slot measure of each lane from the chord between its bottom and top
+    valid points, ``xs_px`` [..., R] -> [...] (same input convention as
+    ``lane_curvature``). Lanes with fewer than 2 valid rows get the image centre
+    (90 degrees / img_w / 2)."""
+    if measure not in SLOT_MEASURES:
+        raise ValueError(f"measure must be one of {SLOT_MEASURES}, got {measure!r}")
+    xs = xs_px.float()
+    rows = xs.shape[-1]
+    valid = (xs >= 0.0) & (xs < float(img_w))
+    y = (prior_ys.to(device=xs.device, dtype=xs.dtype) * float(img_h)).expand_as(xs)
+    idx = torch.arange(rows, device=xs.device).expand_as(xs)
+    n = valid.sum(-1)
+    first = torch.where(valid, idx, torch.full_like(idx, rows)).min(-1).values.clamp(max=rows - 1)
+    last = torch.where(valid, idx, torch.full_like(idx, -1)).max(-1).values.clamp(min=0)
+    xa = xs.gather(-1, first[..., None]).squeeze(-1)
+    ya = y.gather(-1, first[..., None]).squeeze(-1)
+    xb = xs.gather(-1, last[..., None]).squeeze(-1)
+    yb = y.gather(-1, last[..., None]).squeeze(-1)
+    rise = (ya - yb).clamp_min(1e-6)                       # image y grows downwards
+    ok = (n >= 2) & (ya - yb > 1e-6)
+    if measure == "angle":
+        out = torch.rad2deg(torch.atan2(rise, xb - xa))
+        default = 90.0
+    else:
+        out = (xa + (float(img_h) - ya) * (xa - xb) / rise).clamp(-3.0 * img_w, 4.0 * img_w)
+        default = 0.5 * float(img_w)
+    return torch.where(ok, out, torch.full_like(out, default))
+
+
+def lane_measure(xs_px, prior_ys, img_w: int, img_h: int, measure: str) -> torch.Tensor:
+    """The routing measure of each lane (curvature or slot, see the module docstring)."""
+    if measure in SLOT_MEASURES:
+        return lane_slot_value(xs_px, prior_ys, img_w, img_h, measure)
+    return lane_curvature(xs_px, prior_ys, img_w, img_h, measure)
+
+
 def curvature_bins(values: torch.Tensor, edges: torch.Tensor) -> torch.Tensor:
     """Bin of each |value|: 0 for |v| <= edges[0], ..., K-1 for |v| > edges[-1]."""
     return torch.bucketize(values.abs().float(), edges.to(values.device).float(), right=False)
+
+
+def measure_bins(values: torch.Tensor, edges: torch.Tensor, measure: str) -> torch.Tensor:
+    """Curvature measures bin |value|; slot measures bin the signed value."""
+    if measure in SLOT_MEASURES:
+        return torch.bucketize(values.float(), edges.to(values.device).float(), right=False)
+    return curvature_bins(values, edges)
+
+
+def edges_from_quantiles(values, num_bins: int):
+    """K-1 edges at the k/K quantiles of the values: K bins of equal share."""
+    v = torch.as_tensor(values, dtype=torch.float64).flatten()
+    q = torch.arange(1, num_bins, dtype=torch.float64) / float(num_bins)
+    edges = torch.quantile(v, q).tolist()
+    if any(b <= a for a, b in zip(edges[:-1], edges[1:])):
+        raise ValueError(f"quantile edges do not increase: {edges}")
+    return edges
 
 
 def edges_from_sigma(values, straight: float, sigmas: Sequence[float] = (1.0, 2.0)):
@@ -252,14 +321,18 @@ class CurvatureMoEClassifier(nn.Module):
             if len(edges) != self.num_experts - 1:
                 raise ValueError(f"curv_moe_cfg: {len(edges)} bin edges give {len(edges) + 1} "
                                  f"bins, but num_experts={self.num_experts}")
-            if any(e < 0 for e in edges) or any(b <= a for a, b in zip(edges[:-1], edges[1:])):
-                raise ValueError(f"curv_moe_cfg.bin_edges must be >= 0 and increasing: {edges}")
+            negative = measure in CURVATURE_MEASURES and any(e < 0 for e in edges)
+            if negative or any(b <= a for a, b in zip(edges[:-1], edges[1:])):
+                raise ValueError(f"curv_moe_cfg.bin_edges must be increasing (and >= 0 for "
+                                 f"a curvature measure): {edges}")
             edge_t = torch.tensor(edges, dtype=torch.float32)
         else:
             edge_t = torch.full((self.num_experts - 1,), float("nan"))
         self.register_buffer("bin_edges", edge_t)
         # 1 once pretrain_curvature_router.py has trained the router
         self.register_buffer("router_trained", torch.zeros((), dtype=torch.long))
+        # which measure the edges and the router belong to (index into MEASURES)
+        self.register_buffer("measure_code", torch.tensor(MEASURES.index(measure)))
         self.measure = measure
         self.expert_type = expert
         self.router_detach = bool(router_detach)
@@ -296,7 +369,7 @@ class CurvatureMoEClassifier(nn.Module):
     def edges(self) -> torch.Tensor:
         if not bool(torch.isfinite(self.bin_edges).all()):
             raise ValueError(
-                "curv_moe: curvature bin edges are unknown. Load a checkpoint written by "
+                "curv_moe: bin edges are unknown. Load a checkpoint written by "
                 "tools/clrbezier/pretrain_curvature_router.py (load_from), or set "
                 "curv_moe_cfg.bin_edges.")
         return self.bin_edges
@@ -312,11 +385,17 @@ class CurvatureMoEClassifier(nn.Module):
         and 5, length as a fraction of the rows, as get_lanes decodes it).
         """
         px, y_bottom, span = visible_lane_px(xs, y_start, length, prior_ys, img_w, n_strips)
-        c = lane_curvature(px, prior_ys, img_w, img_h, self.measure)
+        c = lane_measure(px, prior_ys, img_w, img_h, self.measure)
         edges = self.edges()
-        own_bin = curvature_bins(c, edges)
-        scale = float(edges[-1]) if edges.numel() and float(edges[-1]) > 0 else 1.0
-        z = (c / scale).clamp(-8.0, 8.0)
+        own_bin = measure_bins(c, edges, self.measure)
+        if self.measure == "angle":
+            z = (c - 90.0) / 45.0
+        elif self.measure == "x_bottom":
+            z = (c - 0.5 * img_w) / (0.5 * img_w)
+        else:
+            scale = float(edges[-1]) if edges.numel() and float(edges[-1]) > 0 else 1.0
+            z = c / scale
+        z = z.clamp(-8.0, 8.0)
         onehot = F.one_hot(own_bin, self.num_experts).float()
         feats = torch.cat([z[..., None], z.abs()[..., None], onehot,
                            y_bottom[..., None], span[..., None]], dim=-1)
@@ -371,8 +450,8 @@ class CurvatureMoEClassifier(nn.Module):
             nn.init.zeros_(last.bias)
 
     def lane_bins(self, xs_px, prior_ys, img_w, img_h):
-        values = lane_curvature(xs_px, prior_ys, img_w, img_h, self.measure)
-        return curvature_bins(values, self.edges()), values
+        values = lane_measure(xs_px, prior_ys, img_w, img_h, self.measure)
+        return measure_bins(values, self.edges(), self.measure), values
 
     def router_loss(self, router_logits, preds, gt_pad, gt_mask, prior_ys, img_w, img_h,
                     lane_width, iou_shape):
