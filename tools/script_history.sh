@@ -1657,7 +1657,7 @@ nohup env CUDA_VISIBLE_DEVICES=0 \
     > "$LOG" 2>&1 < /dev/null &
 
 
-CONFIG_NAME="clrbezier_anchored_pred_o2o_r34_batch_jitter_slotmoe"
+CONFIG_NAME="clrbezier_anchored_pred_o2o_r34_batch_jitter_slotexperts"
 MODEL_NAME="clrbezier"
 PORT=25000
 DATASET=culane
@@ -1665,6 +1665,24 @@ WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAM
 LOG="$WORK_DIR/train.log"
 mkdir -p "$WORK_DIR"
 nohup env CUDA_VISIBLE_DEVICES=0,1,2,3 PORT=$PORT \
+    bash tools/dist_train.sh \
+    /exhdd/seungyu/CLRBezierLane/configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py \
+    4 \
+    --work-dir "$WORK_DIR" \
+    > "$LOG" 2>&1 < /dev/null &
+TRAIN_PID=$!
+echo "Training launcher PID: $TRAIN_PID"
+disown -h "$TRAIN_PID"
+tail -f "$LOG"
+
+CONFIG_NAME="clrbezier_anchored_pred_o2m_r34_batch_jitter"
+MODEL_NAME="clrbezier"
+PORT=25001
+DATASET=culane
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/run1
+LOG="$WORK_DIR/train.log"
+mkdir -p "$WORK_DIR"
+nohup env CUDA_VISIBLE_DEVICES=4,5,6,7 PORT=$PORT \
     bash tools/dist_train.sh \
     /exhdd/seungyu/CLRBezierLane/configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py \
     4 \

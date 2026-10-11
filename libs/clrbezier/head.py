@@ -46,6 +46,7 @@ from .gliou import GeneralizedLaneIoULoss, pairwise_generalized_lane_iou
 from .modules import ROIGather, SegDecoder, linear_relu, pool_prior_features
 from .curv_moe import CurvatureMoEClassifier
 from .slot_experts import LaneSlotExperts, base_name
+from .diffusion import AnchorDiffusion
 from .moe import MoEGate
 from .priors import BezierPriorBank, StructuredPriorPerturbation
 
@@ -131,6 +132,7 @@ class CLRBezierHead(_OfficialHead):
         aux_cls_head=False,
         curv_moe_cfg=None,
         slot_expert_cfg=None,
+        diffusion_cfg=None,
         target_adapter=None,
         train_cfg=None,
         test_cfg=None,
@@ -640,6 +642,18 @@ class CLRBezierHead(_OfficialHead):
         else:
             self._register_load_state_dict_pre_hook(self._slot_experts_absent_hook)
 
+        # ---- truncated anchored diffusion (diffusion.py) ------------------------
+        # diffusion_cfg: None (default, off) or a dict for AnchorDiffusion. The
+        # main branch starts from noisy anchors (anchor + sigma(t) * eps on the
+        # control points and start y, t <= trunc_t), every stage's RoI feature is
+        # modulated by t, and inference runs DDIM steps of the whole cascade.
+        # Independent of perturb_cfg (the auxiliary branch's perturbation).
+        self.diffusion = None
+        if diffusion_cfg:
+            if self.cp_frame == "support":
+                raise ValueError("diffusion_cfg supports the global and anchored frames only")
+            self.diffusion = AnchorDiffusion(self.fc_hidden_dim, self.img_w, **dict(diffusion_cfg))
+
         self._init_clrernet_weights()
 
     # ======================================================================
@@ -689,6 +703,8 @@ class CLRBezierHead(_OfficialHead):
         if getattr(self, "slot_experts", None) is not None:
             # every expert starts as the base layers it replaces
             self.slot_experts.copy_from_base(self)
+        if getattr(self, "diffusion", None) is not None:
+            self.diffusion.zero_init()
         # MoE routers (deformable offsets, GSRC) start uniform; the Linear sweep
         # above had given them trunc_normal weights.
         for m in self.modules():
@@ -719,15 +735,26 @@ class CLRBezierHead(_OfficialHead):
     # ======================================================================
     # BRR refinement
     # ======================================================================
-    def _refine(self, feats, local_cp, context_tokens=None, num_groups=1, branch="main"):
-        """Returns (preds, states, extras); extras holds input_xs and re-projection stats."""
+    def _refine(self, feats, local_cp, context_tokens=None, num_groups=1, branch="main",
+                init_state=None, diff_t=None):
+        """Returns (preds, states, extras); extras holds input_xs and re-projection stats.
+
+        init_state: optional (cp_x [B, Q, 4], y_start [B, Q]) that replaces the
+        state of ``local_cp`` (diffusion: the noisy anchors). diff_t: [B, Q]
+        diffusion timestep of each query (the RoI features are modulated by it).
+        """
         batch_size, num_q = local_cp.shape[:2]
         one_row = 1.0 / float(self.n_strips)
         geo = dict(prior_ys=self.prior_ys, sample_x_indices=self.sample_x_indices,
                    img_w=self.img_w, img_h=self.img_h, n_strips=self.n_strips,
                    cp_frame=self.cp_frame, slope_grad=self.slope_grad)
 
-        if self.cp_frame == "support":
+        if init_state is not None:
+            # diffusion: the (noisy) anchor state, full height from its start
+            cp_x, y_start = init_state
+            length = y_start + one_row
+            frame_top = torch.zeros_like(y_start)
+        elif self.cp_frame == "support":
             cp_x, y_start, length, frame_top = support_state_from_local(
                 local_cp, self.cp_x_margin, self.n_strips, self.support_min_span, self.eps)
         else:
@@ -815,6 +842,8 @@ class CLRBezierHead(_OfficialHead):
                 roi = self.gsrc.inject(stage, roi, context_tokens)
             if query_mixer is not None and not in_gather:
                 roi = query_mixer(roi)
+            if diff_t is not None:
+                roi = self.diffusion.modulate(roi, diff_t)
             cls_roi = reg_roi = roi
             if self.lateral is not None and stage in self.lateral_stages:
                 evidence = self.lateral[str(stage)](feats[stage], prior_xs, self.prior_feat_ys)
@@ -912,6 +941,7 @@ class CLRBezierHead(_OfficialHead):
                 raw_x = cp_x.detach() + reg[..., 2:6]
                 states.append(torch.cat([raw_y.unsqueeze(-1), new_len.unsqueeze(-1), raw_x],
                                         dim=-1))
+            final_state = (new_x, new_y)
             out_xs = ref[..., 6:] + reg[..., 6:]
             if moe_main:
                 # hard top-1: each query is scored by its curvature bin's expert
@@ -966,7 +996,8 @@ class CLRBezierHead(_OfficialHead):
         return preds, states, dict(input_xs=input_xs or None, reproj=reproj_stats,
                                    precond=precond_stats, moe=moe_stats,
                                    curv=curv_logits, curv_in=curv_inputs, curv_rule=curv_rule,
-                                   curv_own=curv_own, slot=slot_routes)
+                                   curv_own=curv_own, slot=slot_routes,
+                                   final_state=final_state)
 
     def _curv_moe_load_hook(self, state_dict, prefix, local_metadata, strict, missing_keys,
                             unexpected_keys, error_msgs):
@@ -1214,7 +1245,12 @@ class CLRBezierHead(_OfficialHead):
         batch_size = feats[-1].shape[0]
         clean_cp = self.prior_bank(batch_size)
         tokens = self.gsrc_tokens(feats)
-        main_preds, main_states, main_extra = self._refine(feats, clean_cp, tokens)
+        if self.diffusion is not None:
+            init_state, diff_t, rollout = self._diffusion_train_input(feats, clean_cp, tokens)
+            main_preds, main_states, main_extra = self._refine(
+                feats, clean_cp, tokens, init_state=init_state, diff_t=diff_t)
+        else:
+            main_preds, main_states, main_extra = self._refine(feats, clean_cp, tokens)
         out = dict(main_preds=main_preds, main_states=main_states,
                    main_input_xs=main_extra["input_xs"], reproj=main_extra["reproj"],
                    precond=main_extra["precond"], moe=main_extra.get("moe", []))
@@ -1222,6 +1258,9 @@ class CLRBezierHead(_OfficialHead):
             out["moe_gsrc"] = dict(self.gsrc.last_stats)
         if main_extra.get("slot"):
             out["slot_routes"] = main_extra["slot"]
+        if self.diffusion is not None:
+            out["diffusion"] = dict(t_mean=diff_t.float().mean().detach(),
+                                    rollout=diff_t.new_tensor(float(rollout), dtype=torch.float32))
         if main_extra.get("curv"):
             out["curv_router_logits"] = main_extra["curv"]
             if not self._curv_warned:
@@ -1261,9 +1300,78 @@ class CLRBezierHead(_OfficialHead):
         return out
 
     def forward_test(self, feats):
-        preds, _, _ = self._refine(feats, self.prior_bank(feats[-1].shape[0]),
-                                self.gsrc_tokens(feats))
+        if self.diffusion is not None:
+            preds = self._diffusion_sample(feats)
+        else:
+            preds, _, _ = self._refine(feats, self.prior_bank(feats[-1].shape[0]),
+                                    self.gsrc_tokens(feats))
         return StagePredictions([self.to_official_pred_dict(p) for p in preds])
+
+    # ---- diffusion (diffusion_cfg) --------------------------------------------
+    def _anchor_state(self, local_cp):
+        """BRR state (cp_x [B, K, 4], y_start [B, K]) of the clean anchors."""
+        return globalize_local_cp(local_cp, self.cp_x_margin, self.eps, cp_frame=self.cp_frame,
+                                  legacy_tangent=self.legacy_anchored_prior)
+
+    def _diffusion_train_input(self, feats, clean_cp, tokens):
+        """Noisy anchors and their timesteps for the main branch, (x, y), t, rollout.
+
+        Without a rollout: anchor + sigma(t) * eps, t uniform in 0..T per query.
+        With one: the first k sampler steps run without gradient from anchor +
+        sigma(T) * eps, and the returned input is their DDIM output (it keeps
+        the live path from the anchor, so the prior bank still gets gradient).
+        """
+        dif = self.diffusion
+        one_row = 1.0 / float(self.n_strips)
+        kw = dict(margin=self.cp_x_margin, y_min=one_row)
+        cp_x, y0 = self._anchor_state(clean_cp)
+        eps_x = torch.randn_like(cp_x)
+        eps_y = torch.randn_like(y0)
+        steps = dif.sampler_steps()
+        # Drawn from the iteration number, so every DDP rank makes the same choice
+        # and runs the same number of head passes (safe with SyncBN).
+        g = torch.Generator().manual_seed(1000003 * int(self._step_cache) + 17)
+        rollout = (len(steps) > 1 and dif.rollout_prob > 0
+                   and float(torch.rand((), generator=g)) < dif.rollout_prob)
+        if not rollout:
+            t = dif.sample_t(y0.shape, y0.device)
+            return dif.perturb(cp_x, y0, t, eps_x, eps_y, **kw), t, False
+        k = int(torch.randint(1, len(steps), (), generator=g))
+        t = torch.full(y0.shape, steps[0], dtype=torch.long, device=y0.device)
+        x, y = dif.perturb(cp_x, y0, t, eps_x, eps_y, **kw)
+        for i in range(k):
+            with torch.no_grad(), self._frozen_bn_stats(True):
+                _, _, extra = self._refine(feats, clean_cp, tokens,
+                                           init_state=(x.detach(), y.detach()), diff_t=t)
+            x0, y0_hat = (v.detach() for v in extra["final_state"])
+            t_next = torch.full_like(t, steps[i + 1])
+            x, y = dif.ddim(x, y, x0, y0_hat, t, t_next, **kw)
+            t = t_next
+        return (x, y), t, True
+
+    def _diffusion_sample(self, feats):
+        """DDIM over the whole cascade; the last pass's stage predictions."""
+        dif = self.diffusion
+        one_row = 1.0 / float(self.n_strips)
+        kw = dict(margin=self.cp_x_margin, y_min=one_row)
+        clean_cp = self.prior_bank(feats[-1].shape[0])
+        tokens = self.gsrc_tokens(feats)
+        x, y = self._anchor_state(clean_cp)
+        steps = dif.sampler_steps()
+        t = torch.full(y.shape, steps[0], dtype=torch.long, device=y.device)
+        if dif.infer_noise:
+            g = torch.Generator(device=y.device).manual_seed(dif.infer_seed)
+            eps_x = torch.randn(x.shape, generator=g, device=x.device, dtype=x.dtype)
+            eps_y = torch.randn(y.shape, generator=g, device=y.device, dtype=y.dtype)
+            x, y = dif.perturb(x, y, t, eps_x, eps_y, **kw)
+        preds = None
+        for i in range(len(steps)):
+            preds, _, extra = self._refine(feats, clean_cp, tokens, init_state=(x, y), diff_t=t)
+            if i + 1 < len(steps):
+                t_next = torch.full_like(t, steps[i + 1])
+                x, y = dif.ddim(x, y, *extra["final_state"], t, t_next, **kw)
+                t = t_next
+        return preds
 
     @staticmethod
     def to_official_pred_dict(pred):
@@ -1384,6 +1492,9 @@ class CLRBezierHead(_OfficialHead):
             diag.update(curv_stats)
             diag["curv_router_ce"] = curv_loss.detach()
 
+        if outs.get("diffusion"):
+            diag["diff_t_mean"] = outs["diffusion"]["t_mean"]
+            diag["diff_rollout"] = outs["diffusion"]["rollout"]
         if outs.get("slot_routes"):
             # share of the main queries each slot expert ran at the last stage
             last = outs["slot_routes"][-1].reshape(-1)
