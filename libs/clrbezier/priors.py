@@ -118,15 +118,19 @@ class BezierPriorBank(nn.Module):
     """Fixed prior layout + small learnable delta (V11: learnable_pos_prior=False,
     allow_small_delta=True, prior_delta_scale=0.1).
 
-    ``param`` sets how ``delta`` moves the control points:
-      "sigmoid" (default): cp = sigmoid(prior_logits + delta_scale * delta),
-          clamped to [eps, 1 - eps]. A unit step moves a point by
-          delta_scale * p(1 - p), and a point on the image border gets no
-          gradient at all.
-      "linear": cp = prior_cp + delta_scale * delta, the same step for every
-          point (delta_scale = 1 is CLRerNet's embedding update). x is kept in
-          [-x_margin, 1 + x_margin] (the head's cp_x_margin) and the y end
-          points in [eps, 1 - eps], with clamps that let a point come back.
+    ``param`` sets what ``delta`` moves:
+      "sigmoid" (default): the support-local control points,
+          cp = sigmoid(prior_logits + delta_scale * delta), clamped to
+          [eps, 1 - eps]. A unit step moves a point by delta_scale * p(1 - p),
+          and a point on the image border gets no gradient at all.
+      "linear": the head's own anchor state, 4 global control-point x's and the
+          start y (global / anchored frames): state = state(prior_cp) +
+          delta_scale * delta, see ``state_offset`` and CLRBezierHead._anchor_state.
+          Every prior moves by the same step (delta_scale = 1 is CLRerNet's
+          embedding update). Acting on the state matters: a prior whose visible
+          support is a few rows long has its global curve extrapolated from that
+          short piece, so a step on its local points would move the curve
+          thousands of times further.
     The two store different buffers (prior_logits / prior_cp), and a checkpoint
     of one refuses to load into the other.
     """
@@ -134,7 +138,7 @@ class BezierPriorBank(nn.Module):
     PARAMS = ("sigmoid", "linear")
 
     def __init__(self, num_priors, img_w, img_h, delta_scale=0.1, eps=1e-4,
-                 visible_only=True, min_support=1.0 / 71.0, param="sigmoid", x_margin=0.5):
+                 visible_only=True, min_support=1.0 / 71.0, param="sigmoid"):
         super().__init__()
         if param not in self.PARAMS:
             raise ValueError(f"prior_cfg.param must be one of {self.PARAMS}, got {param!r}")
@@ -142,15 +146,19 @@ class BezierPriorBank(nn.Module):
         self.delta_scale = float(delta_scale)
         self.eps = float(eps)
         self.param = param
-        self.x_margin = float(x_margin)
         cp = clrernet_style_bezier_priors(num_priors, img_w, img_h, eps, visible_only, min_support)
         cp = project_support_y(cp, eps)
         cp = cp.clamp(eps, 1.0 - eps).reshape(self.num_priors, 8)
         if param == "linear":
-            self.register_buffer("prior_cp", cp)
+            # the layout stays fixed; delta is the offset of each prior's state
+            # (cp_x 0..3, y_start). Middle y's re-derived from the clamped end
+            # points, as the sigmoid bank's forward does.
+            cp = project_support_y(cp.view(self.num_priors, 4, 2), eps)
+            self.register_buffer("prior_cp", cp.clamp(eps, 1.0 - eps).reshape(self.num_priors, 8))
+            self.prior_delta = nn.Parameter(cp.new_zeros(self.num_priors, 5))
         else:
             self.register_buffer("prior_logits", inverse_sigmoid(cp, eps=1e-12))
-        self.prior_delta = nn.Parameter(torch.zeros_like(cp))
+            self.prior_delta = nn.Parameter(torch.zeros_like(cp))
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         other = "prior_logits" if self.param == "linear" else "prior_cp"
@@ -161,15 +169,25 @@ class BezierPriorBank(nn.Module):
                 f"'{saved}', but the config sets '{self.param}'. Its prior_delta is in "
                 f"different units, so use param='{saved}' for this checkpoint, or train "
                 f"from scratch (load_from=None).")
+        key = prefix + "prior_delta"
+        if self.param == "linear" and key in state_dict \
+                and tuple(state_dict[key].shape) != tuple(self.prior_delta.shape):
+            raise RuntimeError(
+                f"{key}: shape {tuple(state_dict[key].shape)}, expected "
+                f"{tuple(self.prior_delta.shape)}. This checkpoint comes from the first "
+                f"linear_prior.patch, whose delta moved the support-local control points; "
+                f"evaluate it with that code, or train from scratch.")
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
+    def state_offset(self):
+        """"linear": the learned offset of each prior's state, (cp_x [K, 4], y_start [K])."""
+        d = self.delta_scale * self.prior_delta
+        return d[:, :4], d[:, 4]
+
     def forward(self, batch_size):
-        """Clean support-local CPs [B, K, 4, 2]."""
+        """Clean support-local CPs [B, K, 4, 2] ("linear": the fixed layout)."""
         if self.param == "linear":
-            cp = (self.prior_cp + self.delta_scale * self.prior_delta).view(self.num_priors, 4, 2)
-            x = inward_clamp(cp[..., 0], -self.x_margin, 1.0 + self.x_margin)
-            y = inward_clamp(cp[..., 1], self.eps, 1.0 - self.eps)
-            cp = project_support_y(torch.stack((x, y), dim=-1), self.eps)
+            cp = self.prior_cp.view(self.num_priors, 4, 2)
             return cp.unsqueeze(0).expand(batch_size, -1, -1, -1).float()
         logits = self.prior_logits + self.delta_scale * self.prior_delta
         cp = torch.sigmoid(logits.view(self.num_priors, 4, 2))

@@ -48,7 +48,7 @@ from .curv_moe import CurvatureMoEClassifier
 from .slot_experts import LaneSlotExperts, base_name
 from .diffusion import AnchorDiffusion
 from .moe import MoEGate
-from .priors import BezierPriorBank, StructuredPriorPerturbation
+from .priors import BezierPriorBank, StructuredPriorPerturbation, inward_clamp
 
 
 def _resolve_official_head():
@@ -179,13 +179,13 @@ class CLRBezierHead(_OfficialHead):
         self.eps = float(prior_cfg.get("eps", 1e-4))
         self.cp_x_margin = float(brr_cfg.get("cp_x_margin", 0.5))
         # prior_cfg.param: "sigmoid" (default) or "linear" prior update, see
-        # BezierPriorBank. The linear bank keeps x within the same margin.
+        # BezierPriorBank; "linear" moves the anchor state (_anchor_state).
         self.prior_bank = BezierPriorBank(
             self.num_priors, self.img_w, self.img_h,
             delta_scale=prior_cfg.get("delta_scale", 0.1), eps=self.eps,
             visible_only=prior_cfg.get("visible_only", True),
             min_support=prior_cfg.get("min_support", 1.0 / self.n_strips),
-            param=prior_cfg.get("param", "sigmoid"), x_margin=self.cp_x_margin)
+            param=prior_cfg.get("param", "sigmoid"))
         # Where the four control points live.
         #   "global"   : image y = 0, 1/3, 2/3, 1 — the curve's domain is the
         #                whole image however short the lane is.
@@ -197,6 +197,10 @@ class CLRBezierHead(_OfficialHead):
         self.cp_frame = str(cp_frame)
         if self.cp_frame not in ("global", "anchored", "support"):
             raise ValueError("cp_frame must be 'global', 'anchored' or 'support'")
+        if self.prior_bank.param == "linear" and self.cp_frame == "support":
+            raise ValueError("prior_cfg.param='linear' moves the global/anchored anchor "
+                             "state, which cp_frame 'support' does not have; use cp_frame "
+                             "'global' or 'anchored', or param='sigmoid'")
         if self.cp_frame != "global" and reproject_cfg:
             # ReferenceReprojector refits control points on the fixed global
             # basis; it would silently write global-frame points into an
@@ -761,9 +765,7 @@ class CLRBezierHead(_OfficialHead):
             cp_x, y_start, length, frame_top = support_state_from_local(
                 local_cp, self.cp_x_margin, self.n_strips, self.support_min_span, self.eps)
         else:
-            cp_x, y_start = globalize_local_cp(local_cp, self.cp_x_margin, self.eps,
-                                               cp_frame=self.cp_frame,
-                                               legacy_tangent=self.legacy_anchored_prior)
+            cp_x, y_start = self._anchor_state(local_cp)
             # full height from the start; also the anchored frame's own extent
             length = y_start + one_row
             frame_top = torch.zeros_like(y_start)
@@ -1323,9 +1325,21 @@ class CLRBezierHead(_OfficialHead):
 
     # ---- diffusion (diffusion_cfg) --------------------------------------------
     def _anchor_state(self, local_cp):
-        """BRR state (cp_x [B, K, 4], y_start [B, K]) of the clean anchors."""
-        return globalize_local_cp(local_cp, self.cp_x_margin, self.eps, cp_frame=self.cp_frame,
-                                  legacy_tangent=self.legacy_anchored_prior)
+        """BRR state (cp_x [B, K, 4], y_start [B, K]) of the anchors (global /
+        anchored frames). With prior_cfg.param="linear" it adds each prior's
+        learned offset, clamped to the ranges the cascade keeps
+        ([-cp_x_margin, 1 + cp_x_margin], start y in [one row, 1]) by clamps that
+        let a value pushed against the bound come back."""
+        cp_x, y_start = globalize_local_cp(local_cp, self.cp_x_margin, self.eps,
+                                           cp_frame=self.cp_frame,
+                                           legacy_tangent=self.legacy_anchored_prior)
+        if self.prior_bank.param == "linear":
+            off_x, off_y = self.prior_bank.state_offset()
+            cp_x = inward_clamp(cp_x + off_x.to(cp_x.dtype), -self.cp_x_margin,
+                                1.0 + self.cp_x_margin)
+            y_start = inward_clamp(y_start + off_y.to(y_start.dtype),
+                                   1.0 / float(self.n_strips), 1.0)
+        return cp_x, y_start
 
     def _diffusion_train_input(self, feats, clean_cp, tokens):
         """Noisy anchors and their timesteps for the main branch, (x, y), t, rollout.
