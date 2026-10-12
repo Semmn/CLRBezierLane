@@ -47,6 +47,7 @@ from .modules import ROIGather, SegDecoder, linear_relu, pool_prior_features
 from .curv_moe import CurvatureMoEClassifier
 from .slot_experts import LaneSlotExperts, base_name
 from .diffusion import AnchorDiffusion
+from .dedup import LearnedLaneNMS
 from .moe import MoEGate
 from .priors import BezierPriorBank, StructuredPriorPerturbation, inward_clamp
 
@@ -133,6 +134,7 @@ class CLRBezierHead(_OfficialHead):
         curv_moe_cfg=None,
         slot_expert_cfg=None,
         diffusion_cfg=None,
+        dedup_cfg=None,
         target_adapter=None,
         train_cfg=None,
         test_cfg=None,
@@ -416,6 +418,39 @@ class CLRBezierHead(_OfficialHead):
             "assigner_weights", [1.0] * len(self.aux_assigners))]
         stage_ids = aux_cfg.get("stage_assigner_ids", {0: [0], 1: [0], 2: [1]})
         self.aux_stage_assigner_ids = {int(k): [int(i) for i in v] for k, v in dict(stage_ids).items()}
+        # Group one-to-one (Group DETR): aux_cfg.group_o2o matches every perturbed
+        # group on its own with a one-to-one assigner, as if each group were the
+        # main branch, so the classifier the aux queries share with the main
+        # branch (aux_cls_head=False) is trained with one-to-one targets only.
+        #   assigner : one-to-one assigner (default: main_assigner, so the groups
+        #              and the main branch use one cost)
+        #   stages   : aux stages it applies to (default: aux_cfg.stages)
+        #   o2m      : "reg" (default) keeps the o2m assigners above for the aux
+        #              regression losses and drops their classification loss;
+        #              "off" drops them, the groups give both losses
+        #   weight   : multiplies the aux loss weights for the group losses
+        self.aux_group_o2o = None
+        group_cfg = aux_cfg.get("group_o2o") if aux_given else None
+        if group_cfg is not None:
+            group_cfg = dict(group_cfg)
+            unknown = set(group_cfg) - {"assigner", "stages", "o2m", "weight"}
+            if unknown:
+                raise ValueError(f"aux_cfg.group_o2o: unknown keys {sorted(unknown)}")
+            if not bool(aux_cfg.get("enabled", True)):
+                raise ValueError("aux_cfg.group_o2o needs the aux branch (aux_cfg.enabled)")
+            o2m = str(group_cfg.get("o2m", "reg"))
+            if o2m not in ("reg", "off"):
+                raise ValueError("aux_cfg.group_o2o.o2m must be 'reg' or 'off'")
+            assigner_cfg = group_cfg.get("assigner")
+            if assigner_cfg is None:
+                assigner_cfg = dict(main_assigner or dict(type="HungarianLaneAssigner"))
+                if assigner_cfg.get("type") != "HungarianLaneAssigner":
+                    raise ValueError("aux_cfg.group_o2o: main_assigner is not one-to-one; "
+                                     "give group_o2o.assigner")
+            self.aux_group_assigner = build_lane_assigner(assigner_cfg)
+            self.aux_group_o2o = dict(
+                o2m=o2m, weight=float(group_cfg.get("weight", 1.0)),
+                stages=[int(v) for v in group_cfg.get("stages", aux_cfg.get("stages", [0, 1, 2]))])
         self.aux_cls_loss_weight = float(aux_cfg.get("cls_loss_weight", 0.5))
         self.aux_reg_loss_weight = float(aux_cfg.get("reg_loss_weight", 0.5))
         self.aux_noise_t = int(aux_cfg.get("noise_t", 50))
@@ -661,13 +696,81 @@ class CLRBezierHead(_OfficialHead):
                 raise ValueError("diffusion_cfg supports the global and anchored frames only")
             self.diffusion = AnchorDiffusion(self.fc_hidden_dim, self.img_w, **dict(diffusion_cfg))
 
+        # ---- learned NMS (dedup.py) ---------------------------------------------
+        # dedup_cfg: None (default, off) or a dict. A small o2o head after the last
+        # stage corrects each o2m logit from its higher-scored neighbours and is
+        # trained with a one-to-one target; its inputs are detached, so the o2m
+        # head trains as without it.
+        #   train_mode  : "joint" (default) adds loss_dedup to the usual losses;
+        #                 "dedup_only" trains the dedup head alone on a loaded
+        #                 checkpoint: the rest of the head runs as at test time
+        #                 (eval mode, no gradient) and is frozen
+        #   target      : "o2m_top1" (default): per GT, the o2m positive (last-stage
+        #                 main assigner) with the lowest cost, so the o2o positive is
+        #                 always the o2m head's best match (YOLOv10's consistent
+        #                 matching); "hungarian": a one-to-one assigner on the
+        #                 last-stage predictions (assigner, default the main
+        #                 assigner's cost weights)
+        #   use_at_test : replace the last stage's scores with the corrected ones
+        #   test_topk   : without NMS, keep this many top-scored lanes per image
+        #                 (default test_cfg.nms_topk, the cap NMS applies)
+        #   loss_weight, bg_weight (weight of the 0 targets, default 1.0), hidden,
+        #   num_neighbors, dist_scale (px, default 50 = test_cfg.nms_thres)
+        self.dedup = None
+        if dedup_cfg is not None:
+            cfg = dict(dedup_cfg)
+            known = {"train_mode", "target", "assigner", "use_at_test", "test_topk",
+                     "loss_weight", "bg_weight", "hidden", "num_neighbors", "dist_scale"}
+            unknown = set(cfg) - known
+            if unknown:
+                raise ValueError(f"dedup_cfg: unknown keys {sorted(unknown)}")
+            if self.diffusion is not None:
+                raise ValueError("dedup_cfg cannot be combined with diffusion_cfg")
+            self.dedup_train_mode = str(cfg.get("train_mode", "joint"))
+            if self.dedup_train_mode not in ("joint", "dedup_only"):
+                raise ValueError("dedup_cfg.train_mode must be 'joint' or 'dedup_only'")
+            self.dedup_target = str(cfg.get("target", "o2m_top1"))
+            if self.dedup_target not in ("o2m_top1", "hungarian"):
+                raise ValueError("dedup_cfg.target must be 'o2m_top1' or 'hungarian'")
+            last = self._main_pairs(self.refine_layers - 1)[0][0]
+            self.dedup_assigner = None
+            if self.dedup_target == "hungarian":
+                self.dedup_assigner = build_lane_assigner(cfg.get("assigner") or dict(
+                    type="HungarianLaneAssigner", cls_weight=last.cls_weight,
+                    point_weight=last.point_weight, iou_weight=last.iou_weight))
+            elif cfg.get("assigner") is not None:
+                raise ValueError("dedup_cfg.assigner is used with target='hungarian' only")
+            self.dedup_use_at_test = bool(cfg.get("use_at_test", True))
+            topk = cfg.get("test_topk")
+            self.dedup_test_topk = None if topk is None else int(topk)
+            self.dedup_loss_weight = float(cfg.get("loss_weight", 1.0))
+            # 1.0: calibrated keep/suppress probabilities. A down-weighted
+            # background (cls_bg_weight) would push duplicates above threshold.
+            self.dedup_bg_weight = float(cfg.get("bg_weight", 1.0))
+            # Built on a forked RNG and left out of _init_clrernet_weights, so the
+            # rest of the head is initialized exactly as without it.
+            with torch.random.fork_rng(devices=[]):
+                self.dedup = LearnedLaneNMS(
+                    self.fc_hidden_dim, self.n_strips, self.img_w,
+                    hidden=int(cfg.get("hidden", 32)),
+                    num_neighbors=int(cfg.get("num_neighbors", 16)),
+                    dist_scale=float(cfg.get("dist_scale", 50.0)))
+            if self.dedup_train_mode == "dedup_only":
+                for name, p in self.named_parameters():
+                    if not name.startswith("dedup."):
+                        p.requires_grad_(False)
+
         self._init_clrernet_weights()
 
     # ======================================================================
     # Initialization (official CLRerNet policy, as in V11)
     # ======================================================================
     def _init_clrernet_weights(self):
+        dedup = getattr(self, "dedup", None)
+        skip = set(dedup.modules()) if dedup is not None else set()
         for m in self.modules():
+            if m in skip:
+                continue
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
                 if m.bias is not None:
@@ -772,6 +875,7 @@ class CLRBezierHead(_OfficialHead):
         _, on_map = brr_reference(cp_x, y_start, length, **geo, frame_top=frame_top)
 
         pooled_stages, preds, states = [], [], []
+        last_roi = None
         input_xs, reproj_stats, precond_stats, moe_stats = [], [], [], []
         curv_logits, curv_inputs, curv_rule, curv_own = [], [], [], []
         moe_main = self.curv_moe is not None and branch == "main"
@@ -850,6 +954,8 @@ class CLRBezierHead(_OfficialHead):
             if diff_t is not None:
                 roi = self.diffusion.modulate(roi, diff_t)
             cls_roi = reg_roi = roi
+            if stage == self.refine_layers - 1:
+                last_roi = roi.reshape(batch_size, num_q, -1)
             if self.lateral is not None and stage in self.lateral_stages:
                 evidence = self.lateral[str(stage)](feats[stage], prior_xs, self.prior_feat_ys)
                 module = self.lateral[str(stage)]
@@ -1002,7 +1108,7 @@ class CLRBezierHead(_OfficialHead):
                                    precond=precond_stats, moe=moe_stats,
                                    curv=curv_logits, curv_in=curv_inputs, curv_rule=curv_rule,
                                    curv_own=curv_own, slot=slot_routes,
-                                   final_state=final_state)
+                                   final_state=final_state, last_roi=last_roi)
 
     def _curv_moe_load_hook(self, state_dict, prefix, local_metadata, strict, missing_keys,
                             unexpected_keys, error_msgs):
@@ -1258,6 +1364,8 @@ class CLRBezierHead(_OfficialHead):
                 m.training = mode
 
     def forward_train(self, feats):
+        if self.dedup is not None and self.dedup_train_mode == "dedup_only":
+            return self._forward_dedup_only(feats)
         batch_size = feats[-1].shape[0]
         clean_cp = self.prior_bank(batch_size)
         tokens = self.gsrc_tokens(feats)
@@ -1270,6 +1378,8 @@ class CLRBezierHead(_OfficialHead):
         out = dict(main_preds=main_preds, main_states=main_states,
                    main_input_xs=main_extra["input_xs"], reproj=main_extra["reproj"],
                    precond=main_extra["precond"], moe=main_extra.get("moe", []))
+        if self.dedup is not None:
+            out["dedup_delta"] = self.dedup(main_preds[-1], main_extra["last_roi"])
         if self.gsrc is not None and getattr(self.gsrc, "last_stats", None):
             out["moe_gsrc"] = dict(self.gsrc.last_stats)
         if main_extra.get("slot"):
@@ -1319,9 +1429,94 @@ class CLRBezierHead(_OfficialHead):
         if self.diffusion is not None:
             preds = self._diffusion_sample(feats)
         else:
-            preds, _, _ = self._refine(feats, self.prior_bank(feats[-1].shape[0]),
-                                    self.gsrc_tokens(feats))
+            preds, _, extra = self._refine(feats, self.prior_bank(feats[-1].shape[0]),
+                                           self.gsrc_tokens(feats))
+            if self.dedup is not None and self.dedup_use_at_test:
+                preds = list(preds)
+                preds[-1] = self._dedup_scores(preds[-1], extra["last_roi"])
         return StagePredictions([self.to_official_pred_dict(p) for p in preds])
+
+    # ---- learned NMS (dedup_cfg) ----------------------------------------------
+    def _forward_dedup_only(self, feats):
+        """dedup_cfg.train_mode="dedup_only": the head runs as at test time
+        (eval mode, no gradient); only the dedup head trains."""
+        with torch.no_grad(), self._as_eval():
+            preds, _, extra = self._refine(feats, self.prior_bank(feats[-1].shape[0]),
+                                           self.gsrc_tokens(feats))
+        return dict(main_preds=preds, dedup_delta=self.dedup(preds[-1], extra["last_roi"]))
+
+    def _dedup_logits(self, pred, delta):
+        """o2m logits of the last stage with the dedup correction on class 1."""
+        return pred[..., :2].detach().float() + torch.stack([torch.zeros_like(delta), delta], -1)
+
+    def _dedup_scores(self, pred, roi):
+        """Last-stage predictions with the dedup scores (test time)."""
+        logits = self._dedup_logits(pred, self.dedup(pred, roi))
+        topk = self.dedup_test_topk
+        cfg = self.test_cfg or {}
+        if topk is None and not cfg.get("use_nms", True):
+            topk = cfg.get("nms_topk")
+        if topk is not None and 0 < int(topk) < logits.shape[1]:
+            # without NMS, keep the top-k lanes per image (the cap NMS applies)
+            margin = logits[..., 1] - logits[..., 0]
+            keep = torch.zeros_like(margin, dtype=torch.bool)
+            keep.scatter_(1, margin.topk(int(topk), dim=1).indices, True)
+            logits = torch.stack([logits[..., 0],
+                                  torch.where(keep, logits[..., 1], logits[..., 1] - 1e4)], -1)
+        return torch.cat([logits.to(pred.dtype), pred[..., 2:]], dim=-1)
+
+    @torch.no_grad()
+    def _dedup_targets(self, preds, valid_targets):
+        """One-to-one targets of the last-stage predictions [B, Q] (dedup_cfg.target),
+        and the o2m positives that are not the kept one (o2m_top1 only)."""
+        batch_size, num_q = preds.shape[:2]
+        dev = preds.device
+        target = torch.zeros((batch_size, num_q), dtype=torch.long, device=dev)
+        dup = torch.zeros((batch_size, num_q), dtype=torch.bool, device=dev)
+        assigner = (self.dedup_assigner if self.dedup_target == "hungarian"
+                    else self._main_pairs(self.refine_layers - 1)[0][0])
+        for b, gt in enumerate(valid_targets):
+            if gt.shape[0] == 0:
+                continue
+            cache = build_cost_cache(preds[b], gt, self.img_w, self.img_h, self.lane_width,
+                                     self.lane_width_cost, assigner.required_cache_keys,
+                                     iou_fns=self.iou_fns, iou_shape=(self.iou_w, self.iou_h))
+            rows, cols = assigner.assign(cache)
+            if rows.numel() == 0:
+                continue
+            if self.dedup_target == "hungarian":
+                target[b, rows] = 1
+                continue
+            # o2m_top1: the o2m positive with the lowest cost for each GT
+            cost = assigner.total_cost(cache)[rows, cols]
+            dup[b, rows] = True
+            for g in torch.unique(cols).tolist():
+                sel = cols == g
+                best = rows[sel][torch.argmin(cost[sel])]
+                target[b, best] = 1
+                dup[b, best] = False
+        return target, dup
+
+    def _dedup_loss(self, outs, valid_targets):
+        """Cross-entropy of the corrected last-stage scores against a one-to-one
+        target (dedup_cfg.target), per-image mean as the classification loss."""
+        preds = outs["main_preds"][-1].detach()
+        logits = self._dedup_logits(preds, outs["dedup_delta"])
+        batch_size, num_q = logits.shape[:2]
+        target, dup = self._dedup_targets(preds, valid_targets)
+        weight = torch.where(target == 1, logits.new_tensor(1.0),
+                             logits.new_tensor(self.dedup_bg_weight))
+        ce = F.cross_entropy(logits.reshape(-1, 2), target.reshape(-1),
+                             reduction="none").view(batch_size, num_q)
+        loss = ((ce * weight).sum(-1) / weight.sum(-1).clamp_min(1.0)).mean()
+        with torch.no_grad():
+            prob = torch.softmax(logits, dim=-1)[..., 1]
+            pos = target == 1
+            diag = dict(
+                dedup_num_pos=pos.sum().float(),
+                dedup_pos_prob=prob[pos].mean() if bool(pos.any()) else prob.new_zeros(()),
+                dedup_dup_prob=prob[dup].mean() if bool(dup.any()) else prob.new_zeros(()))
+        return loss * self.dedup_loss_weight, diag
 
     # ---- diffusion (diffusion_cfg) --------------------------------------------
     def _anchor_state(self, local_cp):
@@ -1431,7 +1626,7 @@ class CLRBezierHead(_OfficialHead):
         device = feats[0].device
         lanes = self.target_adapter.extract_lanes(batch_data_samples, device)
         seg_gt = None
-        if self.seg_loss_weight > 0:
+        if self.seg_loss_weight > 0 and "seg" in outs:
             seg_gt = self.target_adapter.extract_seg(batch_data_samples, device, outs["seg"].shape[-2:])
         return self.loss_by_outputs(outs, lanes, seg_gt)
 
@@ -1444,6 +1639,9 @@ class CLRBezierHead(_OfficialHead):
 
     def loss_by_outputs(self, outs, lanes, seg_gt=None):
         valid_targets = [t[t[:, 1] == 1] for t in lanes]
+        if self.dedup is not None and self.dedup_train_mode == "dedup_only":
+            loss, diag = self._dedup_loss(outs, valid_targets)
+            return dict(loss_dedup=loss, **diag)
         layout = GTLayout(valid_targets, outs["main_preds"][0].device)
         fit_frame = "global" if self.brr_cp_loss_space == "global" else self.cp_frame
         # Every lane is fitted independently, so one call covers the batch.
@@ -1497,19 +1695,33 @@ class CLRBezierHead(_OfficialHead):
             if balances:
                 moe_balance = torch.stack([b.reshape(()) for b in balances]).mean()
 
-        if "aux_preds" in outs:
+        group = self.aux_group_o2o
+        if "aux_preds" in outs and (group is None or group["o2m"] == "reg"):
             aux = self._branch_losses(outs["aux_preds"], outs["aux_states"], valid_targets, gt_cps,
                                       self._aux_pairs, self.aux_stages, apply_brr=self.aux_apply_brr,
                                       cls_target_mode=self.aux_cls_target_mode,
                                       gate=self.aux_gate, input_xs=outs.get("aux_input_xs"),
                                       layout=layout, gt_flat=gt_flat)
-            cls = cls + self.aux_cls_loss_weight * aux["cls"]
+            if group is None:
+                # with group_o2o the o2m assigners supervise the regression only
+                cls = cls + self.aux_cls_loss_weight * aux["cls"]
             iou = iou + self.aux_reg_loss_weight * aux["iou"]
             sup = sup + self.aux_reg_loss_weight * aux["support"]
             cp = cp + self.aux_reg_loss_weight * aux["cp"]
             diag.update(aux_iou=aux["iou"].detach(), aux_num_pos=aux["num_pos"],
                         aux_conf_iou_l1=aux["conf_iou_l1"],
                         aux_conf_iou_rank=aux["conf_iou_rank"])
+        if "aux_preds" in outs and group is not None:
+            grp = self._group_o2o_losses(outs, valid_targets, gt_cps, gt_flat)
+            w = group["weight"]
+            cls = cls + w * self.aux_cls_loss_weight * grp["cls"]
+            if group["o2m"] == "off":
+                iou = iou + w * self.aux_reg_loss_weight * grp["iou"]
+                sup = sup + w * self.aux_reg_loss_weight * grp["support"]
+                cp = cp + w * self.aux_reg_loss_weight * grp["cp"]
+            diag.update(group_iou=grp["iou"].detach(), group_num_pos=grp["num_pos"],
+                        group_conf_iou_l1=grp["conf_iou_l1"],
+                        group_conf_iou_rank=grp["conf_iou_rank"])
 
         curv_loss = None
         if self.curv_moe is not None and "curv_router_logits" in outs:
@@ -1548,6 +1760,9 @@ class CLRBezierHead(_OfficialHead):
         )
         if rank is not None:
             losses["loss_rank"] = rank * self.rank_loss_weight
+        if self.dedup is not None and "dedup_delta" in outs:
+            losses["loss_dedup"], dedup_diag = self._dedup_loss(outs, valid_targets)
+            diag.update(dedup_diag)
         if curv_loss is not None and not self.curv_moe.freeze_router:
             losses["loss_curv_router"] = curv_loss * self.curv_moe.router_loss_weight
         if moe_balance is not None:
@@ -1563,6 +1778,43 @@ class CLRBezierHead(_OfficialHead):
         # Keys without "loss" are logged but not summed by mmengine.
         losses.update(diag)
         return losses
+
+    def _group_o2o_losses(self, outs, valid_targets, gt_cps, gt_flat):
+        """aux_cfg.group_o2o: each perturbed group matched on its own, as an image.
+
+        The aux outputs are [B, m*K, ...] with the m groups of an image side by
+        side (forward_train); [B*m, K, ...] puts every group in its own row, and
+        each row gets its image's GT lanes.
+        """
+        m = self.aux_num_groups
+        batch_size = len(valid_targets)
+
+        def split(t):
+            return t.reshape(batch_size * m, t.shape[1] // m, *t.shape[2:])
+
+        preds = [split(p) for p in outs["aux_preds"]]
+        states = [split(s) for s in outs["aux_states"]]
+        input_xs = outs.get("aux_input_xs")
+        input_xs = [split(x) for x in input_xs] if input_xs else None
+        targets = [t for t in valid_targets for _ in range(m)]
+        device = preds[0].device
+        counts = [int(t.shape[0]) for t in valid_targets]
+        offsets = [sum(counts[:b]) for b in range(batch_size)]
+        idx = torch.tensor([offsets[b] + i for b in range(batch_size) for _ in range(m)
+                            for i in range(counts[b])], dtype=torch.long, device=device)
+        layout = GTLayout(targets, device)
+        flat = tuple(x[idx] for x in gt_flat)
+        cps = [gt_cps[b] for b in range(batch_size) for _ in range(m)]
+        stages = self.aux_group_o2o["stages"]
+        pairs = [(self.aux_group_assigner, 1.0)]
+
+        def pairs_fn(stage):
+            return pairs if stage in stages else []
+
+        return self._branch_losses(preds, states, targets, cps, pairs_fn, stages,
+                                   apply_brr=self.aux_apply_brr,
+                                   cls_target_mode=self.aux_cls_target_mode, gate=self.aux_gate,
+                                   input_xs=input_xs, layout=layout, gt_flat=flat)
 
     def _rank_loss(self, preds, valid_targets):
         """Pairwise ranking over the candidates NMS will compare.

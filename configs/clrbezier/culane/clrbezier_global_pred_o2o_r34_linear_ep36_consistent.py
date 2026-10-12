@@ -1,16 +1,7 @@
-# Truncated anchored diffusion (bbox_head.diffusion_cfg, libs/clrbezier/diffusion.py)
-# on the O2M jitter config, trained from scratch with the same 20-epoch schedule,
-# so it compares directly with clrbezier_anchored_pred_o2m_r34_batch_jitter.py.
-#
-# Training: the main branch starts from noisy anchors, anchor + sigma(t) * eps on
-# the 4 control-point x's and the start y, t uniform in 0..trunc_t. The noise is
-# centred on each anchor (no DDPM shrink), so a noisy anchor stays local; at
-# t = trunc_t its std is sigma_x_px in x and sigma_y in start y. The cascade
-# predicts the clean lane and its score; a zero-initialised timestep embedding
-# scales and shifts every stage's RoI feature. Assignment is unchanged: SimOTA on
-# each stage's predictions.
-# Inference: DDIM over the whole cascade at infer_steps timesteps from the clean
-# anchors (t = 50 -> 25 with 2 steps). infer_steps=1 costs what the base costs.
+# Consistent matching (YOLOv10) on the 36-epoch linear-prior o2o setup with one
+# aux SimOTA: the main one-to-one Hungarian uses the SimOTA cost (cls 1, iou 3,
+# point 0) at every stage, so the query the o2o branch keeps for a GT is the one
+# the o2m branch ranks first. The aux keeps its own cls layer (aux_cls_head=True).
 _base_ = [
     "dataset_culane_clrernet.py",
     "../../_base_/default_runtime.py"
@@ -31,12 +22,9 @@ custom_imports = dict(
     ],
     allow_failed_imports=False,
 )
-cfg_name = "clrbezier_anchored_pred_o2o_r34_linear.py"
+cfg_name = "clrbezier_global_pred_o2o_r34_linear_ep36_consistent.py"
 
 img_w, img_h, num_points = 800, 320, 72
-
-_o2m = dict(type="SimOTALaneAssigner", candidate_topk=4, min_dynamic_k=1,
-            cls_weight=1.0, point_weight=0.0, iou_weight=3.0)
 model = dict(
     type="CLRerNet",
     data_preprocessor=dict(
@@ -78,22 +66,22 @@ model = dict(
         seg_num_classes=5,
         # separate final classification layer for the auxiliary branch;
         # the shared towers still receive its gradient
-        aux_cls_head=False,
+        aux_cls_head=True,
         lateral_cfg=None,
         look_forward_twice=False,
-        prior_cfg=dict(param="linear", delta_scale=1.0, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),
-        brr_cfg=dict(cp_x_margin=0.1, cp_transport=True, length_mode="fresh", frame_grad=False,
-            stage_jitter=None
-        ), # cp_transport, length_mode, min_span, frame_grad apply to cp_frame="anchored"/"support" only (rejected for "global").
+        prior_cfg=dict(param='linear', delta_scale=1.0, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),
+        # cp_transport, length_mode, min_span, frame_grad apply to cp_frame="anchored"/"support" only (rejected for "global").
+        # 0.5 as in the 80.30 recipe and every global-frame run: in the global frame
+        # 0.1 clamps the GT control points of about a third of CULane-like lanes
+        brr_cfg=dict(cp_x_margin=0.5),
+        # Consistent matching: the one-to-one Hungarian uses the cost of the aux
+        # SimOTA (cls 1, iou 3, point 0) at every stage, so the query it keeps for
+        # a GT is SimOTA's lowest-cost positive for that GT.
         main_assigner=dict(type="HungarianLaneAssigner", cls_weight=1.0, point_weight=0.0, iou_weight=3.0),
-        # per-stage override; stages not listed use main_assigner
-        main_stage_assigners=None,
         main_quality_gate=None,
         reproject_cfg=None,
-        cp_frame="anchored", # "global" | "anchored" | "support"
+        cp_frame="global", # "global" | "anchored" | "support"
         cp_precond_cfg=None,
-        slot_expert_cfg=None,
-        diffusion_cfg=None,
         rank_loss_cfg=dict(
             enabled=False,
             loss_weight=1.0,         # lower than the one-to-one default: the
@@ -116,8 +104,8 @@ model = dict(
             positives_only=False,
         ),
         aux_cfg=dict(
-            enabled=True, # Disable Auxiliary branch
-            num_groups=3, # 3 groups per query
+            enabled=True,
+            num_groups=3,   # perturbed aux groups
             stages=[0, 1, 2],
             assigners=[
                 dict(type="SimOTALaneAssigner", candidate_topk=6, min_dynamic_k=2,
@@ -132,13 +120,8 @@ model = dict(
             apply_brr_loss=True,
             bn_stats="main",
         ),
-        # Perturbation off, auxiliary branch on: zero noise AND no clamps, so the
-        # aux branch gets exactly the clean priors (with clamp_x=True alone, the
-        # x clamp to [0.01, 0.99] would still move the off-image control points
-        # of about half the priors). The aux regression then equals the main
-        # one; aux adds one-to-many (TopK/SimOTA) supervision on the same
-        # predictions, with its own cls layer (aux_cls_head=True).
-        # noise_t / random_t in aux_cfg have no effect in this setting.
+        # Perturbation on (the 80.30 recipe's): every aux group starts from its own
+        # perturbed copy of the priors.
         perturb_cfg=dict(
             timesteps=1000, beta_schedule="linear", beta_start=1e-4, beta_end=2e-2,
             noise_scale=1.0, coeff_dim=4, coeff_scale=1.0, use_tanh=True,
@@ -146,7 +129,7 @@ model = dict(
             clamp_x=True, clamp_y=True,
         ),
         loss_cfg=dict(
-            use_focal=True,
+            use_focal=False,
             cls_loss_weight=2.0,
             # NOTE: quality focal loss is smaller in scale than the weighted CE.
             # Retune cls_loss_weight after the first run (try 2.0 -> 4.0).
@@ -188,7 +171,7 @@ model = dict(
     ),
     test_cfg=dict(
         # Default CLRerNet uses conf_threshold=0.41
-        conf_threshold=0.40,
+        conf_threshold=0.85,
         use_nms=True,
         as_lanes=True,
         extend_bottom=True,
@@ -201,7 +184,7 @@ model = dict(
 )
 
 # Number of epochs
-total_epochs = 25
+total_epochs = 36
 checkpoint_config = dict(interval=total_epochs)
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=total_epochs, val_interval=3)
 val_cfg = dict(type='ValLoop')
@@ -220,3 +203,5 @@ log_config = dict(
         dict(type="TensorboardLoggerHookEpoch"),
     ]
 )
+
+load_from = None

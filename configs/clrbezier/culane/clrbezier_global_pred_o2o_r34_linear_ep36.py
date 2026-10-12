@@ -95,7 +95,7 @@ model = dict(
         aux_cls_head=True,
         lateral_cfg=None,
         look_forward_twice=False,
-        prior_cfg=dict(params='linear', delta_scale=1.0, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),
+        prior_cfg=dict(param='linear', delta_scale=1.0, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),
         # cp_transport, length_mode, min_span, frame_grad apply to cp_frame="anchored"/"support" only (rejected for "global").
         brr_cfg=dict(cp_x_margin=0.1),
         main_assigner=dict(type="HungarianLaneAssigner", cls_weight=1.0, point_weight=0.0, iou_weight=3.0),
