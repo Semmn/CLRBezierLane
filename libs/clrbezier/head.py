@@ -177,12 +177,15 @@ class CLRBezierHead(_OfficialHead):
 
         # ---- priors / BRR -----------------------------------------------------
         self.eps = float(prior_cfg.get("eps", 1e-4))
+        self.cp_x_margin = float(brr_cfg.get("cp_x_margin", 0.5))
+        # prior_cfg.param: "sigmoid" (default) or "linear" prior update, see
+        # BezierPriorBank. The linear bank keeps x within the same margin.
         self.prior_bank = BezierPriorBank(
             self.num_priors, self.img_w, self.img_h,
             delta_scale=prior_cfg.get("delta_scale", 0.1), eps=self.eps,
             visible_only=prior_cfg.get("visible_only", True),
-            min_support=prior_cfg.get("min_support", 1.0 / self.n_strips))
-        self.cp_x_margin = float(brr_cfg.get("cp_x_margin", 0.5))
+            min_support=prior_cfg.get("min_support", 1.0 / self.n_strips),
+            param=prior_cfg.get("param", "sigmoid"), x_margin=self.cp_x_margin)
         # Where the four control points live.
         #   "global"   : image y = 0, 1/3, 2/3, 1 — the curve's domain is the
         #                whole image however short the lane is.

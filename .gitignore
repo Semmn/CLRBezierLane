@@ -66,3 +66,7 @@ patch
 
 # .dist_test temporary
 .dist_test
+
+# ipynb files
+*.ipynb
+*.json

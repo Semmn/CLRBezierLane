@@ -87,24 +87,90 @@ def clrernet_style_bezier_priors(num_priors, img_w, img_h, eps=1e-4,
     return torch.stack(priors, dim=0)
 
 
+class _InwardClamp(torch.autograd.Function):
+    """``x.clamp(lo, hi)`` whose gradient also passes where it points back inside.
+
+    A plain clamp gives a clamped value zero gradient, so a learnable coordinate
+    pushed past the bound stays there for good. Here the gradient of a clamped
+    value is kept when a descent step would move it back towards the range, and
+    dropped when it would push it further out.
+    """
+
+    @staticmethod
+    def forward(ctx, x, lo, hi):
+        ctx.save_for_backward(x)
+        ctx.lo, ctx.hi = lo, hi
+        return x.clamp(lo, hi)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (x,) = ctx.saved_tensors
+        keep = (((x >= ctx.lo) & (x <= ctx.hi))
+                | ((x < ctx.lo) & (grad < 0)) | ((x > ctx.hi) & (grad > 0)))
+        return grad * keep, None, None
+
+
+def inward_clamp(x, lo, hi):
+    return _InwardClamp.apply(x, float(lo), float(hi))
+
+
 class BezierPriorBank(nn.Module):
-    """Fixed prior logits + small learnable delta (V11: learnable_pos_prior=False,
-    allow_small_delta=True, prior_delta_scale=0.1)."""
+    """Fixed prior layout + small learnable delta (V11: learnable_pos_prior=False,
+    allow_small_delta=True, prior_delta_scale=0.1).
+
+    ``param`` sets how ``delta`` moves the control points:
+      "sigmoid" (default): cp = sigmoid(prior_logits + delta_scale * delta),
+          clamped to [eps, 1 - eps]. A unit step moves a point by
+          delta_scale * p(1 - p), and a point on the image border gets no
+          gradient at all.
+      "linear": cp = prior_cp + delta_scale * delta, the same step for every
+          point (delta_scale = 1 is CLRerNet's embedding update). x is kept in
+          [-x_margin, 1 + x_margin] (the head's cp_x_margin) and the y end
+          points in [eps, 1 - eps], with clamps that let a point come back.
+    The two store different buffers (prior_logits / prior_cp), and a checkpoint
+    of one refuses to load into the other.
+    """
+
+    PARAMS = ("sigmoid", "linear")
 
     def __init__(self, num_priors, img_w, img_h, delta_scale=0.1, eps=1e-4,
-                 visible_only=True, min_support=1.0 / 71.0):
+                 visible_only=True, min_support=1.0 / 71.0, param="sigmoid", x_margin=0.5):
         super().__init__()
+        if param not in self.PARAMS:
+            raise ValueError(f"prior_cfg.param must be one of {self.PARAMS}, got {param!r}")
         self.num_priors = int(num_priors)
         self.delta_scale = float(delta_scale)
         self.eps = float(eps)
+        self.param = param
+        self.x_margin = float(x_margin)
         cp = clrernet_style_bezier_priors(num_priors, img_w, img_h, eps, visible_only, min_support)
         cp = project_support_y(cp, eps)
-        logits = inverse_sigmoid(cp.clamp(eps, 1.0 - eps).reshape(self.num_priors, 8), eps=1e-12)
-        self.register_buffer("prior_logits", logits)
-        self.prior_delta = nn.Parameter(torch.zeros_like(logits))
+        cp = cp.clamp(eps, 1.0 - eps).reshape(self.num_priors, 8)
+        if param == "linear":
+            self.register_buffer("prior_cp", cp)
+        else:
+            self.register_buffer("prior_logits", inverse_sigmoid(cp, eps=1e-12))
+        self.prior_delta = nn.Parameter(torch.zeros_like(cp))
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        other = "prior_logits" if self.param == "linear" else "prior_cp"
+        if prefix + other in state_dict:
+            saved = "sigmoid" if other == "prior_logits" else "linear"
+            raise RuntimeError(
+                f"{prefix}{other}: this checkpoint was trained with prior_cfg.param="
+                f"'{saved}', but the config sets '{self.param}'. Its prior_delta is in "
+                f"different units, so use param='{saved}' for this checkpoint, or train "
+                f"from scratch (load_from=None).")
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def forward(self, batch_size):
         """Clean support-local CPs [B, K, 4, 2]."""
+        if self.param == "linear":
+            cp = (self.prior_cp + self.delta_scale * self.prior_delta).view(self.num_priors, 4, 2)
+            x = inward_clamp(cp[..., 0], -self.x_margin, 1.0 + self.x_margin)
+            y = inward_clamp(cp[..., 1], self.eps, 1.0 - self.eps)
+            cp = project_support_y(torch.stack((x, y), dim=-1), self.eps)
+            return cp.unsqueeze(0).expand(batch_size, -1, -1, -1).float()
         logits = self.prior_logits + self.delta_scale * self.prior_delta
         cp = torch.sigmoid(logits.view(self.num_priors, 4, 2))
         cp = project_support_y(cp, self.eps)
