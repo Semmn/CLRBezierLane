@@ -22,7 +22,7 @@ custom_imports = dict(
     ],
     allow_failed_imports=False,
 )
-cfg_name = "clrbezier_global_pred_o2o_r34_linear_ep36_consistent.py"
+cfg_name = "clrbezier_global_pred_o2o_r34_ep36_consistent.py"
 
 img_w, img_h, num_points = 800, 320, 72
 model = dict(
@@ -69,7 +69,7 @@ model = dict(
         aux_cls_head=True,
         lateral_cfg=None,
         look_forward_twice=False,
-        prior_cfg=dict(param='linear', delta_scale=1.0, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),
+        prior_cfg=dict(param='sigmoid', delta_scale=0.1, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),
         # cp_transport, length_mode, min_span, frame_grad apply to cp_frame="anchored"/"support" only (rejected for "global").
         # 0.5 as in the 80.30 recipe and every global-frame run: in the global frame
         # 0.1 clamps the GT control points of about a third of CULane-like lanes

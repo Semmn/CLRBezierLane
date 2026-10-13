@@ -48,6 +48,7 @@ from .curv_moe import CurvatureMoEClassifier
 from .slot_experts import LaneSlotExperts, base_name
 from .diffusion import AnchorDiffusion
 from .dedup import LearnedLaneNMS
+from .lane_decoder import LaneDecoder
 from .moe import MoEGate
 from .priors import BezierPriorBank, StructuredPriorPerturbation, inward_clamp
 
@@ -135,6 +136,7 @@ class CLRBezierHead(_OfficialHead):
         slot_expert_cfg=None,
         diffusion_cfg=None,
         dedup_cfg=None,
+        decoder_cfg=None,
         target_adapter=None,
         train_cfg=None,
         test_cfg=None,
@@ -696,6 +698,49 @@ class CLRBezierHead(_OfficialHead):
                 raise ValueError("diffusion_cfg supports the global and anchored frames only")
             self.diffusion = AnchorDiffusion(self.fc_hidden_dim, self.img_w, **dict(diffusion_cfg))
 
+        # ---- Sparse R-CNN-style lane decoder (lane_decoder.py) ---------------------
+        # decoder_cfg: None (default, off) or a dict. Every prior carries a query
+        # from stage to stage; each stage updates it with its RoIGather feature,
+        # self-attention over the nearest other lanes (NMS distance, with the
+        # previous stage's scores), cross-attention to the lane's sampled points
+        # and an FFN, and the cls/reg towers read it instead of the RoI feature.
+        #   num_heads (4), num_neighbors (16), ffn_dim (256), dropout (0.0),
+        #   cross_attn (True), dist_scale (px, 50 = the NMS threshold),
+        #   query_init_std (0.02)
+        #   apply_to : "both" (default): cls and reg read the decoder;
+        #              "cls": only cls does, regression keeps the RoI feature (the
+        #              lanes are then exactly those of the head without it)
+        self.decoder = None
+        if decoder_cfg is not None:
+            cfg = dict(decoder_cfg)
+            known = {"num_heads", "num_neighbors", "ffn_dim", "dropout", "cross_attn",
+                     "dist_scale", "query_init_std", "apply_to"}
+            unknown = set(cfg) - known
+            if unknown:
+                raise ValueError(f"decoder_cfg: unknown keys {sorted(unknown)}")
+            for name, other in (("diffusion_cfg", self.diffusion),
+                                ("query_attn_cfg", self.query_attn),
+                                ("curv_moe_cfg", self.curv_moe),
+                                ("slot_expert_cfg", self.slot_experts)):
+                if other is not None:
+                    raise ValueError(f"decoder_cfg cannot be combined with {name}")
+            self.decoder_apply_to = str(cfg.pop("apply_to", "both"))
+            if self.decoder_apply_to not in ("both", "cls"):
+                raise ValueError("decoder_cfg.apply_to must be 'both' or 'cls'")
+            # Built on a forked RNG and left out of _init_clrernet_weights, so the
+            # rest of the head is initialized exactly as without it.
+            with torch.random.fork_rng(devices=[]):
+                self.decoder = LaneDecoder(
+                    self.num_priors, self.fc_hidden_dim, self.prior_feat_channels,
+                    self.sample_points, self.n_strips, self.img_w, self.refine_layers,
+                    num_heads=int(cfg.get("num_heads", 4)),
+                    num_neighbors=int(cfg.get("num_neighbors", 16)),
+                    ffn_dim=int(cfg.get("ffn_dim", 256)),
+                    dropout=float(cfg.get("dropout", 0.0)),
+                    cross_attn=bool(cfg.get("cross_attn", True)),
+                    dist_scale=float(cfg.get("dist_scale", 50.0)),
+                    query_init_std=float(cfg.get("query_init_std", 0.02)))
+
         # ---- learned NMS (dedup.py) ---------------------------------------------
         # dedup_cfg: None (default, off) or a dict. A small o2o head after the last
         # stage corrects each o2m logit from its higher-scored neighbours and is
@@ -766,8 +811,11 @@ class CLRBezierHead(_OfficialHead):
     # Initialization (official CLRerNet policy, as in V11)
     # ======================================================================
     def _init_clrernet_weights(self):
-        dedup = getattr(self, "dedup", None)
-        skip = set(dedup.modules()) if dedup is not None else set()
+        skip = set()
+        for name in ("dedup", "decoder"):
+            module = getattr(self, name, None)
+            if module is not None:
+                skip |= set(module.modules())
         for m in self.modules():
             if m in skip:
                 continue
@@ -882,6 +930,9 @@ class CLRBezierHead(_OfficialHead):
         slot = (self.slot_experts if self.slot_experts is not None
                 and branch in self.slot_experts.branches else None)
         slot_routes = []
+        dec_q = (self.decoder.init_queries(batch_size, num_q)
+                 if self.decoder is not None else None)
+        prev_pred = None
         step = self._step_cache
         # lft_mode == "dino": the previous stage's update, live w.r.t. that
         # stage's delta only (same values as the detached cp_x/y_start/...).
@@ -951,9 +1002,29 @@ class CLRBezierHead(_OfficialHead):
                 roi = self.gsrc.inject(stage, roi, context_tokens)
             if query_mixer is not None and not in_gather:
                 roi = query_mixer(roi)
+            reg_src = None
+            if self.decoder is not None:
+                if prev_pred is None:
+                    # stage 0: the anchors, no scores yet
+                    with torch.no_grad():
+                        lanes, _ = brr_reference(cp_x.detach(), y_start.detach(),
+                                                 length.detach(), **geo,
+                                                 frame_top=frame_top.detach())
+                    scores = None
+                else:
+                    # the lanes and scores the previous stage predicted
+                    lanes = prev_pred
+                    scores = torch.softmax(prev_pred[..., :2].float(), dim=-1)[..., 1]
+                dec = self.decoder(stage, dec_q, roi.view(batch_size, num_q, -1), pooled,
+                                   lanes, scores)
+                if self.decoder_apply_to == "cls":
+                    reg_src = roi
+                roi = dec_q = dec
             if diff_t is not None:
                 roi = self.diffusion.modulate(roi, diff_t)
             cls_roi = reg_roi = roi
+            if reg_src is not None:
+                reg_roi = reg_src
             if stage == self.refine_layers - 1:
                 last_roi = roi.reshape(batch_size, num_q, -1)
             if self.lateral is not None and stage in self.lateral_stages:
@@ -1079,6 +1150,7 @@ class CLRBezierHead(_OfficialHead):
                     frame=self.cp_frame))
             pred = torch.cat([cls_logits, ref[..., 2:6], out_xs], dim=-1)
             preds.append(pred)
+            prev_pred = pred.detach()
 
             if stage != self.refine_layers - 1:
                 next_x, next_map = new_x, ref_on_map
@@ -1108,7 +1180,9 @@ class CLRBezierHead(_OfficialHead):
                                    precond=precond_stats, moe=moe_stats,
                                    curv=curv_logits, curv_in=curv_inputs, curv_rule=curv_rule,
                                    curv_own=curv_own, slot=slot_routes,
-                                   final_state=final_state, last_roi=last_roi)
+                                   final_state=final_state, last_roi=last_roi,
+                                   decoder=(self.decoder.self_weights()
+                                            if self.decoder is not None else None))
 
     def _curv_moe_load_hook(self, state_dict, prefix, local_metadata, strict, missing_keys,
                             unexpected_keys, error_msgs):
@@ -1380,6 +1454,8 @@ class CLRBezierHead(_OfficialHead):
                    precond=main_extra["precond"], moe=main_extra.get("moe", []))
         if self.dedup is not None:
             out["dedup_delta"] = self.dedup(main_preds[-1], main_extra["last_roi"])
+        if main_extra.get("decoder"):
+            out["decoder_self_w"] = main_extra["decoder"]
         if self.gsrc is not None and getattr(self.gsrc, "last_stats", None):
             out["moe_gsrc"] = dict(self.gsrc.last_stats)
         if main_extra.get("slot"):
@@ -1763,6 +1839,11 @@ class CLRBezierHead(_OfficialHead):
         if self.dedup is not None and "dedup_delta" in outs:
             losses["loss_dedup"], dedup_diag = self._dedup_loss(outs, valid_targets)
             diag.update(dedup_diag)
+        if outs.get("decoder_self_w"):
+            # main branch: mean attention weight a query keeps on itself (1 = it
+            # ignores the other lanes)
+            for stage, w in enumerate(outs["decoder_self_w"]):
+                diag[f"dec_self_w_s{stage}"] = w
         if curv_loss is not None and not self.curv_moe.freeze_router:
             losses["loss_curv_router"] = curv_loss * self.curv_moe.router_loss_weight
         if moe_balance is not None:
