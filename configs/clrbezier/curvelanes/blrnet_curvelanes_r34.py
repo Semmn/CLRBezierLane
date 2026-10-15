@@ -92,7 +92,7 @@ model = dict(
         img_h=img_h,
         seg_num_classes=2,            # CurveLanes masks: background / lane (head default 5)
         anchor_cfg=dict(
-            num_anchors=192,          # learned anchors; CLRerNet's CurveLanes prior tiling at init (192)
+            num_anchors=48,          # learned anchors; CLRerNet's CurveLanes prior tiling at init (192)
             dim=256,                  # anchor feature width (256)
             num_blocks=2,             # semantic/geometry interaction blocks, each one
                                       #   semantic: relation self-attn, cross-attn to image tokens,
@@ -136,11 +136,11 @@ model = dict(
         assign_cfg=dict(
             # one-to-one, on the last refinement step, geometry first: the score term is linear
             # and weighted 0.15 = 3 * 0.05, so it only reorders copies within 0.05 LaneIoU
-            o2o=dict(type="HungarianLaneAssigner", cls_weight=0.15, cls_cost_mode="linear",
+            o2o=dict(type="HungarianLaneAssigner", cls_weight=1.0, cls_cost_mode="log",
                      point_weight=0.0, iou_weight=3.0),
             # one-to-many for the o2m head (feature learning, with-NMS comparison); None drops it
-            o2m=dict(type="SimOTALaneAssigner", candidate_topk=4, min_dynamic_k=1, cls_weight=0.15,
-                     cls_cost_mode="linear", point_weight=0.0, iou_weight=3.0),
+            o2m=dict(type="SimOTALaneAssigner", candidate_topk=3, min_dynamic_k=1, cls_weight=0.0,
+                     cls_cost_mode="linear", point_weight=1.0, iou_weight=3.0),
         ),
         loss_cfg=dict(
             cls_loss_weight=2.0,      # softmax focal, summed over anchors / GT lanes per image (2.0)

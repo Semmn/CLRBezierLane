@@ -20,7 +20,12 @@ A lane detector without the cross-layer refinement cascade. YSY's design
               curve. Deep supervision on every step.
   heads       o2m classification (per anchor) and, after one more relation
               self-attention over the converged lanes with the o2m scores as
-              neighbour features, o2o classification: NMS-free at test.
+              neighbour features, o2o classification: NMS-free at test. Both
+              classifiers read the same anchor state. Optionally the o2m labels
+              go to a separate set of anchors instead (o2m_branch_cfg: decoded by
+              the same weights, own classifier, not run at test; Co-DETR / H-DETR),
+              so the main anchors get one-to-one targets only; or the o2o head
+              reads the state without gradient (o2o_stop_grad; Polar R-CNN).
   targets     geometry first: Hungarian (o2o) and SimOTA (o2m) with the score
               bounded to breaking ties (cls_cost_mode="linear"); LaneIoU on the
               rows, point L1 against the GT curve sampled at the same t,
@@ -47,6 +52,7 @@ from mmengine.model import BaseModule
 from mmdet.registry import MODELS
 
 from .assigners import build_cost_cache, build_lane_assigner
+from .batched_loss import GTLayout, batched_assign, batched_cost_cache, per_image_sum
 from .data_adapters import CLRTargetAdapter
 from .dedup import lane_rows
 from .geometry import bernstein_basis
@@ -488,15 +494,27 @@ class BLRHead(_OfficialHead):
                  rows: the curve's bottom and top against the GT's first and last
                  visible row), smooth_l1_beta (1.0), o2m_cls_weight (1.0),
                  o2m_reg_weight (0.5), lane_width, lane_width_cost, iou_eval_shape,
-                 seg_loss_weight (1.0), seg_bg_weight (0.4), cp_fit_ridge (1e-2)
+                 seg_loss_weight (1.0), seg_bg_weight (0.4), cp_fit_ridge (1e-2),
+                 batched_loss (True: the whole batch at once, same values as the
+                 per-image loop that False keeps)
     test_score : None (o2o without NMS, o2m with NMS) | "o2o" | "o2m"
+    o2m_branch_cfg: None (off) or dict: num_anchors (192). The o2m labels (assign_cfg.o2m,
+                 loss_cfg o2m_cls_weight / o2m_reg_weight) go to this separate set of learned
+                 anchors, decoded by the same blocks and refinement steps (relation attention
+                 within the set only) and scored by the o2m classifier; the main anchors get
+                 one-to-one targets only. The o2m classifier's score of the main anchors (no
+                 gradient) stays the neighbour score of the final relation attention. The
+                 branch is not run at test.
+    o2o_stop_grad: False; True: the o2o head (final relation attention and classifier) reads
+                 the anchor state without gradient, so the one-to-one labels train only that
+                 head (Polar R-CNN). Needs the o2m head on the same anchors.
     """
 
     def __init__(self, num_points=72, sample_points=36, prior_feat_channels=64, num_levels=3,
                  img_w=800, img_h=320, seg_num_classes=5, anchor_cfg=None, refine_cfg=None,
                  align_cfg=None, assign_cfg=None, loss_cfg=None, target_adapter=None,
                  test_score=None, train_cfg=None, test_cfg=None, init_cfg=None, encoder_cfg=None,
-                 **unused):
+                 o2m_branch_cfg=None, o2o_stop_grad=False, **unused):
         BaseModule.__init__(self, init_cfg=init_cfg)
         if unused:
             print(f"[BLRHead] ignoring unused head arguments: {sorted(unused)}")
@@ -517,7 +535,7 @@ class BLRHead(_OfficialHead):
                                   "o2m_cls_weight", "o2m_reg_weight", "lane_width", "lane_width_cost",
                                   "iou_eval_shape", "seg_loss_weight", "seg_bg_weight",
                                   "seg_ignore_label", "cp_fit_ridge", "point_target",
-                                  "extent_loss_weight"})):
+                                  "extent_loss_weight", "batched_loss"})):
             unknown = set(cfg) - known
             if unknown:
                 raise ValueError(f"BLRHead {name}: unknown keys {sorted(unknown)}")
@@ -646,6 +664,26 @@ class BLRHead(_OfficialHead):
                                               rel["max_dist"], rel["dropout"])
         self.final_norm = nn.LayerNorm(dim)
         self.cls_o2o = nn.Linear(dim, 2)
+        # the o2m labels on a separate set of anchors (Co-DETR / H-DETR), or the o2o head
+        # behind a stop-gradient (Polar R-CNN)
+        self.o2m_branch = None
+        if o2m_branch_cfg is not None:
+            ob = dict(o2m_branch_cfg)
+            if set(ob) - {"num_anchors"}:
+                raise ValueError(f"BLRHead o2m_branch_cfg: unknown keys {sorted(set(ob) - {'num_anchors'})}")
+            if self.o2m_assigner is None:
+                raise ValueError("BLRHead o2m_branch_cfg needs assign_cfg.o2m (the labels the branch carries)")
+            if test_score == "o2m":
+                raise ValueError("BLRHead test_score='o2m' with o2m_branch_cfg: the main anchors have no o2m labels")
+            n_branch = int(ob.get("num_anchors", 192))
+            cps_b = clrernet_style_bezier_priors(n_branch, self.img_w, self.img_h).flip(1)
+            self.branch_anchor_params = nn.Parameter(params_from_control_points(cps_b))   # [M, 8]
+            self.branch_anchor_embed = nn.Parameter(torch.zeros(n_branch, dim))
+            self.o2m_branch = dict(num_anchors=n_branch)
+        self.o2o_stop_grad = bool(o2o_stop_grad)
+        if self.o2o_stop_grad and (self.o2m_assigner is None or self.o2m_branch is not None):
+            raise ValueError("BLRHead o2o_stop_grad needs the o2m head on the same anchors (assign_cfg.o2m "
+                             "set, o2m_branch_cfg None); otherwise no classification loss reaches the anchors")
         self.seg_decoder = SegDecoder(self.img_h, self.img_w,
                                       self.prior_feat_channels * self.num_levels, seg_num_classes)
         self.encoder = None
@@ -685,6 +723,7 @@ class BLRHead(_OfficialHead):
         self.iou_loss = LaneIoULoss(float(lc.get("iou_loss_weight", 4.0)), self.lane_width,
                                     self.iou_w, self.iou_h)
         self.cp_fit_ridge = float(lc.get("cp_fit_ridge", 1e-2))
+        self.batched_loss = bool(lc.get("batched_loss", True))
         self.seg_loss_weight = float(lc.get("seg_loss_weight", 1.0))
         seg_weights = torch.ones(seg_num_classes)
         seg_weights[0] = float(lc.get("seg_bg_weight", 0.4))
@@ -725,6 +764,8 @@ class BLRHead(_OfficialHead):
                 m.reset_parameters()
         if self.step_blocks is not None:
             nn.init.trunc_normal_(self.step_pos, std=0.02)
+        if self.o2m_branch is not None:
+            nn.init.normal_(self.branch_anchor_embed, std=0.02)
 
     def init_weights(self):
         """The official head's init touches the anchor generator this head does
@@ -758,22 +799,30 @@ class BLRHead(_OfficialHead):
     def _geometry_code(self, cps, lanes):
         return torch.cat([cps.flatten(-2), lanes[..., 2:3], lanes[..., 5:6]], dim=-1).detach()
 
-    def _forward(self, feats):
+    def _image_tokens(self, feats):
+        top = feats[0]
+        img_tok = self.img_proj(top.flatten(2).transpose(1, 2).float())
+        return img_tok + sine_position_2d(top.shape[-2], top.shape[-1], self.dim, top.device, img_tok.dtype)[None]
+
+    def _forward(self, feats, img_tok=None, branch="main"):
+        """Decode one set of anchors: "main" (the detector) or "o2m" (o2m_branch_cfg's
+        separate anchors, training only; returns their geometry and o2m scores)."""
         batch_size = feats[0].shape[0]
-        dev, dt = feats[0].device, torch.float32
-        num_q, dim = self.num_anchors, self.dim
+        dt = torch.float32
+        anchor_params, anchor_embed = ((self.branch_anchor_params, self.branch_anchor_embed)
+                                       if branch == "o2m" else (self.anchor_params, self.anchor_embed))
+        num_q, dim = anchor_params.shape[0], self.dim
         zeros2 = feats[0].new_zeros((batch_size, num_q, 2), dtype=dt)
 
         # anchors: geometry, rows, semantic query
-        params0 = self.anchor_params[None].expand(batch_size, -1, -1).float()
+        params0 = anchor_params[None].expand(batch_size, -1, -1).float()
         cps0 = anchor_control_points(params0)                                   # [B, N, 4, 2]
         pts_s = curve_points(cps0, self.t_sample)                               # [B, N, S, 2]
         lanes0 = self.official_layout(zeros2, curve_points(cps0, self.t_out), bezier_end_slopes(cps0))
-        sem = self.anchor_embed[None].expand(batch_size, -1, -1) + self.geo_enc(
+        sem = anchor_embed[None].expand(batch_size, -1, -1) + self.geo_enc(
             self._geometry_code(cps0, lanes0))
-        top = feats[0]
-        img_tok = self.img_proj(top.flatten(2).transpose(1, 2).float())
-        img_tok = img_tok + sine_position_2d(top.shape[-2], top.shape[-1], dim, dev, img_tok.dtype)[None]
+        if img_tok is None:
+            img_tok = self._image_tokens(feats)
         sem = self.sem_pre_norm[0](sem)
         sem = self.sem_pre_norm[1](sem + self.sem_pre(sem, img_tok, img_tok, need_weights=False)[0])
 
@@ -848,14 +897,22 @@ class BLRHead(_OfficialHead):
             pts_list.append(pts)
             cur_pts = curve_points(cps, self.t_sample).detach()
         h = hf.view(batch_size, num_q, dim)
+        if branch == "o2m":
+            return dict(preds=preds, cps=cps_list, pts=pts_list, cls_o2m=self.cls_o2m(h).float())
 
         # heads: o2m per anchor; o2o after the converged lanes have interacted
         cls_o2m, s_o2m = None, None
-        if self.cls_o2m is not None:
+        if self.o2m_branch is not None:
+            # the o2m labels live on the branch; here the o2m classifier only gives the
+            # neighbour score of the final relation attention, without gradient
+            with torch.no_grad():
+                s_o2m = torch.softmax(self.cls_o2m(h).float(), dim=-1)[..., 1]
+        elif self.cls_o2m is not None:
             cls_o2m = self.cls_o2m(h).float()
             with torch.no_grad():
                 s_o2m = torch.softmax(cls_o2m, dim=-1)[..., 1]
-        h_fin = self.final_norm(h + self.final_sa(h, preds[-1], s_o2m))
+        h_o2o = h.detach() if self.o2o_stop_grad else h
+        h_fin = self.final_norm(h_o2o + self.final_sa(h_o2o, preds[-1], s_o2m))
         cls_o2o = self.cls_o2o(h_fin).float()
         return dict(preds=preds, cps=cps_list, pts=pts_list, cls_o2o=cls_o2o, cls_o2m=cls_o2m,
                     anchor_lanes=lanes0.detach(), anchor_pts=pts_s.detach(), raw_feats=raw,
@@ -873,7 +930,10 @@ class BLRHead(_OfficialHead):
 
     def forward_train(self, feats):
         feats = self._encode(feats)
-        out = self._forward(feats)
+        img_tok = self._image_tokens(feats)
+        out = self._forward(feats, img_tok)
+        if self.o2m_branch is not None:
+            out["o2m_branch"] = self._forward(feats, img_tok, branch="o2m")
         size = feats[-1].shape[-2:]
         seg_in = torch.cat([F.interpolate(f, size=size, mode="bilinear", align_corners=False)
                             for f in feats], dim=1)
@@ -1022,9 +1082,20 @@ class BLRHead(_OfficialHead):
 
     def loss_by_outputs(self, outs, lanes, seg_gt=None):
         valid_targets = [t[t[:, 1] == 1] for t in lanes]
-        batch_size, num_q = outs["cls_o2o"].shape[:2]
-        dev = outs["cls_o2o"].device
-        zero = outs["cls_o2o"].new_zeros(())
+        core_fn = self._loss_core_batched if self.batched_loss else self._loss_core_loop
+        branch = outs.get("o2m_branch")
+        core = core_fn(outs, valid_targets, o2m=branch is None)
+        core_b = core_fn(branch, valid_targets, o2o=False, align=False) if branch is not None else None
+        return self._loss_tail(outs, core, seg_gt, core_b)
+
+    def _loss_core_loop(self, outs, valid_targets, o2o=True, o2m=True, align=True):
+        """Assignment and geometry / alignment terms, one image at a time (reference).
+        o2o / o2m / align turn those parts off (o2m also needs the o2m assigner)."""
+        o2m = o2m and self.o2m_assigner is not None
+        final = outs["preds"][-1]
+        batch_size, num_q = final.shape[:2]
+        dev = final.device
+        zero = final.new_zeros(())
         tgt_o2o = torch.zeros((batch_size, num_q), dtype=torch.long, device=dev)
         tgt_o2m = torch.zeros_like(tgt_o2o)
         gt_counts = torch.ones(batch_size, device=dev)
@@ -1033,24 +1104,25 @@ class BLRHead(_OfficialHead):
         align_sum = {"offset": zero, "feature": zero}
         align_n = 0
         num_pos_o2o = num_pos_o2m = 0
-        final = outs["preds"][-1]
-        pred_o2o = torch.cat([outs["cls_o2o"].detach(), final[..., 2:].detach()], dim=-1)
+        pred_o2o = (torch.cat([outs["cls_o2o"].detach(), final[..., 2:].detach()], dim=-1)
+                    if o2o else None)
         pred_o2m = (torch.cat([outs["cls_o2m"].detach(), final[..., 2:].detach()], dim=-1)
-                    if self.o2m_assigner is not None else None)
+                    if o2m else None)
         for b, gt in enumerate(valid_targets):
             if gt.shape[0] == 0:
                 continue
             gt_counts[b] = float(gt.shape[0])
             gt_cps, gt_ok = fit_gt_bezier(gt, self.prior_ys, self.img_w, self.img_h, self.cp_fit_ridge)
             gt_pts = curve_points(gt_cps, self.t_out)
-            rows, cols = self._assign(self.o2o_assigner, pred_o2o[b], gt)
-            tgt_o2o[b, rows] = 1
-            num_pos_o2o += int(rows.numel())
             n_img += 1
-            if rows.numel():
-                iou, pt, cp, ext = self._geometry_terms(outs, b, rows, cols, gt, gt_cps, gt_ok, gt_pts)
-                iou_sum, pt_sum, cp_sum, ext_sum = iou_sum + iou, pt_sum + pt, cp_sum + cp, ext_sum + ext
-            if self.o2m_assigner is not None:
+            if o2o:
+                rows, cols = self._assign(self.o2o_assigner, pred_o2o[b], gt)
+                tgt_o2o[b, rows] = 1
+                num_pos_o2o += int(rows.numel())
+                if rows.numel():
+                    iou, pt, cp, ext = self._geometry_terms(outs, b, rows, cols, gt, gt_cps, gt_ok, gt_pts)
+                    iou_sum, pt_sum, cp_sum, ext_sum = iou_sum + iou, pt_sum + pt, cp_sum + cp, ext_sum + ext
+            if o2m:
                 rows_m, cols_m = self._assign(self.o2m_assigner, pred_o2m[b], gt)
                 tgt_o2m[b, rows_m] = 1
                 num_pos_o2m += int(rows_m.numel())
@@ -1059,13 +1131,218 @@ class BLRHead(_OfficialHead):
                     w = self.o2m_reg_weight
                     iou_sum, pt_sum = iou_sum + w * iou, pt_sum + w * pt
                     cp_sum, ext_sum = cp_sum + w * cp, ext_sum + w * ext
-            if self.align is not None:
+            if align and self.align is not None:
                 terms = self._align_terms(outs, b, gt)
                 if terms:
                     align_n += 1
                     for key, val in terms.items():
                         align_sum[key] = align_sum[key] + val
-        norm = float(max(1, n_img))
+        return dict(tgt_o2o=tgt_o2o, tgt_o2m=tgt_o2m, gt_counts=gt_counts, iou=iou_sum, pt=pt_sum,
+                    cp=cp_sum, ext=ext_sum, n_img=float(n_img), align=align_sum,
+                    align_n=float(align_n), num_pos_o2o=num_pos_o2o, num_pos_o2m=num_pos_o2m)
+
+    def _geometry_terms_batched(self, outs, b_idx, n_idx, j_idx, gt_flat, gt_cps, gt_ok, gt_pts,
+                                batch_size):
+        """_geometry_terms for all matched pairs of the batch: per-image values [B]
+        (0 for images without pairs), each a mean over that image's pairs exactly as
+        the loop computes it, averaged over the iterations."""
+        scale = float(self.img_w - 1) / float(self.img_w)
+        px = gt_flat.new_tensor([float(self.img_w - 1), float(self.img_h - 1)])
+        gt = gt_flat[j_idx]                                                   # [P, 6+R]
+        tgt_rows = gt[:, 6:] / float(self.img_w)
+        gt_valid = (gt[:, 6:] >= 0.0) & (gt[:, 6:] < float(self.img_w))
+        first = torch.argmax(gt_valid.int(), dim=1)
+        last = self.n_strips - torch.argmax(gt_valid.flip(1).int(), dim=1)
+        y_ext = torch.stack([self.prior_ys[first], self.prior_ys[last]], dim=-1)   # [P, 2]
+        cnt = per_image_sum(torch.ones_like(b_idx, dtype=gt_flat.dtype), b_idx, batch_size).clamp_min(1.0)
+        ok = gt_ok[j_idx].to(gt_flat.dtype)
+        ok_n = per_image_sum(ok, b_idx, batch_size).clamp_min(1.0)
+        zero = gt_flat.new_zeros(batch_size)
+        iou = pt = cp = ext = zero
+        for pred, cps, pts in zip(outs["preds"], outs["cps"], outs["pts"]):
+            l_iou = self.iou_loss(pred[b_idx, n_idx, 6:] * scale, tgt_rows)                      # [P]
+            iou = iou + per_image_sum(l_iou, b_idx, batch_size) / cnt
+            c_m = cps[b_idx, n_idx]                                                              # [P, 4, 2]
+            ends = torch.stack([c_m[:, 0, 1], c_m[:, 3, 1]], dim=-1)
+            l_ext = _smooth_l1((ends - y_ext) * float(self.n_strips), 0.0, self.smooth_l1_beta).mean(-1)
+            ext = ext + per_image_sum(l_ext, b_idx, batch_size) / cnt
+            p_m = pts[b_idx, n_idx]                                                              # [P, R, 2]
+            if self.point_target == "lateral":
+                x_gt, on = gt_x_at_y(gt, p_m[..., 1].detach(), self.img_w, self.n_strips)
+                err = _smooth_l1((p_m[..., 0] - x_gt) * px[0], 0.0, self.smooth_l1_beta)
+                on_f = on.to(err.dtype)
+                pt = pt + (per_image_sum((err * on_f).sum(-1), b_idx, batch_size)
+                           / per_image_sum(on_f.sum(-1), b_idx, batch_size).clamp_min(1.0))
+            else:
+                l_pt = _smooth_l1((p_m - gt_pts[j_idx]) * px, 0.0, self.smooth_l1_beta).mean(dim=(-1, -2))
+                pt = pt + per_image_sum(l_pt, b_idx, batch_size) / cnt
+            cp_lane = _smooth_l1((c_m - gt_cps[j_idx]) * px, 0.0, self.smooth_l1_beta).mean(dim=(-1, -2))
+            cp = cp + per_image_sum(cp_lane * ok, b_idx, batch_size) / ok_n
+        n = float(len(outs["preds"]))
+        return iou / n, pt / n, cp / n, ext / n
+
+    def _align_terms_batched(self, outs, layout):
+        """_align_terms for every image at once. Returns per-image terms {key: [B]} and
+        the mask [B] of the images the loop would count (pairs and covered points)."""
+        al = self.align
+        batch_size = layout.batch_size
+        lanes = outs["anchor_lanes"]                                          # [B, N, 6+R]
+        num_q = lanes.shape[1]
+        gt, img = layout.flat, layout.img
+        xs_a = lanes[..., 6:] * float(self.img_w - 1)
+        gt_px = gt[:, 6:]
+        valid_g = (gt_px >= 0.0) & (gt_px < float(self.img_w))                  # [J, R]
+        start, end = lane_rows(lanes, self.n_strips)                            # [B, N]
+        r = torch.arange(self.n_offsets, device=gt.device).view(1, 1, -1)
+        cover = ((r >= start[img][:, :, None]) & (r <= end[img][:, :, None])
+                 & valid_g[:, None, :])                                         # [J, N, R]
+        cnt = cover.sum(-1).float()
+        dist = ((xs_a[img] - gt_px[:, None, :]).abs() * cover).sum(-1) / cnt.clamp_min(1.0)   # [J, N]
+        ok = ((cnt >= al["min_cover"] * valid_g.sum(-1).float()[:, None].clamp_min(1.0))
+              & (dist <= al["max_px"]))
+        dist = torch.where(ok, dist, torch.full_like(dist, float("inf")))
+        k = min(al["topk"], num_q)
+        d_k, n_k = dist.topk(k, dim=1, largest=False)                           # [J, k]
+        pair = torch.isfinite(d_k)
+        j_p = torch.arange(layout.num, device=gt.device)[:, None].expand(-1, k)[pair]
+        n_p = n_k[pair]
+        b_p = img[j_p]                                                           # sorted by image
+        zero = gt.new_zeros(batch_size)
+        if j_p.numel() == 0:
+            return {}, torch.zeros(batch_size, dtype=torch.bool, device=gt.device)
+        y_q = outs["anchor_pts"][b_p, n_p, :, 1]                                 # [P, S]
+        x_gt, on_gt = gt_x_at_y(gt[j_p], y_q, self.img_w, self.n_strips)
+        on_f = on_gt.to(zero.dtype)
+        den = per_image_sum(on_f.sum(-1), b_p, batch_size)
+        has = den > 0                                       # pairs and at least one covered point
+        terms = {}
+        x_a = outs["anchor_pts"][b_p, n_p, :, 0]
+        if al["target"] in ("offset", "both") and outs["offsets"] is not None:
+            off_x = outs["offsets"][b_p, n_p, :, 0] * float(self.img_w - 1)
+            tgt = ((x_gt - x_a) * float(self.img_w - 1)).detach()
+            err = _smooth_l1(off_x, tgt, self.smooth_l1_beta)
+            terms["offset"] = per_image_sum((err * on_f).sum(-1), b_p, batch_size) / den.clamp_min(1.0)
+        if al["target"] in ("feature", "both"):
+            # GT-side features: one grid_sample per level on the padded per-image pairs
+            n_per = per_image_sum(torch.ones_like(on_f[:, 0]), b_p, batch_size).long()   # [B]
+            first = torch.cumsum(n_per, 0) - n_per
+            rank = torch.arange(j_p.numel(), device=gt.device) - first[b_p]
+            p_max = int(n_per.max())
+            with torch.no_grad():
+                xy = torch.stack([x_gt, y_q], dim=-1)                            # [P, S, 2]
+                grid = xy.new_full((batch_size, p_max) + tuple(xy.shape[1:]), -2.0)
+                grid[b_p, rank] = xy
+                f_gt = torch.cat([sample_points(f, grid).float()[b_p, rank] for f in outs["feats"]], dim=-1)
+            f_a = outs["raw_feats"][b_p, n_p]                                     # [P, S, LC]
+            if al["feature_loss"] in ("l2", "cos"):
+                if al["feature_loss"] == "l2":
+                    err = ((f_a - f_gt) ** 2).mean(-1)
+                else:
+                    err = 1.0 - F.cosine_similarity(f_a, f_gt, dim=-1, eps=1e-6)
+                terms["feature"] = per_image_sum((err * on_f).sum(-1), b_p, batch_size) / den.clamp_min(1.0)
+            else:
+                # InfoNCE within each image: the covered points of an image, padded per image
+                on_flat = on_gt.reshape(-1)
+                b_v = b_p[:, None].expand_as(on_gt).reshape(-1)[on_flat]           # [V]
+                qn = F.normalize(f_a.reshape(-1, f_a.shape[-1])[on_flat], dim=-1)
+                kn = F.normalize(f_gt.reshape(-1, f_gt.shape[-1])[on_flat], dim=-1)
+                v_per = per_image_sum(torch.ones_like(b_v, dtype=zero.dtype), b_v, batch_size).long()
+                v_first = torch.cumsum(v_per, 0) - v_per
+                v_rank = torch.arange(b_v.numel(), device=gt.device) - v_first[b_v]
+                v_max = int(v_per.max())
+                qp = qn.new_zeros((batch_size, v_max, qn.shape[-1]))
+                kp = kn.new_zeros((batch_size, v_max, kn.shape[-1]))
+                qp[b_v, v_rank] = qn
+                kp[b_v, v_rank] = kn
+                valid = torch.arange(v_max, device=gt.device)[None] < v_per[:, None]   # [B, Vmax]
+                logits = qp @ kp.transpose(1, 2) / al["tau"]                        # [B, Vmax, Vmax]
+                logits = logits.masked_fill(~valid[:, None, :], float("-inf"))
+                diag = torch.diagonal(logits, dim1=1, dim2=2)
+                ce = torch.logsumexp(torch.where(valid[:, :, None], logits, torch.zeros_like(logits)), dim=-1) - diag
+                ce = torch.where(valid, ce, torch.zeros_like(ce))
+                terms["feature"] = ce.sum(-1) / v_per.clamp_min(1).to(ce.dtype)
+        return terms, has
+
+    def _loss_core_batched(self, outs, valid_targets, o2o=True, o2m=True, align=True):
+        """_loss_core_loop for the whole batch at once (batched_loss.py): one cost cache,
+        one host transfer per Hungarian assignment, all matched pairs of the batch in
+        one pass per iteration, per-image means kept as the loop computes them."""
+        o2m = o2m and self.o2m_assigner is not None
+        batch_size, num_q = outs["preds"][-1].shape[:2]
+        dev = outs["preds"][-1].device
+        layout = GTLayout(valid_targets, dev)
+        tgt_o2o = torch.zeros((batch_size, num_q), dtype=torch.long, device=dev)
+        tgt_o2m = torch.zeros_like(tgt_o2o)
+        gt_counts = torch.tensor([float(c) if c > 0 else 1.0 for c in layout.counts], device=dev)
+        n_img = float(sum(1 for c in layout.counts if c > 0))
+        zero = outs["preds"][-1].new_zeros(())
+        out = dict(tgt_o2o=tgt_o2o, tgt_o2m=tgt_o2m, gt_counts=gt_counts, iou=zero, pt=zero, cp=zero,
+                   ext=zero, n_img=n_img, align={"offset": zero, "feature": zero}, align_n=zero,
+                   num_pos_o2o=0, num_pos_o2m=0)
+        if layout.num == 0:
+            return out
+        gt_cps, gt_ok = fit_gt_bezier(layout.flat, self.prior_ys, self.img_w, self.img_h, self.cp_fit_ridge)
+        gt_pts = curve_points(gt_cps, self.t_out)
+        final = outs["preds"][-1].detach()
+        iou_sum = pt_sum = cp_sum = ext_sum = zero
+        cache = None
+        if o2o:
+            pred_o2o = torch.cat([outs["cls_o2o"].detach(), final[..., 2:]], dim=-1)
+            required = set(self.o2o_assigner.required_cache_keys)
+            if o2m:
+                required |= set(self.o2m_assigner.required_cache_keys)
+            cache = batched_cost_cache(pred_o2o, layout, self.img_w, self.img_h, self.lane_width,
+                                       self.lane_width_cost, required, iou_shape=(self.iou_w, self.iou_h))
+            b_o, n_o, g_o = batched_assign(self.o2o_assigner, cache, layout)
+            tgt_o2o[b_o, n_o] = 1
+            out["num_pos_o2o"] = int(n_o.numel())
+            j_o = layout.flat_index(b_o, g_o)
+            iou, pt, cp, ext = self._geometry_terms_batched(outs, b_o, n_o, j_o, layout.flat, gt_cps, gt_ok,
+                                                            gt_pts, batch_size)
+            iou_sum, pt_sum, cp_sum, ext_sum = iou.sum(), pt.sum(), cp.sum(), ext.sum()
+        if o2m:
+            pred_o2m = torch.cat([outs["cls_o2m"].detach(), final[..., 2:]], dim=-1)
+            if cache is None:                       # the o2m branch: its own geometry
+                cache_m = batched_cost_cache(pred_o2m, layout, self.img_w, self.img_h, self.lane_width,
+                                             self.lane_width_cost, set(self.o2m_assigner.required_cache_keys),
+                                             iou_shape=(self.iou_w, self.iou_h))
+            else:
+                cache_m = dict(cache)
+                cache_m.update(batched_cost_cache(pred_o2m, layout, self.img_w, self.img_h, self.lane_width,
+                                                  self.lane_width_cost, {"cls_cost"},
+                                                  iou_shape=(self.iou_w, self.iou_h)))
+            b_m, n_m, g_m = batched_assign(self.o2m_assigner, cache_m, layout)
+            tgt_o2m[b_m, n_m] = 1
+            out["num_pos_o2m"] = int(n_m.numel())
+            if n_m.numel() and self.o2m_reg_weight > 0:
+                iou, pt, cp, ext = self._geometry_terms_batched(
+                    outs, b_m, n_m, layout.flat_index(b_m, g_m), layout.flat, gt_cps, gt_ok, gt_pts, batch_size)
+                w = self.o2m_reg_weight
+                iou_sum, pt_sum = iou_sum + w * iou.sum(), pt_sum + w * pt.sum()
+                cp_sum, ext_sum = cp_sum + w * cp.sum(), ext_sum + w * ext.sum()
+        out.update(iou=iou_sum, pt=pt_sum, cp=cp_sum, ext=ext_sum)
+        if align and self.align is not None:
+            terms, has = self._align_terms_batched(outs, layout)
+            hf = has.to(zero.dtype)
+            out["align"] = {key: (val * hf).sum() for key, val in terms.items()}
+            out["align"].setdefault("offset", zero)
+            out["align"].setdefault("feature", zero)
+            out["align_n"] = hf.sum()
+        return out
+
+    def _loss_tail(self, outs, core, seg_gt, core_b=None):
+        tgt_o2o, tgt_o2m, gt_counts = core["tgt_o2o"], core["tgt_o2m"], core["gt_counts"]
+        iou_sum, pt_sum, cp_sum, ext_sum = core["iou"], core["pt"], core["cp"], core["ext"]
+        align_sum, align_n = core["align"], core["align_n"]
+        num_pos_o2o, num_pos_o2m = core["num_pos_o2o"], core["num_pos_o2m"]
+        logits_o2m = outs["cls_o2m"]
+        if core_b is not None:            # o2m_branch_cfg: the o2m labels and their geometry terms
+            tgt_o2m, num_pos_o2m = core_b["tgt_o2m"], core_b["num_pos_o2m"]
+            logits_o2m = outs["o2m_branch"]["cls_o2m"]
+            iou_sum, pt_sum = iou_sum + core_b["iou"], pt_sum + core_b["pt"]
+            cp_sum, ext_sum = cp_sum + core_b["cp"], ext_sum + core_b["ext"]
+        dev = outs["cls_o2o"].device
+        norm = max(1.0, core["n_img"])
         cls_o2o = (focal_2cls(outs["cls_o2o"], tgt_o2o, self.focal_alpha, self.focal_gamma).sum(-1)
                    / gt_counts).mean()
         losses = dict(loss_cls=cls_o2o * self.cls_loss_weight,
@@ -1074,11 +1351,11 @@ class BLRHead(_OfficialHead):
                       loss_cp=cp_sum / norm * self.cp_loss_weight,
                       loss_extent=ext_sum / norm * self.extent_loss_weight)
         if self.o2m_assigner is not None:
-            cls_o2m = (focal_2cls(outs["cls_o2m"], tgt_o2m, self.focal_alpha, self.focal_gamma).sum(-1)
+            cls_o2m = (focal_2cls(logits_o2m, tgt_o2m, self.focal_alpha, self.focal_gamma).sum(-1)
                        / gt_counts).mean()
             losses["loss_cls_o2m"] = cls_o2m * self.cls_loss_weight * self.o2m_cls_weight
         if self.align is not None:
-            an = float(max(1, align_n))
+            an = (align_n.clamp_min(1.0) if torch.is_tensor(align_n) else float(max(1.0, align_n)))
             if self.align["target"] in ("offset", "both") and outs["offsets"] is not None:
                 losses["loss_align_offset"] = align_sum["offset"] / an * self.align["offset_weight"]
             if self.align["target"] in ("feature", "both"):
