@@ -80,6 +80,7 @@ train_pipeline = [
             "gt_masks",
             "lanes",
         ],
+        lane_interp="pchip"
     ),
 ]
 
@@ -96,6 +97,7 @@ val_pipeline = [
             "crop_shape",
             "crop_offset",
         ],
+        lane_interp="pchip"
     ),
 ]
 

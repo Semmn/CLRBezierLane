@@ -70,3 +70,5 @@ patch
 # ipynb files
 *.ipynb
 *.json
+# Claude Code local guidance
+CLAUDE.md

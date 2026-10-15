@@ -67,13 +67,21 @@ def build_cost_cache(pred, target, img_w, img_h, lane_width, lane_width_cost,
 class _CachedCostAssigner:
     required_cache_keys = frozenset({"cls_cost", "point_cost", "iou_cost_assign"})
 
-    def __init__(self, cls_weight=1.0, point_weight=2.0, iou_weight=3.0):
+    def __init__(self, cls_weight=1.0, point_weight=2.0, iou_weight=3.0, cls_cost_mode="log"):
         self.cls_weight = float(cls_weight)
         self.point_weight = float(point_weight)
         self.iou_weight = float(iou_weight)
+        if cls_cost_mode not in ("log", "linear"):
+            raise ValueError(f"cls_cost_mode must be 'log' or 'linear', got {cls_cost_mode!r}")
+        self.cls_cost_mode = cls_cost_mode
 
     def total_cost(self, cache):
-        cost = (self.cls_weight * cache["cls_cost"]
+        cls_cost = cache["cls_cost"]
+        if self.cls_cost_mode == "linear":
+            # 1 - score, bounded in [0, 1]. With cls_weight = iou_weight * delta the score
+            # can only reorder copies whose LaneIoU differs by less than delta.
+            cls_cost = -torch.expm1(-cls_cost)
+        cost = (self.cls_weight * cls_cost
                 + self.point_weight * cache["point_cost"]
                 + self.iou_weight * cache["iou_cost_assign"])
         return torch.nan_to_num(cost, nan=100.0, posinf=100.0, neginf=100.0)

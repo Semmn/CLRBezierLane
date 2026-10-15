@@ -782,7 +782,8 @@ class CLRBezierHead(_OfficialHead):
             if self.dedup_target == "hungarian":
                 self.dedup_assigner = build_lane_assigner(cfg.get("assigner") or dict(
                     type="HungarianLaneAssigner", cls_weight=last.cls_weight,
-                    point_weight=last.point_weight, iou_weight=last.iou_weight))
+                    point_weight=last.point_weight, iou_weight=last.iou_weight,
+                    cls_cost_mode=last.cls_cost_mode))
             elif cfg.get("assigner") is not None:
                 raise ValueError("dedup_cfg.assigner is used with target='hungarian' only")
             self.dedup_use_at_test = bool(cfg.get("use_at_test", True))

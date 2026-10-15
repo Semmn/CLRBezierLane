@@ -2,7 +2,7 @@
 # inherited from the CLRerNet-R34 baseline; only the head is replaced.
 # Head settings mirror configs/clrbezier/culane/clrbezier_collab_perturb_r34.py.
 _base_ = [
-    "dataset_curvelanes_clrernet.py",
+    "dataset_curvelanes_clrbezier.py",
     "../../_base_/default_runtime.py"
 ]
 default_scope = "mmdet"

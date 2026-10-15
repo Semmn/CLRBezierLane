@@ -77,7 +77,7 @@ model = dict(
         # Consistent matching: the one-to-one Hungarian uses the cost of the aux
         # SimOTA (cls 1, iou 3, point 0) at every stage, so the query it keeps for
         # a GT is SimOTA's lowest-cost positive for that GT.
-        main_assigner=dict(type="HungarianLaneAssigner", cls_weight=1.0, point_weight=0.0, iou_weight=3.0),
+        main_assigner=dict(type="HungarianLaneAssigner", cls_weight=1.0, point_weight=2.0, iou_weight=3.0),
         main_quality_gate=None,
         reproject_cfg=None,
         cp_frame="global", # "global" | "anchored" | "support"
@@ -109,7 +109,7 @@ model = dict(
             stages=[0, 1, 2],
             assigners=[
                 dict(type="SimOTALaneAssigner", candidate_topk=6, min_dynamic_k=2,
-                            cls_weight=1.0, point_weight=0.0, iou_weight=3.0),
+                            cls_weight=1.0, point_weight=2.0, iou_weight=3.0),
             ],
             assigner_weights=[1.0],
             stage_assigner_ids={"0": [0], "1": [0], "2": [0]},

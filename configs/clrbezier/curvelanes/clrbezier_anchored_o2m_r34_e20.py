@@ -10,7 +10,7 @@
 # distribution does not move and the confidence threshold does not need
 # re-tuning when it is switched on.
 _base_ = [
-    "dataset_curvelanes_clrernet.py",
+    "dataset_curvelanes_clrbezier.py",
     "../../_base_/default_runtime.py"
 ]
 
