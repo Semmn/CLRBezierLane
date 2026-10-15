@@ -49,6 +49,7 @@ from .slot_experts import LaneSlotExperts, base_name
 from .diffusion import AnchorDiffusion
 from .dedup import LearnedLaneNMS
 from .lane_decoder import LaneDecoder
+from .decider import LaneDecider
 from .moe import MoEGate
 from .priors import BezierPriorBank, StructuredPriorPerturbation, inward_clamp
 
@@ -137,6 +138,7 @@ class CLRBezierHead(_OfficialHead):
         diffusion_cfg=None,
         dedup_cfg=None,
         decoder_cfg=None,
+        decider_cfg=None,
         target_adapter=None,
         train_cfg=None,
         test_cfg=None,
@@ -806,6 +808,112 @@ class CLRBezierHead(_OfficialHead):
                     if not name.startswith("dedup."):
                         p.requires_grad_(False)
 
+        # ---- converge, then decide (decider.py) ----------------------------------
+        # decider_cfg: None (default, off) or a dict. A decision stage after the
+        # cascade scores its final lanes jointly: features re-pooled along each
+        # final lane from every level, self-attention over the nearest other
+        # candidates, cross-attention to the lane's own points. It replaces the
+        # last stage's scores at test time. Its one-to-one target is matched on the
+        # final lanes, geometry first, its own score bounded to breaking ties.
+        #   train_mode  : "joint" (default) adds loss_decider to the usual losses;
+        #                 "decider_only" trains the decider alone on a loaded
+        #                 checkpoint: the rest of the head runs as at test time
+        #                 (eval mode, no gradient) and is frozen
+        #   assigner    : one-to-one assigner on the final lanes, default Hungarian
+        #                 with cls_weight 0.15, cls_cost_mode "linear", iou_weight 3
+        #                 (the score reorders copies within 0.05 LaneIoU only)
+        #   min_pos_iou : drop matched pairs below this LaneIoU (default 0.0)
+        #   loss        : "focal" (default; alpha 0.25, gamma 2, per GT lane) or
+        #                 "ce" (bg_weight on the 0 targets, per-image mean)
+        #   loss_weight (2.0), quality_weight (1.0): the quality head regresses
+        #                 every candidate's best LaneIoU (BCE on soft targets)
+        #   aux_layers  : supervise every decision layer (True) or the last only
+        #   score       : "o2o" (default) or "o2o_quality" (geometric mean of the two)
+        #   use_at_test, test_topk: as in dedup_cfg
+        #   detach_feats: stop the decider's gradient at the feature maps (default:
+        #                 True for decider_only, False for joint)
+        #   dim (128), num_layers (2), num_heads (4), num_neighbors (16),
+        #   ffn_dim (512), dropout (0.0), dist_scale (px, 50), use_scores (True:
+        #   from the second layer on, the relation features carry the previous
+        #   decision layer's scores), prior_prob (0.01, init of the logit bias)
+        #   score_input : feed the cascade's last-stage score to the decider (lane
+        #                 token, and the relation features of every layer in place
+        #                 of use_scores). Default False
+        #   tie_break   : "own" (default): the assigner above, the layer's own score
+        #                 in its bounded term. "cascade": for each GT lane the copies
+        #                 within tie_delta LaneIoU of its best copy form a tie set,
+        #                 and the one with the highest cascade score is the target
+        #                 (Hungarian across lanes). Geometry decides beyond
+        #                 tie_delta; inside it the target is a rule the decider can
+        #                 observe (with score_input). Pairs with LaneIoU 0 are dropped
+        #   tie_delta   : the tie band in LaneIoU (default 0.1)
+        self.decider = None
+        if decider_cfg is not None:
+            cfg = dict(decider_cfg)
+            known = {"train_mode", "assigner", "min_pos_iou", "loss", "focal_alpha",
+                     "focal_gamma", "bg_weight", "loss_weight", "quality_weight", "aux_layers",
+                     "score", "use_at_test", "test_topk", "detach_feats", "dim", "num_layers",
+                     "num_heads", "num_neighbors", "ffn_dim", "dropout", "dist_scale",
+                     "use_scores", "prior_prob", "score_input", "tie_break", "tie_delta"}
+            unknown = set(cfg) - known
+            if unknown:
+                raise ValueError(f"decider_cfg: unknown keys {sorted(unknown)}")
+            for name, other in (("dedup_cfg", self.dedup), ("diffusion_cfg", self.diffusion)):
+                if other is not None:
+                    raise ValueError(f"decider_cfg cannot be combined with {name}")
+            self.decider_train_mode = str(cfg.get("train_mode", "joint"))
+            if self.decider_train_mode not in ("joint", "decider_only"):
+                raise ValueError("decider_cfg.train_mode must be 'joint' or 'decider_only'")
+            self.decider_assigner = build_lane_assigner(cfg.get("assigner") or dict(
+                type="HungarianLaneAssigner", cls_weight=0.15, cls_cost_mode="linear",
+                point_weight=0.0, iou_weight=3.0))
+            self.decider_min_pos_iou = float(cfg.get("min_pos_iou", 0.0))
+            self.decider_loss = str(cfg.get("loss", "focal"))
+            if self.decider_loss not in ("focal", "ce"):
+                raise ValueError("decider_cfg.loss must be 'focal' or 'ce'")
+            self.decider_focal_alpha = float(cfg.get("focal_alpha", 0.25))
+            self.decider_focal_gamma = float(cfg.get("focal_gamma", 2.0))
+            self.decider_bg_weight = float(cfg.get("bg_weight", 1.0))
+            self.decider_loss_weight = float(cfg.get("loss_weight", 2.0))
+            self.decider_quality_weight = float(cfg.get("quality_weight", 1.0))
+            self.decider_aux_layers = bool(cfg.get("aux_layers", True))
+            self.decider_score = str(cfg.get("score", "o2o"))
+            if self.decider_score not in ("o2o", "o2o_quality"):
+                raise ValueError("decider_cfg.score must be 'o2o' or 'o2o_quality'")
+            self.decider_use_at_test = bool(cfg.get("use_at_test", True))
+            topk = cfg.get("test_topk")
+            self.decider_test_topk = None if topk is None else int(topk)
+            self.decider_detach_feats = bool(cfg.get(
+                "detach_feats", self.decider_train_mode == "decider_only"))
+            self.decider_tie_break = str(cfg.get("tie_break", "own"))
+            if self.decider_tie_break not in ("own", "cascade"):
+                raise ValueError("decider_cfg.tie_break must be 'own' or 'cascade'")
+            self.decider_tie_delta = float(cfg.get("tie_delta", 0.1))
+            if not 0.0 <= self.decider_tie_delta < 1.0:
+                raise ValueError("decider_cfg.tie_delta must be in [0, 1)")
+            # Built on a forked RNG and left out of _init_clrernet_weights, so the
+            # rest of the head is initialized exactly as without it.
+            with torch.random.fork_rng(devices=[]):
+                self.decider = LaneDecider(
+                    self.prior_feat_channels, self.refine_layers, self.sample_points,
+                    self.n_strips, self.img_w,
+                    dim=int(cfg.get("dim", 128)),
+                    num_layers=int(cfg.get("num_layers", 2)),
+                    num_heads=int(cfg.get("num_heads", 4)),
+                    num_neighbors=int(cfg.get("num_neighbors", 16)),
+                    ffn_dim=int(cfg.get("ffn_dim", 512)),
+                    dropout=float(cfg.get("dropout", 0.0)),
+                    dist_scale=float(cfg.get("dist_scale", 50.0)),
+                    use_scores=bool(cfg.get("use_scores", True)),
+                    prior_prob=float(cfg.get("prior_prob", 0.01)),
+                    score_input=bool(cfg.get("score_input", False)))
+            if self.decider_train_mode == "decider_only":
+                for name, p in self.named_parameters():
+                    if not name.startswith("decider."):
+                        p.requires_grad_(False)
+            # decider_only trains on a frozen cascade: it must come from a checkpoint
+            self._decider_cascade_loaded = False
+
         self._init_clrernet_weights()
 
     # ======================================================================
@@ -813,7 +921,7 @@ class CLRBezierHead(_OfficialHead):
     # ======================================================================
     def _init_clrernet_weights(self):
         skip = set()
-        for name in ("dedup", "decoder"):
+        for name in ("dedup", "decoder", "decider"):
             module = getattr(self, name, None)
             if module is not None:
                 skip |= set(module.modules())
@@ -1441,6 +1549,8 @@ class CLRBezierHead(_OfficialHead):
     def forward_train(self, feats):
         if self.dedup is not None and self.dedup_train_mode == "dedup_only":
             return self._forward_dedup_only(feats)
+        if self.decider is not None and self.decider_train_mode == "decider_only":
+            return self._forward_decider_only(feats)
         batch_size = feats[-1].shape[0]
         clean_cp = self.prior_bank(batch_size)
         tokens = self.gsrc_tokens(feats)
@@ -1455,6 +1565,8 @@ class CLRBezierHead(_OfficialHead):
                    precond=main_extra["precond"], moe=main_extra.get("moe", []))
         if self.dedup is not None:
             out["dedup_delta"] = self.dedup(main_preds[-1], main_extra["last_roi"])
+        if self.decider is not None:
+            out["decider"] = self._run_decider(feats, main_preds[-1])
         if main_extra.get("decoder"):
             out["decoder_self_w"] = main_extra["decoder"]
         if self.gsrc is not None and getattr(self.gsrc, "last_stats", None):
@@ -1511,7 +1623,164 @@ class CLRBezierHead(_OfficialHead):
             if self.dedup is not None and self.dedup_use_at_test:
                 preds = list(preds)
                 preds[-1] = self._dedup_scores(preds[-1], extra["last_roi"])
+            if self.decider is not None and self.decider_use_at_test:
+                preds = list(preds)
+                preds[-1] = self._decider_scores(preds[-1], feats)
         return StagePredictions([self.to_official_pred_dict(p) for p in preds])
+
+    # ---- converge, then decide (decider_cfg) -----------------------------------
+    def _run_decider(self, feats, final_pred):
+        maps = [f.detach() for f in feats] if self.decider_detach_feats else list(feats)
+        return self.decider(maps, final_pred.detach(), self.sample_x_indices, self.prior_feat_ys)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        if self.decider is not None and any(
+                k.startswith(prefix) and not k[len(prefix):].startswith("decider.") for k in state_dict):
+            self._decider_cascade_loaded = True
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def _forward_decider_only(self, feats):
+        """decider_cfg.train_mode="decider_only": the head runs as at test time
+        (eval mode, no gradient); only the decider trains."""
+        if not self._decider_cascade_loaded:
+            raise RuntimeError(
+                "decider_cfg.train_mode='decider_only' trains the decider alone on a frozen "
+                "cascade, but no checkpoint with the cascade was loaded into the head (load_from "
+                "or resume). Without one the cascade stays at its random initialization and only "
+                "the decider's losses exist. To train everything from scratch use "
+                "train_mode='joint'.")
+        with torch.no_grad(), self._as_eval():
+            preds, _, _ = self._refine(feats, self.prior_bank(feats[-1].shape[0]),
+                                       self.gsrc_tokens(feats))
+        return dict(main_preds=preds, decider=self._run_decider(feats, preds[-1]))
+
+    def _decider_logit(self, out):
+        """The final decision logit [B, Q] (decider_cfg.score)."""
+        z = out["logits"][-1].float()
+        if self.decider_score == "o2o_quality":
+            p = (torch.sigmoid(z) * torch.sigmoid(out["quality"][-1].float())).sqrt()
+            z = torch.logit(p.clamp(1e-6, 1.0 - 1e-6))
+        return z
+
+    def _decider_scores(self, pred, feats):
+        """Last-stage predictions with the decider's scores (test time)."""
+        z = self._decider_logit(self._run_decider(feats, pred))
+        topk = self.decider_test_topk
+        cfg = self.test_cfg or {}
+        if topk is None and not cfg.get("use_nms", True):
+            topk = cfg.get("nms_topk")
+        if topk is not None and 0 < int(topk) < z.shape[1]:
+            # without NMS, keep the top-k lanes per image (the cap NMS applies)
+            keep = torch.zeros_like(z, dtype=torch.bool)
+            keep.scatter_(1, z.topk(int(topk), dim=1).indices, True)
+            z = torch.where(keep, z, z - 1e4)
+        logits = torch.stack([torch.zeros_like(z), z], dim=-1)
+        return torch.cat([logits.to(pred.dtype), pred[..., 2:]], dim=-1)
+
+    @torch.no_grad()
+    def _decider_targets(self, preds, logits, valid_targets):
+        """One-to-one targets [B, Q] of the final lanes for one decision layer (its own
+        logits enter the assigner's bounded score term), every candidate's best
+        LaneIoU [B, Q], and the candidates that are correct copies (LaneIoU >= 0.5)
+        but not the positive."""
+        batch_size, num_q = logits.shape
+        dev = logits.device
+        target = torch.zeros((batch_size, num_q), dtype=torch.long, device=dev)
+        best_iou = torch.zeros((batch_size, num_q), device=dev)
+        assigner = self.decider_assigner
+        cascade = self.decider_tie_break == "cascade"
+        keys = {"iou_cost_assign"} if cascade else set(assigner.required_cache_keys) | {"iou_cost_assign"}
+        for b, gt in enumerate(valid_targets):
+            if gt.shape[0] == 0:
+                continue
+            if cascade:
+                pred = preds[b].detach().float()
+            else:
+                z = logits[b].detach().float()
+                pred = torch.cat([torch.zeros_like(z)[:, None], z[:, None],
+                                  preds[b, :, 2:].detach().float()], dim=-1)
+            cache = build_cost_cache(pred, gt, self.img_w, self.img_h, self.lane_width,
+                                     self.lane_width_cost, keys, iou_fns=self.iou_fns,
+                                     iou_shape=(self.iou_w, self.iou_h))
+            iou = (1.0 - cache["iou_cost_assign"]).clamp(0.0, 1.0)
+            best_iou[b] = iou.max(dim=1).values
+            if cascade:
+                rows, cols = self._decider_tie_set_match(iou, torch.softmax(pred[:, :2], -1)[:, 1])
+            else:
+                rows, cols = assigner.assign(cache)
+            if rows.numel() and self.decider_min_pos_iou > 0:
+                rows = rows[iou[rows, cols] >= self.decider_min_pos_iou]
+            target[b, rows] = 1
+        dup = (best_iou >= 0.5) & (target == 0)
+        return target, best_iou, dup
+
+    def _decider_tie_set_match(self, iou, score):
+        """decider_cfg.tie_break="cascade": one-to-one on iou [Q, G]. For each GT lane
+        the copies within tie_delta of its best LaneIoU cost less than any other
+        candidate, and among them a higher cascade score costs less. Returns the
+        matched (candidate, lane) pairs with LaneIoU > 0."""
+        from scipy.optimize import linear_sum_assignment
+        delta = self.decider_tie_delta
+        best = iou.max(dim=0, keepdim=True).values                  # [1, G]
+        tie = (iou >= best - delta) & (iou > 0)
+        inside = (1.0 - best) + delta * 0.999 * (1.0 - score.float()[:, None])
+        cost = torch.where(tie, inside, 1.0 - iou)
+        r, c = linear_sum_assignment(cost.cpu().double().numpy())
+        r = torch.as_tensor(r, dtype=torch.long, device=iou.device)
+        c = torch.as_tensor(c, dtype=torch.long, device=iou.device)
+        keep = iou[r, c] > 0
+        return r[keep], c[keep]
+
+    def _decider_cls_loss(self, z, target, num_gt):
+        t = target.float()
+        if self.decider_loss == "focal":
+            p = torch.sigmoid(z)
+            ce = F.binary_cross_entropy_with_logits(z, t, reduction="none")
+            p_t = p * t + (1.0 - p) * (1.0 - t)
+            a_t = self.decider_focal_alpha * t + (1.0 - self.decider_focal_alpha) * (1.0 - t)
+            return (a_t * (1.0 - p_t).pow(self.decider_focal_gamma) * ce).sum() / max(num_gt, 1)
+        w = torch.where(target == 1, z.new_tensor(1.0), z.new_tensor(self.decider_bg_weight))
+        ce = F.binary_cross_entropy_with_logits(z, t, reduction="none")
+        return ((ce * w).sum(-1) / w.sum(-1).clamp_min(1.0)).mean()
+
+    def _decider_losses(self, outs, valid_targets):
+        """Deep-supervised one-to-one classification and quality regression of the
+        decision layers on the final lanes."""
+        preds = outs["main_preds"][-1].detach()
+        out = outs["decider"]
+        num_gt = int(sum(int(t.shape[0]) for t in valid_targets))
+        layers = range(len(out["logits"])) if self.decider_aux_layers else [len(out["logits"]) - 1]
+        cls_loss = preds.new_zeros(())
+        q_loss = preds.new_zeros(())
+        fixed = None   # tie_break="cascade": the targets do not depend on the layer
+        for i in layers:
+            z = out["logits"][i].float()
+            if fixed is None:
+                target, best_iou, dup = self._decider_targets(preds, z, valid_targets)
+                if self.decider_tie_break == "cascade":
+                    fixed = (target, best_iou, dup)
+            else:
+                target, best_iou, dup = fixed
+            cls_loss = cls_loss + self._decider_cls_loss(z, target, num_gt)
+            q_loss = q_loss + F.binary_cross_entropy_with_logits(
+                out["quality"][i].float(), best_iou, reduction="mean")
+        with torch.no_grad():
+            prob = torch.sigmoid(z)
+            pos = target == 1
+            rest = ~pos & ~dup
+            diag = dict(
+                decider_num_pos=pos.sum().float(),
+                decider_pos_prob=prob[pos].mean() if bool(pos.any()) else prob.new_zeros(()),
+                decider_dup_prob=prob[dup].mean() if bool(dup.any()) else prob.new_zeros(()),
+                decider_bg_prob=prob[rest].mean() if bool(rest.any()) else prob.new_zeros(()),
+                decider_quality_l1=(torch.sigmoid(out["quality"][-1].float()) - best_iou)
+                .abs().mean())
+            for i, w in enumerate(out.get("self_w") or []):
+                if w is not None:
+                    diag[f"decider_self_w_l{i}"] = w
+        losses = dict(loss_decider=cls_loss * self.decider_loss_weight,
+                      loss_decider_quality=q_loss * self.decider_quality_weight)
+        return losses, diag
 
     # ---- learned NMS (dedup_cfg) ----------------------------------------------
     def _forward_dedup_only(self, feats):
@@ -1719,6 +1988,9 @@ class CLRBezierHead(_OfficialHead):
         if self.dedup is not None and self.dedup_train_mode == "dedup_only":
             loss, diag = self._dedup_loss(outs, valid_targets)
             return dict(loss_dedup=loss, **diag)
+        if self.decider is not None and self.decider_train_mode == "decider_only":
+            losses, diag = self._decider_losses(outs, valid_targets)
+            return dict(**losses, **diag)
         layout = GTLayout(valid_targets, outs["main_preds"][0].device)
         fit_frame = "global" if self.brr_cp_loss_space == "global" else self.cp_frame
         # Every lane is fitted independently, so one call covers the batch.
@@ -1840,6 +2112,10 @@ class CLRBezierHead(_OfficialHead):
         if self.dedup is not None and "dedup_delta" in outs:
             losses["loss_dedup"], dedup_diag = self._dedup_loss(outs, valid_targets)
             diag.update(dedup_diag)
+        if self.decider is not None and "decider" in outs:
+            decider_losses, decider_diag = self._decider_losses(outs, valid_targets)
+            losses.update(decider_losses)
+            diag.update(decider_diag)
         if outs.get("decoder_self_w"):
             # main branch: mean attention weight a query keeps on itself (1 = it
             # ignores the other lanes)

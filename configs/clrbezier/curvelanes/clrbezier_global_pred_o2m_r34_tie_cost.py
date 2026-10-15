@@ -90,7 +90,7 @@ model = dict(
         seg_num_classes=2,
         # separate final classification layer for the auxiliary branch;
         # the shared towers still receive its gradient
-        aux_cls_head=True,
+        aux_cls_head=False,
         lateral_cfg=None,
         look_forward_twice=False,
         prior_cfg=dict(param='sigmoid', delta_scale=0.1, visible_only=True, min_support=1.0 / 71.0, eps=1e-4),

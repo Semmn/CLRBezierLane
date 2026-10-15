@@ -3,10 +3,25 @@
     python tools/clrbezier/sweep_conf_eval.py CONFIG CHECKPOINT --range 0.80 0.90 --step 0.02
 
 Inference runs ONCE, at the lowest threshold of the range. Every higher threshold
-is then obtained by dropping the lanes whose score is below it, and the dataset's
-own evaluator (``test_evaluator`` or ``val_evaluator`` from the config:
-CULaneMetric, CurvelanesMetric, LLAMASMetric, TuSimpleMetric) is run on the
-filtered predictions.
+is then obtained by dropping the lanes whose score is below it.
+
+The evaluation is also done once for CurveLanes and CULane. Their metrics match
+predictions to annotations per image by the Hungarian algorithm on 1 - IoU, and
+the IoU of a prediction/annotation pair does not depend on the threshold: a
+higher threshold only removes predictions. So the IoU matrices are computed once
+(the expensive part: drawing every lane) and each threshold only re-solves the
+matching on the surviving predictions (re-solved, not reused: removing a winner
+can hand its lane to another prediction).
+
+    CurvelanesMetric  cached here, with vega's own lane drawing; checked against
+                      CurvelanesMetric on a subset of images before the sweep
+                      is reported (--check-images), exact to the last bit
+    CULaneMetric      tools/clrbezier/fast_sweep.py (build_records + sweep)
+    LLAMAS, TuSimple  the config's evaluator re-run per threshold
+
+``--reference`` re-runs the config's evaluator per threshold for every dataset
+(the old behaviour), and ``--verify`` re-runs it once on the whole split at the
+best threshold to confirm the cached number.
 
 Why filtering afterwards is exact
 ---------------------------------
@@ -25,9 +40,7 @@ Use ``--save-dump`` once and ``--load-dump`` afterwards to sweep other ranges
 without running the model again (the dump must come from a run whose lowest
 threshold is at or below the new range).
 
-For CULane, tools/clrbezier/sweep_threshold.py is much faster on large grids
-(rasterizes once); this script re-runs the official evaluation per threshold,
-which is the reference behaviour and works for every dataset.
+CPU workers for the one IoU pass: ``--workers`` (default: up to 8).
 """
 from __future__ import annotations
 
@@ -39,7 +52,9 @@ import math
 import os
 import os.path as osp
 import pickle
+import re
 import shutil
+import sys
 import time
 
 import numpy as np
@@ -123,7 +138,9 @@ def pick_key(metrics, requested=None):
         if requested not in metrics:
             raise KeyError(f"--metric-key {requested!r} not in {sorted(metrics)}")
         return requested
-    for key in ("F1", "F1_0.50", "F1_measure", "F1@50", "f1"):
+    # CULaneMetric reports F1_0.1 / F1_0.5 / F1_0.75 and no plain F1, so F1_0.5
+    # must come before the alphabetical fallback (which would pick F1_0.1).
+    for key in ("F1", "F1_0.5", "F1_0.50", "F1_measure", "F1@50", "f1"):
         if key in metrics:
             return key
     f1s = [k for k in metrics if "f1" in k.lower()]
@@ -153,6 +170,248 @@ def sweep(dump, thresholds, metric_factory, lane_cls, metric_key=None, log=print
                if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool)}
         key = key or pick_key(res, metric_key)
         n_lanes = sum(len(s["lanes"]) for s in samples)
+        rows.append(dict(threshold=t, lanes=n_lanes, seconds=round(time.time() - tic, 1), **res))
+        log(f"conf {t:.4f}: {key} = {res.get(key, float('nan')):.4f}  ({n_lanes} lanes)")
+    return rows, key
+
+
+def lanes_above(dump, t):
+    """Lanes of the dump with score >= t (the ``lanes`` column of the reference sweep)."""
+    return sum(1 for _, lanes in dump for _, s in lanes if s >= t)
+
+
+# ----------------------------------------------------------------------------
+# CurveLanes: IoU matrices once, Hungarian per threshold
+# ----------------------------------------------------------------------------
+_CL = {}   # read by the forked workers: metric, lane class, dump
+
+
+def curvelanes_cache_supported(metric):
+    """CurvelanesMetric, with or without the F1@ thresholds of curvelanes_f1_thresholds.patch."""
+    return type(metric).__name__ == "CurvelanesMetric" and all(
+        hasattr(metric, a) for a in ("process", "parse_anno", "iou_thresh", "eval_width",
+                                     "eval_height", "lane_width"))
+
+
+def _vega_prf(hits, pr_num, gt_num):
+    """vega LaneMetricCore.summary (CurvelanesMetric._prf where the patch adds it)."""
+    eps = sys.float_info.epsilon
+    precision = hits / (pr_num + eps)
+    recall = hits / (gt_num + eps)
+    return precision, recall, 2 * precision * recall / (precision + recall + eps)
+
+
+def _vega_mask(lane, height, width, lane_width):
+    """One lane drawn exactly as vega's ``calc_iou`` draws it, flattened."""
+    import cv2
+    from vega.metrics.pytorch.lane_metric import spline_interp
+
+    im = np.zeros((height, width), np.uint8)
+    pts = spline_interp(lane=lane, step_t=1)
+    for i in range(0, len(pts) - 1):
+        cv2.line(im, (int(pts[i]["x"]), int(pts[i]["y"])),
+                 (int(pts[i + 1]["x"]), int(pts[i + 1]["y"])), 255, lane_width)
+    return im.reshape(-1) > 0
+
+
+def curvelanes_iou_matrix(gt_lines, pr_lines, ori_shape, metric):
+    """vega ``calc_iou`` for every (GT, prediction) pair, each lane drawn once.
+
+    ``calc_iou`` divides sum(A & B) by sum(A | B) on 0/255 masks (0 when the union
+    is empty); the factor 255 cancels exactly in float64, so pixel counts give the
+    same numbers bit for bit (checked in test_sweep_conf_eval_cached.py).
+    """
+    iou = np.zeros((len(gt_lines), len(pr_lines)))
+    if not gt_lines or not pr_lines:   # vega draws nothing for these images either
+        return iou
+    from vega.metrics.pytorch.lane_metric import resize_lane
+
+    h, w, lw = int(metric.eval_height), int(metric.eval_width), int(metric.lane_width)
+    y_ratio = np.true_divide(ori_shape[0], metric.eval_height)
+    x_ratio = np.true_divide(ori_shape[1], metric.eval_width)
+    gt = np.stack([_vega_mask(resize_lane(l, x_ratio, y_ratio), h, w, lw) for l in gt_lines])
+    pr = np.stack([_vega_mask(resize_lane(l, x_ratio, y_ratio), h, w, lw) for l in pr_lines])
+    cols = np.flatnonzero(gt.any(0))   # an intersection can only lie on GT pixels
+    inter = gt[:, cols].astype(np.int64) @ pr[:, cols].astype(np.int64).T
+    union = gt.sum(1, dtype=np.int64)[:, None] + pr.sum(1, dtype=np.int64)[None, :] - inter
+    np.divide(inter, union, out=iou, where=union > 0)
+    return iou
+
+
+def _curvelanes_image(i):
+    """(GT lane count, scores [P], IoU [G, P]) of image i, P = the predictions
+    CurvelanesMetric would score (lanes that convert to no points are dropped)."""
+    metric, lane_cls = _CL["metric"], _CL["lane_cls"]
+    sample = filtered_samples([_CL["dump"][i]], -math.inf, lane_cls)[0]
+    metric.results = []
+    metric.process({}, [sample])   # the metric's own crop/convert, one entry per lane
+    r = metric.results.pop()
+    keep = [j for j, line in enumerate(r["pred"]) if len(line) > 0]
+    gt_lines = [lane for lane in metric.parse_anno(r["filename"]) if len(lane) > 0]
+    iou = curvelanes_iou_matrix(gt_lines, [r["pred"][j] for j in keep], r["ori_shape"], metric)
+    return len(gt_lines), np.asarray([sample["scores"][j] for j in keep], dtype=np.float64), iou
+
+
+def _worker_init():
+    try:
+        import cv2
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+
+
+def build_curvelanes_cache(dump, metric, lane_cls, workers=1, log=print):
+    """One pass over the dump: draws every lane once per image."""
+    _CL.update(metric=metric, lane_cls=lane_cls, dump=dump)
+    tic = time.time()
+    try:
+        ctx = None
+        if workers > 1 and len(dump) > 1:
+            import multiprocessing as mp
+            try:
+                ctx = mp.get_context("fork")   # workers inherit _CL; nothing is pickled in
+            except ValueError:
+                ctx = None
+        cache = []
+        if ctx is None:
+            items = map(_curvelanes_image, range(len(dump)))
+            pool = None
+        else:
+            pool = ctx.Pool(workers, initializer=_worker_init)
+            items = pool.imap(_curvelanes_image, range(len(dump)), chunksize=16)
+        try:
+            for item in items:
+                cache.append(item)
+                if len(cache) % 2000 == 0:
+                    log(f"  IoU matrices: {len(cache)}/{len(dump)} images", flush=True)
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
+    finally:
+        _CL.clear()
+    log(f"IoU matrices for {len(cache)} images in {time.time() - tic:.0f} s", flush=True)
+    return cache
+
+
+def curvelanes_sweep(cache, dump, thresholds, metric, metric_key=None, log=print):
+    """CurvelanesMetric.compute_metrics at every threshold from the cached matrices."""
+    from scipy.optimize import linear_sum_assignment
+
+    prf = getattr(metric, "_prf", _vega_prf)
+    main = float(metric.iou_thresh)
+    extra = sorted(set(float(t) for t in (getattr(metric, "iou_thresholds", None) or ())))
+    levels = sorted(set(extra) | {main})
+    gt_num = sum(n_gt for n_gt, _, _ in cache)
+    rows, key = [], metric_key
+    for t in thresholds:
+        tic = time.time()
+        hits = dict.fromkeys(levels, 0)
+        pr_num = 0
+        for n_gt, scores, iou in cache:
+            keep = scores >= t
+            n = int(keep.sum())
+            pr_num += n
+            if n_gt and n:
+                sub = iou[:, keep]
+                r, c = linear_sum_assignment(1 - sub)   # vega: cost 1 - IoU, GT x prediction
+                matched = sub[r, c]
+                for lv in levels:
+                    hits[lv] += int((matched > lv).sum())   # vega: iou_val > iou_thresh
+        precision, recall, f1 = prf(hits[main], pr_num, gt_num)
+        res = dict(f1_measure=f1, precision=precision, recall=recall)
+        for lv in extra:
+            res[f"F1@{int(round(lv * 100))}"] = prf(hits[lv], pr_num, gt_num)[2]
+        res = {k: float(v) for k, v in res.items()}
+        key = key or pick_key(res, metric_key)
+        n_lanes = lanes_above(dump, t)
+        rows.append(dict(threshold=t, lanes=n_lanes, seconds=round(time.time() - tic, 1), **res))
+        log(f"conf {t:.4f}: {key} = {res.get(key, float('nan')):.4f}  ({n_lanes} lanes)")
+    return rows, key
+
+
+def _metric_values(row):
+    return {k: v for k, v in row.items() if k not in ("threshold", "seconds")}
+
+
+def compare_rows(cached, reference, tol=0.0):
+    """[(threshold, key, cached, reference)] where the two sweeps disagree."""
+    bad = []
+    for a, b in zip(cached, reference):
+        va, vb = _metric_values(a), _metric_values(b)
+        for k in sorted(set(va) | set(vb)):
+            x, y = va.get(k), vb.get(k)
+            if x is None or y is None or abs(float(x) - float(y)) > tol * max(1.0, abs(float(y))):
+                bad.append((a["threshold"], k, x, y))
+    return bad
+
+
+def check_curvelanes_cache(dump, cache, thresholds, metric, factory, lane_cls, n_images,
+                           log=print):
+    """Cached vs CurvelanesMetric on the first ``n_images`` images, at the lowest,
+    middle and highest threshold. Must agree exactly, or nothing is reported."""
+    n = min(int(n_images), len(dump))
+    if n <= 0:
+        return
+    probe = sorted({thresholds[0], thresholds[len(thresholds) // 2], thresholds[-1]})
+    tic = time.time()
+    quiet = lambda *a, **k: None   # noqa: E731
+    ref, _ = sweep(dump[:n], probe, factory, lane_cls, log=quiet)
+    fast, _ = curvelanes_sweep(cache[:n], dump[:n], probe, metric, log=quiet)
+    bad = compare_rows(fast, ref)
+    if bad:
+        lines = "\n".join(f"  conf {t:.4f} {k}: cached {x} vs CurvelanesMetric {y}"
+                          for t, k, x, y in bad[:10])
+        raise RuntimeError(
+            f"the cached CurveLanes evaluation differs from CurvelanesMetric on the first "
+            f"{n} images:\n{lines}\nRun with --reference (evaluator per threshold) and "
+            "report this.")
+    log(f"check: cached == CurvelanesMetric on {n} images at conf "
+        f"{', '.join(f'{t:g}' for t in probe)} ({time.time() - tic:.0f} s)", flush=True)
+
+
+# ----------------------------------------------------------------------------
+# CULane: tools/clrbezier/fast_sweep.py
+# ----------------------------------------------------------------------------
+def import_fast_sweep():
+    try:
+        import fast_sweep   # this script's folder (tools/clrbezier/) is on sys.path
+        return fast_sweep
+    except ImportError:
+        pass
+    try:
+        from tools.clrbezier import fast_sweep
+        return fast_sweep
+    except ImportError:
+        return None
+
+
+def culane_cache_supported(metric):
+    return type(metric).__name__ == "CULaneMetric" and all(
+        hasattr(metric, a) for a in ("img_prefix", "list_path", "test_categories_dir",
+                                     "get_prediction_string"))
+
+
+def culane_fast_dump(dump, lane_cls):
+    """fast_sweep's dump layout: [(sub_img_name, [Lane], scores)]."""
+    return [(meta["sub_img_name"],
+             [lane_cls(points=p.copy(), metadata={"conf": s}) for p, s in lanes],
+             np.asarray([s for _, s in lanes], dtype=np.float64))
+            for meta, lanes in dump]
+
+
+def culane_sweep(fs, records, dump, thresholds, metric_key=None, log=print):
+    """fast_sweep.sweep per threshold, keyed like CULaneMetric (eval_predictions)."""
+    rows, key = [], metric_key
+    for t in thresholds:
+        tic = time.time()
+        out = fs.sweep(records, [t], per_category=True)[0]
+        # fast_sweep adds F1 / Precision / Recall aliases of the 0.5 numbers;
+        # eval_predictions does not, so the report keeps ranking by F1_0.5
+        res = {k: float(v) for k, v in out.items()
+               if k not in ("threshold", "F1", "Precision", "Recall")}
+        key = key or pick_key(res, metric_key)
+        n_lanes = lanes_above(dump, t)
         rows.append(dict(threshold=t, lanes=n_lanes, seconds=round(time.time() - tic, 1), **res))
         log(f"conf {t:.4f}: {key} = {res.get(key, float('nan')):.4f}  ({n_lanes} lanes)")
     return rows, key
@@ -218,17 +477,28 @@ def default_work_dir(config):
 
 
 def format_report(rows, key, best, info):
-    extra = [k for k in ("Precision", "Recall") if any(k in r for r in rows)]
+    # precision/recall (either capitalization) and any other F1@xx the metric
+    # reports, e.g. CurvelanesMetric's F1@75 next to the ranked F1@50
+    cand = ["Precision", "Recall", "precision", "recall"]
+    # CULaneMetric: Precision0.5 / Recall0.5 of the ranked F1_0.5, and the
+    # overall F1 at its other IoU thresholds (F1_0.1, F1_0.75)
+    m = re.fullmatch(r"F1_(\d+(?:\.\d+)?)", key)
+    if m:
+        cand += [f"Precision{m.group(1)}", f"Recall{m.group(1)}"]
+    cand += sorted({k for r in rows for k in r
+                    if k.startswith("F1@") or re.fullmatch(r"F1_\d+(?:\.\d+)?", k)})
+    extra = [k for k in cand if k != key and any(k in r for r in rows)]
+    width = {k: max(10, len(k)) for k in extra}
     lines = ["=" * 64, f"threshold sweep  {time.strftime('%Y-%m-%d %H:%M:%S')}"]
     for name, value in info.items():
         if value not in (None, ""):
             lines.append(f"{name:>10}: {value}")
     lines.append("-" * 64)
-    lines.append(f"{'conf':>8} {key:>12}" + "".join(f" {k:>10}" for k in extra) + f" {'lanes':>8}")
+    lines.append(f"{'conf':>8} {key:>12}" + "".join(f" {k:>{width[k]}}" for k in extra) + f" {'lanes':>8}")
     for r in rows:
         mark = "  <- best" if r is best else ""
         lines.append(f"{r['threshold']:8.4f} {r.get(key, float('nan')):12.4f}"
-                     + "".join(f" {r.get(k, float('nan')):10.4f}" for k in extra)
+                     + "".join(f" {r.get(k, float('nan')):{width[k]}.4f}" for k in extra)
                      + f" {r['lanes']:8d}{mark}")
     lines.append("-" * 64)
     lines.append(f"best in range: conf {best['threshold']:.4f} -> {key} {best[key]:.4f}")
@@ -259,6 +529,16 @@ def main():
                          "a .csv and .json with the same stem are written next to it")
     ap.add_argument("--overwrite", action="store_true",
                     help="replace the text report instead of appending this run to it")
+    ap.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1),
+                    help="CPU processes for the one IoU pass (CurveLanes, CULane)")
+    ap.add_argument("--reference", action="store_true",
+                    help="re-run the config's evaluator at every threshold (no IoU cache)")
+    ap.add_argument("--verify", action="store_true",
+                    help="also run the config's evaluator on the whole split at the best "
+                         "threshold and compare (costs one full evaluation)")
+    ap.add_argument("--check-images", type=int, default=50,
+                    help="CurveLanes: images on which the cached evaluation is checked "
+                         "against CurvelanesMetric before the sweep (0: skip)")
     from mmengine.config import DictAction
     ap.add_argument("--cfg-options", nargs="+", action=DictAction,
                     help="key=value overrides, as in tools/test.py")
@@ -307,16 +587,64 @@ def main():
         print("[warn] --max-images evaluates against the FULL annotation set; numbers are not valid")
 
     from libs.utils.lane_utils import Lane
-    rows, key = sweep(dump, thresholds, metric_factory_from(evaluator_cfg, args.metric_index),
-                      Lane, args.metric_key)
+    factory = metric_factory_from(evaluator_cfg, args.metric_index)
+    metric = factory()
+    # CULaneMetric makes a temp dir when it is built; this instance never scores
+    tmp = getattr(metric, "result_dir", None)
+    if tmp and not getattr(metric, "output_dir", None):
+        shutil.rmtree(tmp, ignore_errors=True)
+    fs = None
+    if args.reference:
+        mode = "reference"
+    elif curvelanes_cache_supported(metric):
+        mode = "curvelanes"
+    elif culane_cache_supported(metric) and (fs := import_fast_sweep()) is not None:
+        mode = "culane"
+    else:
+        mode = "reference"
+        print(f"[info] no cached evaluation for {type(metric).__name__}; "
+              "running it once per threshold")
+
+    if mode == "curvelanes":
+        print(f"IoU matrices once ({len(dump)} images, {args.workers} workers)...", flush=True)
+        cache = build_curvelanes_cache(dump, metric, Lane, args.workers)
+        check_curvelanes_cache(dump, cache, thresholds, metric, factory, Lane, args.check_images)
+        rows, key = curvelanes_sweep(cache, dump, thresholds, metric, args.metric_key)
+        evaluation = "IoU matrices once, Hungarian per threshold (CurveLanes)"
+    elif mode == "culane":
+        print(f"IoU matrices once with fast_sweep ({len(dump)} images)...", flush=True)
+        fs_dump = culane_fast_dump(dump, Lane)
+        gt = fs.GroundTruth(metric.img_prefix, metric.list_path, metric.test_categories_dir)
+        records = fs.build_records(fs_dump, gt, metric, jobs=args.workers)
+        rows, key = culane_sweep(fs, records, dump, thresholds, args.metric_key)
+        evaluation = "IoU matrices once, Hungarian per threshold (fast_sweep)"
+    else:
+        rows, key = sweep(dump, thresholds, factory, Lane, args.metric_key)
+        evaluation = f"{type(metric).__name__} per threshold"
 
     best = max(rows, key=lambda r: r.get(key, -1))
+    if args.verify and mode != "reference":
+        print(f"\nverifying conf {best['threshold']:g} against the config's evaluator "
+              "on the whole split...", flush=True)
+        if mode == "culane":
+            ok = fs.check_against_official(records, fs_dump, best["threshold"], metric,
+                                           metric.img_prefix, metric.list_path,
+                                           metric.test_categories_dir)
+        else:
+            ref, _ = sweep(dump, [best["threshold"]], factory, Lane, key)
+            bad = compare_rows([best], ref)
+            ok = not bad
+            for t, k, x, y in bad:
+                print(f"  {k}: cached {x} vs evaluator {y}")
+        print("verify: the cached sweep matches the evaluator" if ok else
+              "verify: MISMATCH, use --reference and report this")
+        evaluation += ", verified at best" if ok else ", VERIFY FAILED"
     dump_conf = saved["conf"] if args.load_dump else thresholds[0]
     report = format_report(rows, key, best, dict(
         config=args.config, checkpoint=args.checkpoint or (saved.get("checkpoint") if args.load_dump else None),
         split=args.split, range=f"{args.range[0]:g} ~ {args.range[1]:g}", step=f"{args.step:g}",
         inference=f"conf >= {dump_conf:g}" + (f" (from {args.load_dump})" if args.load_dump else ""),
-        max_images=args.max_images))
+        evaluation=evaluation, max_images=args.max_images))
     print("\n" + report)
 
     with open(out, "w" if args.overwrite else "a") as f:
@@ -331,7 +659,7 @@ def main():
     with open(base + ".json", "w") as f:
         json.dump(dict(config=args.config,
                        checkpoint=args.checkpoint or (saved.get("checkpoint") if args.load_dump else None),
-                       split=args.split,
+                       split=args.split, evaluation=evaluation,
                        metric_key=key, best=best, rows=rows), f, indent=1)
     print(f"{'wrote' if args.overwrite else 'appended to'} {out} (+ {base}.csv, {base}.json for this run)")
     return 0
