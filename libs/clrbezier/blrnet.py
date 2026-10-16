@@ -61,6 +61,8 @@ from .lane_decoder import LaneRelationAttention
 from .lane_iou import LaneIoULoss
 from .modules import SegDecoder
 from .priors import clrernet_style_bezier_priors
+from .raster_strip import (StripRefiner, curve_normals, nearest_lanes, normal_crossings, render_neighbours,
+                           render_rows, sample_strip, strip_cells)
 
 
 # ------------------------------------------------------------------ geometry
@@ -397,6 +399,21 @@ class DeformableEncoderLayer(nn.Module):
         return self.norms[1](x + self.drop(self.ffn(x)))
 
 
+class FineMap(nn.Module):
+    """fine_cfg: one stride-4 map for the reads that need position (Mask2Former's pixel-decoder
+    pattern): the neck's P2 plus the head's P3 (after the encoder, if on) upsampled, then a 3x3
+    conv, GroupNorm and ReLU, at the neck's channel width."""
+
+    def __init__(self, channels, groups=8):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.norm = nn.GroupNorm(groups, channels)
+
+    def forward(self, p2, p3):
+        x = p2 + F.interpolate(p3.to(p2.dtype), size=p2.shape[-2:], mode="bilinear", align_corners=False)
+        return F.relu(self.norm(self.conv(x)))
+
+
 class DeformableEncoder(nn.Module):
     """Option C: a Deformable-DETR encoder over the coarsest `levels` neck maps, between the
     neck and the head. Its output is added to the neck maps through a zero-initialized
@@ -485,7 +502,10 @@ class BLRHead(_OfficialHead):
                  offsets), max_offset_px (24), topk (3), max_px (50), min_cover
                  (0.25), target ("offset" | "feature" | "both"), feature_loss
                  ("cos" | "l2" | "infonce"), tau (0.1), offset_weight (0.05, px
-                 smooth-L1), feature_weight (1.0)
+                 smooth-L1), feature_weight (1.0), detach_feats (False: the feature
+                 term's gradient also reaches the feature maps, so it can be met by making
+                 the features near a lane look like the lane; True: it reaches only the
+                 sampling offsets, through the sampling locations, so it moves the read)
     assign_cfg : o2o (Hungarian cls 0.15 linear, iou 3), o2m (SimOTA topk 4,
                  cls 0.15 linear, iou 3) or None to drop the o2m head
     loss_cfg   : cls_loss_weight (2.0), focal_alpha (0.25), focal_gamma (2.0),
@@ -508,13 +528,51 @@ class BLRHead(_OfficialHead):
     o2o_stop_grad: False; True: the o2o head (final relation attention and classifier) reads
                  the anchor state without gradient, so the one-to-one labels train only that
                  head (Polar R-CNN). Needs the o2m head on the same anchors.
+    strip_cfg  : None (off) or dict: render-and-compare refinement after the last step
+                 (raster_strip.py). Each candidate gets a strip along its final curve: rows =
+                 every row_step-th output point, 2 * half_bins + 1 lateral bins of bin_px along
+                 the normals. It holds the neck levels `levels` (indices into the neck outputs,
+                 fine -> coarse; (0, 1) = P2 + P3 needs one neck level finer than num_levels),
+                 the raster of its own curve and the rasters of its num_neighbours nearest
+                 candidates (weighted by their o2m score). A CNN (dim, layers) predicts per row
+                 the lateral correction (soft-argmax, bounded by the strip), a visibility logit
+                 and a quality vector, over `iters` passes in which only the own raster moves.
+                 The corrected points are the output (assignment, LaneIoU, point loss, test);
+                 the quality vector reaches the o2o head (final relation attention and
+                 classifier) through a zero-initialized projection, and the lateral layer
+                 starts at zero, so at init the output is the last step's. Keys: levels
+                 ((0, 1)), half_bins (8), bin_px (2.0), sigma_bins (1.0), iters (2), dim (32),
+                 layers (3), num_neighbours (4), row_step (2), gamma (0.8, weight ratio of
+                 earlier passes), loss_weight (1.0), ce_weight (1.0), l1_weight (0.5, px),
+                 vis_weight (0.5), step_weight (1.0: the corrected output's LaneIoU and point
+                 losses weigh as one more refinement step), mode ("final").
+                 mode "steps": the strip runs inside the refinement loop instead of after it.
+                 It is built once around the first step's output (evidence sampled once, the
+                 frame fixed like a map), and every later step does one pass after its GRU
+                 update: the current curve and its neighbours are rasterized in that strip,
+                 the CNN corrects each row laterally (gated by a learned scalar that starts at
+                 0, so at init the steps are the control's), and the pass's quality vector
+                 enters the next GRU input (zero-initialized) and, from the last pass, the o2o
+                 head. Passes = num_iters - 1 (iters is not used); the corrections accumulate
+                 into the later steps' outputs, which the per-step losses supervise
+                 (step_weight is not used).
+    fine_cfg   : None (off) or dict: a stride-4 map (FineMap) built from the neck's P2 (the neck
+                 must give one level more than num_levels: backbone out_indices (0, 1, 2, 3),
+                 neck in_channels [64, 128, 256, 512], num_outs 4) and the head's P3 after the
+                 encoder; the per-step re-sampling along the current curve (refine_cfg.resample
+                 "fine") reads it instead of P3. seg (True): the segmentation decoder runs at
+                 stride 4 on the head's levels upsampled plus this map (False: as without it).
+                 The one-shot anchor sampling, the image tokens and the strip are unchanged.
+    test_cfg.output_step: None (the last output) or an index into the outputs (proposal if
+                 on, the refinement steps, the strip-corrected lanes in mode "final"): the
+                 lanes of that output are decoded with the final scores, to evaluate steps.
     """
 
     def __init__(self, num_points=72, sample_points=36, prior_feat_channels=64, num_levels=3,
                  img_w=800, img_h=320, seg_num_classes=5, anchor_cfg=None, refine_cfg=None,
                  align_cfg=None, assign_cfg=None, loss_cfg=None, target_adapter=None,
                  test_score=None, train_cfg=None, test_cfg=None, init_cfg=None, encoder_cfg=None,
-                 o2m_branch_cfg=None, o2o_stop_grad=False, **unused):
+                 o2m_branch_cfg=None, o2o_stop_grad=False, strip_cfg=None, fine_cfg=None, **unused):
         BaseModule.__init__(self, init_cfg=init_cfg)
         if unused:
             print(f"[BLRHead] ignoring unused head arguments: {sorted(unused)}")
@@ -590,7 +648,7 @@ class BLRHead(_OfficialHead):
         if align_cfg is not None:
             al = dict(align_cfg)
             known = {"offsets", "max_offset_px", "topk", "max_px", "min_cover", "target",
-                     "feature_loss", "tau", "offset_weight", "feature_weight"}
+                     "feature_loss", "tau", "offset_weight", "feature_weight", "detach_feats"}
             if set(al) - known:
                 raise ValueError(f"BLRHead align_cfg: unknown keys {sorted(set(al) - known)}")
             self.align = dict(offsets=bool(al.get("offsets", True)),
@@ -601,13 +659,17 @@ class BLRHead(_OfficialHead):
                               feature_loss=str(al.get("feature_loss", "cos")),
                               tau=float(al.get("tau", 0.1)),
                               offset_weight=float(al.get("offset_weight", 0.05)),
-                              feature_weight=float(al.get("feature_weight", 1.0)))
+                              feature_weight=float(al.get("feature_weight", 1.0)),
+                              detach_feats=bool(al.get("detach_feats", False)))
             if self.align["target"] not in ("offset", "feature", "both"):
                 raise ValueError("align_cfg.target must be 'offset', 'feature' or 'both'")
             if self.align["feature_loss"] not in ("cos", "l2", "infonce"):
                 raise ValueError("align_cfg.feature_loss must be 'cos', 'l2' or 'infonce'")
             if self.align["target"] == "offset" and not self.align["offsets"]:
                 raise ValueError("align_cfg.target='offset' needs align_cfg.offsets=True")
+            if self.align["detach_feats"] and not self.align["offsets"]:
+                raise ValueError("align_cfg.detach_feats=True needs align_cfg.offsets=True (without learned "
+                                 "offsets the feature term would train nothing)")
             self.offset_head = (nn.Linear(dim, 2 * self.sample_points) if self.align["offsets"]
                                 else None)
         else:
@@ -684,8 +746,18 @@ class BLRHead(_OfficialHead):
         if self.o2o_stop_grad and (self.o2m_assigner is None or self.o2m_branch is not None):
             raise ValueError("BLRHead o2o_stop_grad needs the o2m head on the same anchors (assign_cfg.o2m "
                              "set, o2m_branch_cfg None); otherwise no classification loss reaches the anchors")
+        self.fine_map, self.fine_seg = None, False
+        if fine_cfg is not None:
+            fc = dict(fine_cfg)
+            if set(fc) - {"seg"}:
+                raise ValueError(f"BLRHead fine_cfg: unknown keys {sorted(set(fc) - {'seg'})}")
+            if self.prior_feat_channels % 8:
+                raise ValueError("BLRHead fine_cfg needs prior_feat_channels divisible by 8 (GroupNorm)")
+            self.fine_map = FineMap(self.prior_feat_channels)
+            self.fine_seg = bool(fc.get("seg", True))
         self.seg_decoder = SegDecoder(self.img_h, self.img_w,
-                                      self.prior_feat_channels * self.num_levels, seg_num_classes)
+                                      self.prior_feat_channels * (self.num_levels + int(self.fine_seg)),
+                                      seg_num_classes)
         self.encoder = None
         if encoder_cfg is not None:
             ec = dict(encoder_cfg)
@@ -733,6 +805,68 @@ class BLRHead(_OfficialHead):
                                                img_h=self.img_h, **dict(target_adapter or {}))
         self.register_buffer("_train_step", torch.zeros((), dtype=torch.long))
         self.reset_parameters()
+        # built after the init above, so every other weight starts exactly as without it
+        self.strip = None
+        if strip_cfg is not None:
+            self._build_strip(dict(strip_cfg))
+
+    def _build_strip(self, sc):
+        known = {"levels", "half_bins", "bin_px", "sigma_bins", "iters", "dim", "layers", "num_neighbours",
+                 "row_step", "gamma", "loss_weight", "ce_weight", "l1_weight", "vis_weight", "step_weight",
+                 "mode"}
+        if set(sc) - known:
+            raise ValueError(f"BLRHead strip_cfg: unknown keys {sorted(set(sc) - known)}")
+        self.strip_mode = str(sc.get("mode", "final"))
+        if self.strip_mode not in ("final", "steps"):
+            raise ValueError(f"BLRHead strip_cfg.mode must be 'final' or 'steps', got {self.strip_mode!r}")
+        if self.strip_mode == "steps":
+            if self.num_iters < 2:
+                raise ValueError("BLRHead strip_cfg.mode 'steps' needs refine_cfg.num_iters >= 2 "
+                                 "(one pass in every step after the first)")
+            if "iters" in sc and int(sc["iters"]) != self.num_iters - 1:
+                raise ValueError("BLRHead strip_cfg.iters: in mode 'steps' the passes are refine_cfg.num_iters - 1 "
+                                 f"= {self.num_iters - 1}; drop the key")
+            sc = dict(sc, iters=self.num_iters - 1)
+        self.strip_levels = tuple(int(i) for i in sc.get("levels", (0, 1)))
+        if not self.strip_levels or min(self.strip_levels) < 0:
+            raise ValueError("strip_cfg.levels must be a non-empty tuple of neck output indices")
+        half, bin_px, sdim = int(sc.get("half_bins", 8)), float(sc.get("bin_px", 2.0)), int(sc.get("dim", 32))
+        self.strip = StripRefiner(self.prior_feat_channels * len(self.strip_levels), self.dim, sdim,
+                                  int(sc.get("layers", 3)), int(sc.get("iters", 2)), half, bin_px,
+                                  float(sc.get("sigma_bins", 1.0)))
+        self.strip_q_proj = nn.Linear(sdim, self.dim)
+        if self.strip_mode == "steps":
+            self.strip_in = nn.Linear(sdim, self.dim)              # a pass's quality -> the next GRU input
+            # scales the passes' corrections: 0 at init; used x10 so that AdamW (steps of about
+            # lr in the parameter) can open it within an epoch or two
+            self.strip_gate = nn.Parameter(torch.zeros(()))
+            self.strip_gate_scale = 10.0
+        self.strip_max_px = half * bin_px
+        self.strip_neighbours = int(sc.get("num_neighbours", 4))
+        self.strip_gamma = float(sc.get("gamma", 0.8))
+        self.strip_w = dict(loss=float(sc.get("loss_weight", 1.0)), ce=float(sc.get("ce_weight", 1.0)),
+                            l1=float(sc.get("l1_weight", 0.5)), vis=float(sc.get("vis_weight", 0.5)),
+                            step=float(sc.get("step_weight", 1.0)))
+        # strip rows = a subset of the output points (both ends kept); the correction is
+        # interpolated back to every output point
+        n_rows = max(2, -(-self.n_offsets // int(sc.get("row_step", 2))))
+        rows = torch.linspace(0, self.n_offsets - 1, n_rows).round().long()
+        lo = (torch.searchsorted(rows, torch.arange(self.n_offsets), right=True) - 1).clamp(0, n_rows - 2)
+        frac = (torch.arange(self.n_offsets).float() - rows[lo].float()) / (rows[lo + 1] - rows[lo]).float()
+        self.register_buffer("strip_rows", rows, persistent=False)
+        self.register_buffer("strip_lo", lo, persistent=False)
+        self.register_buffer("strip_frac", frac, persistent=False)
+        self._reset_strip()
+
+    def _reset_strip(self):
+        """The lateral logits start at zero (correction 0: the output is the last step's) and
+        the quality projection at zero (the o2o head starts as without the strip)."""
+        for lin in (self.strip.lat, self.strip_q_proj) + ((self.strip_in,) if self.strip_mode == "steps" else ()):
+            nn.init.zeros_(lin.weight)
+            nn.init.zeros_(lin.bias)
+        if self.strip_mode == "steps":
+            with torch.no_grad():
+                self.strip_gate.zero_()
 
     # ------------------------------------------------------------------ init
     def reset_parameters(self):
@@ -766,6 +900,8 @@ class BLRHead(_OfficialHead):
             nn.init.trunc_normal_(self.step_pos, std=0.02)
         if self.o2m_branch is not None:
             nn.init.normal_(self.branch_anchor_embed, std=0.02)
+        if getattr(self, "strip", None) is not None:
+            self._reset_strip()
 
     def init_weights(self):
         """The official head's init touches the anchor generator this head does
@@ -782,6 +918,35 @@ class BLRHead(_OfficialHead):
         if any(p > q for p, q in zip(areas[:-1], areas[1:])):
             raise RuntimeError("BLRHead expects neck outputs ordered fine -> coarse")
         return feats
+
+    def _fine_input(self, x):
+        """fine_cfg: the neck's finest output (P2), one level finer than the head's levels."""
+        if self.fine_map is None:
+            return None
+        x = list(x.values()) if isinstance(x, dict) else list(x)
+        if len(x) <= self.num_levels:
+            raise ValueError(f"BLRHead fine_cfg needs a neck level finer than the head's {self.num_levels} "
+                             f"(the neck gives {len(x)}): backbone out_indices (0, 1, 2, 3), neck "
+                             "in_channels [64, 128, 256, 512], num_outs 4")
+        return x[0]
+
+    def _fine(self, feats, fine_in):
+        if self.fine_map is None:
+            return None
+        if fine_in is None:
+            raise ValueError("BLRHead fine_cfg is set but no P2 was passed (forward_train/forward_test fine_in)")
+        return self.fine_map(fine_in, feats[-1])
+
+    def _strip_maps(self, x):
+        """The neck outputs strip_cfg samples (indices into the neck outputs, fine -> coarse)."""
+        if self.strip is None:
+            return None
+        x = list(x.values()) if isinstance(x, dict) else list(x)
+        if len(x) <= self.num_levels or max(self.strip_levels) >= len(x):
+            raise ValueError(f"BLRHead strip_cfg.levels {self.strip_levels} needs a neck level finer than the "
+                             f"head's {self.num_levels} (the neck gives {len(x)}): backbone out_indices "
+                             "(0, 1, 2, 3), neck in_channels [64, 128, 256, 512], num_outs 4")
+        return [x[i] for i in self.strip_levels]
 
     def official_layout(self, logits, pts, end_slopes=None):
         """[B, N, 6+R] from the output points [B, N, P, 2] and logits [B, N, 2];
@@ -804,7 +969,95 @@ class BLRHead(_OfficialHead):
         img_tok = self.img_proj(top.flatten(2).transpose(1, 2).float())
         return img_tok + sine_position_2d(top.shape[-2], top.shape[-1], self.dim, top.device, img_tok.dtype)[None]
 
-    def _forward(self, feats, img_tok=None, branch="main"):
+    def _strip_refine(self, pts, cps, h, score, maps):
+        """strip_cfg: move the last step's output points along their normals (raster_strip.py).
+        pts [B, N, P, 2] normalized; cps the last step's control points; h [B, N, dim] the anchor
+        state; score [B, N] the o2m score (neighbour raster weights) or None; maps the neck levels."""
+        batch_size, num_q = pts.shape[:2]
+        wh = pts.new_tensor([float(self.img_w - 1), float(self.img_h - 1)])
+        u_bins = self.strip.u_bins
+        with torch.no_grad():
+            pts_px = pts.detach().float() * wh                                    # [B, N, P, 2]
+            rows = pts_px[:, :, self.strip_rows]                                  # [B, N, S, 2]
+            nrm = curve_normals(rows)
+            cells = strip_cells(rows, nrm, u_bins)                                # [B, N, S, U, 2]
+            valid = (rows[..., 0] >= 0) & (rows[..., 0] <= wh[0]) & (rows[..., 1] >= 0) & (rows[..., 1] <= wh[1])
+            k = min(self.strip_neighbours, num_q - 1)
+            if k > 0:
+                s = score.float() if score is not None else rows.new_ones(batch_size, num_q)
+                nbr = render_neighbours(rows, nrm, valid, s, nearest_lanes(rows, valid, k), u_bins,
+                                        self.strip.sigma)
+            else:
+                nbr = rows.new_zeros(cells.shape[:-1])
+            nrm_out = curve_normals(pts_px)                                       # [B, N, P, 2]
+        strip = torch.cat([sample_strip(f, cells, self.img_w, self.img_h).float() for f in maps], dim=2)
+
+        def flat(t):
+            return t.reshape((batch_size * num_q,) + t.shape[2:])
+
+        iters, quality = self.strip(flat(strip), flat(nbr), flat(valid), flat(h.float()))
+        iters = [{key: v.view((batch_size, num_q) + v.shape[1:]) for key, v in it.items()} for it in iters]
+        u = iters[-1]["u"]                                                        # [B, N, S] px
+        frac = self.strip_frac.to(u.dtype)
+        u_out = u[..., self.strip_lo] * (1.0 - frac) + u[..., self.strip_lo + 1] * frac   # [B, N, P]
+        pts_ref = pts + u_out[..., None] * nrm_out / wh
+        pred = self.official_layout(pts.new_zeros((batch_size, num_q, 2)), pts_ref, bezier_end_slopes(cps))
+        return dict(pred=pred, pts=pts_ref, quality=quality.view(batch_size, num_q, -1), iters=iters,
+                    rows=rows, nrm=nrm, valid=valid)
+
+    def _strip_frame(self, pts, maps):
+        """strip_cfg mode "steps": the strip around the first step's output points pts [B, N, P, 2]
+        (normalized), fixed for the later steps; the evidence of maps is sampled once."""
+        batch_size, num_q = pts.shape[:2]
+        wh = pts.new_tensor([float(self.img_w - 1), float(self.img_h - 1)])
+        with torch.no_grad():
+            rows = (pts.detach().float() * wh)[:, :, self.strip_rows]               # [B, N, S, 2]
+            nrm = curve_normals(rows)
+            cells = strip_cells(rows, nrm, self.strip.u_bins)
+            valid = (rows[..., 0] >= 0) & (rows[..., 0] <= wh[0]) & (rows[..., 1] >= 0) & (rows[..., 1] <= wh[1])
+            k = min(self.strip_neighbours, num_q - 1)
+            nbr_idx = nearest_lanes(rows, valid, k) if k > 0 else None
+        ev = torch.cat([sample_strip(f, cells, self.img_w, self.img_h).float() for f in maps], dim=2)
+        return dict(rows=rows, nrm=nrm, valid=valid, nbr_idx=nbr_idx,
+                    ev=ev.reshape((batch_size * num_q,) + ev.shape[2:]))
+
+    def _strip_pass(self, frame, pts, h, score):
+        """strip_cfg mode "steps": one pass for the current output points pts [B, N, P, 2]
+        (normalized) in the fixed frame. Returns the pass outputs [B, N, ...] (logits, u: where
+        the lane is in the strip, vis, corr: the applied correction, px), the quality vector
+        [B * N, dim] and the displacement of the output points [B, N, P, 2] (normalized)."""
+        batch_size, num_q = pts.shape[:2]
+        wh = pts.new_tensor([float(self.img_w - 1), float(self.img_h - 1)])
+        rows, nrm, valid = frame["rows"], frame["nrm"], frame["valid"]
+        u_bins = self.strip.u_bins
+        with torch.no_grad():
+            cur = pts.detach().float() * wh                                          # [B, N, P, 2]
+            cur_ok = (cur[..., 0] >= 0) & (cur[..., 0] <= wh[0]) & (cur[..., 1] >= 0) & (cur[..., 1] <= wh[1])
+            u_own, has = normal_crossings(rows, nrm, cur, cur_ok, self.strip_max_px)   # [B, N, S]
+            has = has & valid
+            if frame["nbr_idx"] is not None:
+                s = score.float() if score is not None else rows.new_ones(batch_size, num_q)
+                cur_rows = cur[:, :, self.strip_rows]
+                nbr = render_neighbours(rows, nrm, valid, s, frame["nbr_idx"], u_bins, self.strip.sigma,
+                                        poly=cur_rows, poly_valid=cur_ok[:, :, self.strip_rows])
+            else:
+                nbr = rows.new_zeros(rows.shape[:-1] + (u_bins.numel(),))
+
+        def flat(t):
+            return t.reshape((batch_size * num_q,) + t.shape[2:])
+
+        x0 = self.strip.embed(frame["ev"], flat(nbr), flat(h.float()))
+        out, read = self.strip.step(x0, flat(u_own), flat(has))
+        gate = self.strip_gate * self.strip_gate_scale
+        corr = gate * (out["u"] - flat(u_own)) * flat(has).to(out["u"].dtype)               # [M, S] px
+        quality = self.strip.pool(read, flat(valid))
+        it = {key: v.view((batch_size, num_q) + v.shape[1:]) for key, v in dict(out, corr=corr).items()}
+        d_rows = it["corr"][..., None] * nrm                                         # [B, N, S, 2] px
+        frac = self.strip_frac.to(d_rows.dtype)[:, None]
+        disp = d_rows[:, :, self.strip_lo] * (1.0 - frac) + d_rows[:, :, self.strip_lo + 1] * frac
+        return it, quality, disp / wh
+
+    def _forward(self, feats, img_tok=None, branch="main", strip_maps=None, fine=None):
         """Decode one set of anchors: "main" (the detector) or "o2m" (o2m_branch_cfg's
         separate anchors, training only; returns their geometry and o2m scores)."""
         batch_size = feats[0].shape[0]
@@ -847,6 +1100,12 @@ class BLRHead(_OfficialHead):
             offsets = off * scale
             grid = grid + offsets
         raw = torch.cat([sample_points(f, grid).float() for f in feats], dim=-1)   # [B, N, S, L*C]
+        # align_cfg.detach_feats: the alignment's own read, the same values with the maps detached,
+        # so the feature term trains only the offsets
+        align_feats = raw
+        if (self.training and self.align is not None and self.align["detach_feats"]
+                and self.align["target"] in ("feature", "both")):
+            align_feats = torch.cat([sample_points(f.detach(), grid).float() for f in feats], dim=-1)
         tok = self.point_norm(self.point_proj(raw) + self.point_pos)
         geo = self.geo_vec(self.geo_point(raw).flatten(2))
         for block in self.blocks:
@@ -861,12 +1120,16 @@ class BLRHead(_OfficialHead):
             preds.append(lanes0)
             cps_list.append(cps_init)
             pts_list.append(curve_points(cps_init, self.t_out))
-        fine = feats[-1]
+        fine = feats[-1] if fine is None else fine              # fine_cfg: the stride-4 map
         hf = h.reshape(batch_size * num_q, dim)
         cur_pts = pts_s.detach()
         cps_cur = cps_init if self.proposal is not None else cps0
         deform_feats = feats[len(feats) - self.deform_levels:] if self.step_blocks is not None else None
         step_off, step_w = [], []
+        # strip_cfg mode "steps": built after the first step, one pass in every later step
+        steps_strip = (self.strip is not None and self.strip_mode == "steps" and strip_maps is not None
+                       and branch == "main")
+        s_frame, s_disp, s_q, s_iters = None, None, None, []
         for i in range(self.num_iters):
             if self.step_blocks is not None:                     # option B: a decoder block per step
                 lanes_cur = (preds[-1] if preds else lanes0).detach()
@@ -878,6 +1141,8 @@ class BLRHead(_OfficialHead):
                 step_off.append(self.step_blocks[i].curve.last_offset_px)
                 step_w.append(self.step_blocks[i].sa.last_self_weight)
             inp = [hf, self.delta_enc((params - params0).detach().float()).reshape(-1, dim)]
+            if s_q is not None:                                  # the previous pass's quality vector
+                inp[1] = inp[1] + self.strip_in(s_q)
             if self.resample_enc is not None:
                 fine_feat = sample_points(fine, cur_pts).float().flatten(2)          # [B, N, S*C]
                 inp.append(self.resample_enc(fine_feat).reshape(-1, dim))
@@ -892,6 +1157,20 @@ class BLRHead(_OfficialHead):
                 delta_raw = d if delta_raw is None else delta_raw + d
                 delta_pts = torch.tanh(delta_raw / self.max_point_offset_px) * self.max_point_offset
                 pts = torch.cat([pts[..., :1] + delta_pts[..., None], pts[..., 1:]], dim=-1)
+            if steps_strip:
+                if s_frame is None:
+                    s_frame = self._strip_frame(pts, strip_maps)
+                    s_disp = torch.zeros_like(pts)
+                else:
+                    pts = pts + s_disp                           # the earlier passes' corrections
+                    s_score = None
+                    if self.cls_o2m is not None:
+                        with torch.no_grad():
+                            s_score = torch.softmax(self.cls_o2m(hf.view(batch_size, num_q, dim)).float(), -1)[..., 1]
+                    it, s_q, disp = self._strip_pass(s_frame, pts, hf.view(batch_size, num_q, dim), s_score)
+                    s_iters.append(it)
+                    s_disp = s_disp + disp
+                    pts = pts + disp
             preds.append(self.official_layout(zeros2, pts, bezier_end_slopes(cps)))
             cps_list.append(cps)
             pts_list.append(pts)
@@ -911,12 +1190,23 @@ class BLRHead(_OfficialHead):
             cls_o2m = self.cls_o2m(h).float()
             with torch.no_grad():
                 s_o2m = torch.softmax(cls_o2m, dim=-1)[..., 1]
+        # strip_cfg: the corrected lanes are the output and their quality reaches the o2o head
+        final_pred, strip = preds[-1], None
+        if self.strip is not None and self.strip_mode == "final" and strip_maps is not None:
+            strip = self._strip_refine(pts_list[-1], cps_list[-1], h, s_o2m, strip_maps)
+            final_pred = strip["pred"]
+        elif steps_strip:
+            strip = dict(iters=s_iters, quality=s_q.view(batch_size, num_q, -1), rows=s_frame["rows"],
+                         nrm=s_frame["nrm"], valid=s_frame["valid"])
         h_o2o = h.detach() if self.o2o_stop_grad else h
-        h_fin = self.final_norm(h_o2o + self.final_sa(h_o2o, preds[-1], s_o2m))
+        if strip is not None:
+            h_o2o = h_o2o + self.strip_q_proj(strip["quality"].detach() if self.o2o_stop_grad else strip["quality"])
+        h_fin = self.final_norm(h_o2o + self.final_sa(h_o2o, final_pred, s_o2m))
         cls_o2o = self.cls_o2o(h_fin).float()
         return dict(preds=preds, cps=cps_list, pts=pts_list, cls_o2o=cls_o2o, cls_o2m=cls_o2m,
+                    final_pred=(final_pred if strip is not None and "pred" in strip else None), strip=strip,
                     anchor_lanes=lanes0.detach(), anchor_pts=pts_s.detach(), raw_feats=raw,
-                    offsets=offsets, feats=feats, h=h, prop_px=prop_px,
+                    align_feats=align_feats, offsets=offsets, feats=feats, h=h, prop_px=prop_px,
                     step_off_px=(torch.stack(step_off).mean() if step_off else None),
                     step_self_w=(torch.stack([w for w in step_w if w is not None]).mean()
                                  if step_w and all(w is not None for w in step_w) else None),
@@ -928,21 +1218,22 @@ class BLRHead(_OfficialHead):
     def _encode(self, feats):
         return self.encoder(feats) if self.encoder is not None else feats
 
-    def forward_train(self, feats):
+    def forward_train(self, feats, strip_maps=None, fine_in=None):
         feats = self._encode(feats)
+        fine = self._fine(feats, fine_in)
         img_tok = self._image_tokens(feats)
-        out = self._forward(feats, img_tok)
+        out = self._forward(feats, img_tok, strip_maps=strip_maps, fine=fine)
         if self.o2m_branch is not None:
-            out["o2m_branch"] = self._forward(feats, img_tok, branch="o2m")
-        size = feats[-1].shape[-2:]
+            out["o2m_branch"] = self._forward(feats, img_tok, branch="o2m", fine=fine)
+        size = (fine if self.fine_seg else feats[-1]).shape[-2:]
         seg_in = torch.cat([F.interpolate(f, size=size, mode="bilinear", align_corners=False)
-                            for f in feats], dim=1)
+                            for f in feats] + ([fine] if self.fine_seg else []), dim=1)
         out["seg"] = self.seg_decoder(seg_in)
         return out
 
-    def forward_test(self, feats):
+    def forward_test(self, feats, strip_maps=None, fine_in=None):
         feats = self._encode(feats)
-        out = self._forward(feats)
+        out = self._forward(feats, strip_maps=strip_maps, fine=self._fine(feats, fine_in))
         cfg = self.test_cfg or {}
         use_nms = bool(cfg.get("use_nms", True))
         source = self.test_score or ("o2m" if use_nms else "o2o")
@@ -955,6 +1246,13 @@ class BLRHead(_OfficialHead):
                 keep.scatter_(1, fg.topk(int(topk), dim=1).indices, True)
                 z = torch.stack([z[..., 0], torch.where(keep, z[..., 1], z[..., 1] - 1e4)], dim=-1)
         preds = list(out["preds"])
+        if out.get("final_pred") is not None:            # strip_cfg: the corrected lanes
+            preds.append(out["final_pred"])
+        step = cfg.get("output_step")
+        if step is not None:                             # evaluate an earlier output with the final scores
+            if not 0 <= int(step) < len(preds):
+                raise ValueError(f"test_cfg.output_step {step}: this head has outputs 0..{len(preds) - 1}")
+            preds = preds[:int(step) + 1]
         last = preds[-1].clone()
         last[..., :2] = z.to(last.dtype)
         preds[-1] = last
@@ -967,15 +1265,16 @@ class BLRHead(_OfficialHead):
 
     def forward(self, x, *args, **kwargs):
         feats = self._select_features(x)
+        strip_maps, fine_in = self._strip_maps(x), self._fine_input(x)
         if self.training:
-            return self.forward_train(feats)
-        return self.forward_test(feats)
+            return self.forward_train(feats, strip_maps, fine_in)
+        return self.forward_test(feats, strip_maps, fine_in)
 
     def loss(self, x, batch_data_samples, *args, **kwargs):
         if self.training:
             self._train_step += 1
         feats = self._select_features(x)
-        outs = self.forward_train(feats)
+        outs = self.forward_train(feats, self._strip_maps(x), self._fine_input(x))
         device = feats[0].device
         lanes = self.target_adapter.extract_lanes(batch_data_samples, device)
         seg_gt = None
@@ -1064,7 +1363,7 @@ class BLRHead(_OfficialHead):
             with torch.no_grad():
                 xy = torch.stack([x_gt, y_q], dim=-1)[None]          # [1, M, S, 2]
                 f_gt = torch.cat([sample_points(f[b:b + 1], xy).float() for f in outs["feats"]], dim=-1)[0]
-            f_a = outs["raw_feats"][b, n_idx]                        # [M, S, LC]
+            f_a = outs["align_feats"][b, n_idx]                      # [M, S, LC]
             if al["feature_loss"] == "l2":
                 err = ((f_a - f_gt) ** 2).mean(-1)
             elif al["feature_loss"] == "cos":
@@ -1080,6 +1379,57 @@ class BLRHead(_OfficialHead):
             terms["feature"] = (err * on_gt).sum() / on_gt.sum().clamp_min(1.0)
         return terms
 
+    def _strip_pair_terms(self, outs, b_idx, n_idx, gt):
+        """strip_cfg terms of matched pairs (candidates n_idx of images b_idx, GT rows gt [P, 6+R]).
+        Lateral target per strip row: where the GT polyline crosses the row's normal (inside the
+        strip). Returns per-pair sums and counts so images pool them like the point loss."""
+        st = outs["strip"]
+        rows, nrm, valid = st["rows"][b_idx, n_idx], st["nrm"][b_idx, n_idx], st["valid"][b_idx, n_idx]
+        gx = gt[:, 6:].float()
+        gy = (self.prior_ys.float() * float(self.img_h - 1)).expand_as(gx)
+        with torch.no_grad():
+            u_star, has = normal_crossings(rows, nrm, torch.stack([gx, gy], dim=-1),
+                                           (gx >= 0.0) & (gx < float(self.img_w)), self.strip_max_px)
+            has = has & valid
+            tgt = render_rows(u_star, self.strip.u_bins, self.strip.sigma)
+            tgt = tgt / tgt.sum(-1, keepdim=True).clamp_min(1e-12)
+        hf, vf = has.float(), valid.float()
+        w, n_it = self.strip_w, len(st["iters"])
+        lat = vis = rows.new_zeros(rows.shape[0])
+        for i, it in enumerate(st["iters"]):
+            g = self.strip_gamma ** (n_it - 1 - i)
+            ce = -(tgt * it["logits"][b_idx, n_idx].log_softmax(-1)).sum(-1)
+            l1 = _smooth_l1(it["u"][b_idx, n_idx], u_star, self.smooth_l1_beta)
+            lat = lat + g * ((w["ce"] * ce + w["l1"] * l1) * hf).sum(-1)
+            bce = F.binary_cross_entropy_with_logits(it["vis"][b_idx, n_idx], hf, reduction="none")
+            vis = vis + g * (bce * vf).sum(-1)
+        if outs.get("final_pred") is None:                   # mode "steps": the steps' own losses
+            zero = lat.new_zeros(lat.shape)
+            return dict(lat_num=lat, lat_den=hf.sum(-1), vis_num=vis, vis_den=vf.sum(-1), iou=zero,
+                        pt_num=zero, pt_den=zero)
+        scale = float(self.img_w - 1) / float(self.img_w)
+        iou = self.iou_loss(outs["final_pred"][b_idx, n_idx, 6:] * scale, gt[:, 6:] / float(self.img_w))
+        p_m = st["pts"][b_idx, n_idx]
+        x_gt, on = gt_x_at_y(gt, p_m[..., 1].detach(), self.img_w, self.n_strips)
+        err = _smooth_l1((p_m[..., 0] - x_gt) * float(self.img_w - 1), 0.0, self.smooth_l1_beta)
+        on_f = on.to(err.dtype)
+        return dict(lat_num=lat, lat_den=hf.sum(-1), vis_num=vis, vis_den=vf.sum(-1), iou=iou,
+                    pt_num=(err * on_f).sum(-1), pt_den=on_f.sum(-1))
+
+    def _strip_reduce(self, t, b_idx, batch_size):
+        """Per-image strip terms [B]: lateral and visibility terms and the point loss pooled over
+        the image's pairs, LaneIoU averaged over them (as the steps' terms)."""
+        def ps(v):
+            return per_image_sum(v, b_idx, batch_size)
+        lat = (ps(t["lat_num"]) / ps(t["lat_den"]).clamp_min(1.0)
+               + self.strip_w["vis"] * ps(t["vis_num"]) / ps(t["vis_den"]).clamp_min(1.0))
+        return dict(lat=lat, iou=ps(t["iou"]) / ps(torch.ones_like(t["iou"])).clamp_min(1.0),
+                    pt=ps(t["pt_num"]) / ps(t["pt_den"]).clamp_min(1.0))
+
+    def _strip_image_terms(self, outs, b, rows, gt_m):
+        t = self._strip_pair_terms(outs, torch.full_like(rows, b), rows, gt_m)
+        return {key: val.sum() for key, val in self._strip_reduce(t, torch.zeros_like(rows), 1).items()}
+
     def loss_by_outputs(self, outs, lanes, seg_gt=None):
         valid_targets = [t[t[:, 1] == 1] for t in lanes]
         core_fn = self._loss_core_batched if self.batched_loss else self._loss_core_loop
@@ -1092,7 +1442,7 @@ class BLRHead(_OfficialHead):
         """Assignment and geometry / alignment terms, one image at a time (reference).
         o2o / o2m / align turn those parts off (o2m also needs the o2m assigner)."""
         o2m = o2m and self.o2m_assigner is not None
-        final = outs["preds"][-1]
+        final = outs["final_pred"] if outs.get("final_pred") is not None else outs["preds"][-1]
         batch_size, num_q = final.shape[:2]
         dev = final.device
         zero = final.new_zeros(())
@@ -1104,6 +1454,8 @@ class BLRHead(_OfficialHead):
         align_sum = {"offset": zero, "feature": zero}
         align_n = 0
         num_pos_o2o = num_pos_o2m = 0
+        strip_sum = {"lat": zero, "iou": zero, "pt": zero}
+        use_strip = outs.get("strip") is not None
         pred_o2o = (torch.cat([outs["cls_o2o"].detach(), final[..., 2:].detach()], dim=-1)
                     if o2o else None)
         pred_o2m = (torch.cat([outs["cls_o2m"].detach(), final[..., 2:].detach()], dim=-1)
@@ -1122,6 +1474,9 @@ class BLRHead(_OfficialHead):
                 if rows.numel():
                     iou, pt, cp, ext = self._geometry_terms(outs, b, rows, cols, gt, gt_cps, gt_ok, gt_pts)
                     iou_sum, pt_sum, cp_sum, ext_sum = iou_sum + iou, pt_sum + pt, cp_sum + cp, ext_sum + ext
+                    if use_strip:
+                        for key, val in self._strip_image_terms(outs, b, rows, gt[cols]).items():
+                            strip_sum[key] = strip_sum[key] + val
             if o2m:
                 rows_m, cols_m = self._assign(self.o2m_assigner, pred_o2m[b], gt)
                 tgt_o2m[b, rows_m] = 1
@@ -1131,6 +1486,9 @@ class BLRHead(_OfficialHead):
                     w = self.o2m_reg_weight
                     iou_sum, pt_sum = iou_sum + w * iou, pt_sum + w * pt
                     cp_sum, ext_sum = cp_sum + w * cp, ext_sum + w * ext
+                    if use_strip:
+                        for key, val in self._strip_image_terms(outs, b, rows_m, gt[cols_m]).items():
+                            strip_sum[key] = strip_sum[key] + w * val
             if align and self.align is not None:
                 terms = self._align_terms(outs, b, gt)
                 if terms:
@@ -1139,7 +1497,8 @@ class BLRHead(_OfficialHead):
                         align_sum[key] = align_sum[key] + val
         return dict(tgt_o2o=tgt_o2o, tgt_o2m=tgt_o2m, gt_counts=gt_counts, iou=iou_sum, pt=pt_sum,
                     cp=cp_sum, ext=ext_sum, n_img=float(n_img), align=align_sum,
-                    align_n=float(align_n), num_pos_o2o=num_pos_o2o, num_pos_o2m=num_pos_o2m)
+                    align_n=float(align_n), num_pos_o2o=num_pos_o2o, num_pos_o2m=num_pos_o2m,
+                    strip=strip_sum)
 
     def _geometry_terms_batched(self, outs, b_idx, n_idx, j_idx, gt_flat, gt_cps, gt_ok, gt_pts,
                                 batch_size):
@@ -1233,7 +1592,7 @@ class BLRHead(_OfficialHead):
                 grid = xy.new_full((batch_size, p_max) + tuple(xy.shape[1:]), -2.0)
                 grid[b_p, rank] = xy
                 f_gt = torch.cat([sample_points(f, grid).float()[b_p, rank] for f in outs["feats"]], dim=-1)
-            f_a = outs["raw_feats"][b_p, n_p]                                     # [P, S, LC]
+            f_a = outs["align_feats"][b_p, n_p]                                   # [P, S, LC]
             if al["feature_loss"] in ("l2", "cos"):
                 if al["feature_loss"] == "l2":
                     err = ((f_a - f_gt) ** 2).mean(-1)
@@ -1278,12 +1637,13 @@ class BLRHead(_OfficialHead):
         zero = outs["preds"][-1].new_zeros(())
         out = dict(tgt_o2o=tgt_o2o, tgt_o2m=tgt_o2m, gt_counts=gt_counts, iou=zero, pt=zero, cp=zero,
                    ext=zero, n_img=n_img, align={"offset": zero, "feature": zero}, align_n=zero,
-                   num_pos_o2o=0, num_pos_o2m=0)
+                   num_pos_o2o=0, num_pos_o2m=0, strip={"lat": zero, "iou": zero, "pt": zero})
+        use_strip = outs.get("strip") is not None
         if layout.num == 0:
             return out
         gt_cps, gt_ok = fit_gt_bezier(layout.flat, self.prior_ys, self.img_w, self.img_h, self.cp_fit_ridge)
         gt_pts = curve_points(gt_cps, self.t_out)
-        final = outs["preds"][-1].detach()
+        final = (outs["final_pred"] if outs.get("final_pred") is not None else outs["preds"][-1]).detach()
         iou_sum = pt_sum = cp_sum = ext_sum = zero
         cache = None
         if o2o:
@@ -1300,6 +1660,9 @@ class BLRHead(_OfficialHead):
             iou, pt, cp, ext = self._geometry_terms_batched(outs, b_o, n_o, j_o, layout.flat, gt_cps, gt_ok,
                                                             gt_pts, batch_size)
             iou_sum, pt_sum, cp_sum, ext_sum = iou.sum(), pt.sum(), cp.sum(), ext.sum()
+            if use_strip and n_o.numel():
+                r = self._strip_reduce(self._strip_pair_terms(outs, b_o, n_o, layout.flat[j_o]), b_o, batch_size)
+                out["strip"] = {key: val.sum() for key, val in r.items()}
         if o2m:
             pred_o2m = torch.cat([outs["cls_o2m"].detach(), final[..., 2:]], dim=-1)
             if cache is None:                       # the o2m branch: its own geometry
@@ -1320,6 +1683,10 @@ class BLRHead(_OfficialHead):
                 w = self.o2m_reg_weight
                 iou_sum, pt_sum = iou_sum + w * iou.sum(), pt_sum + w * pt.sum()
                 cp_sum, ext_sum = cp_sum + w * cp.sum(), ext_sum + w * ext.sum()
+                if use_strip:
+                    j_m = layout.flat_index(b_m, g_m)
+                    r = self._strip_reduce(self._strip_pair_terms(outs, b_m, n_m, layout.flat[j_m]), b_m, batch_size)
+                    out["strip"] = {key: out["strip"][key] + w * val.sum() for key, val in r.items()}
         out.update(iou=iou_sum, pt=pt_sum, cp=cp_sum, ext=ext_sum)
         if align and self.align is not None:
             terms, has = self._align_terms_batched(outs, layout)
@@ -1350,6 +1717,12 @@ class BLRHead(_OfficialHead):
                       loss_point=pt_sum / norm * self.point_loss_weight,
                       loss_cp=cp_sum / norm * self.cp_loss_weight,
                       loss_extent=ext_sum / norm * self.extent_loss_weight)
+        if outs.get("strip") is not None:          # strip_cfg (main anchors only)
+            st, sw, n_steps = core["strip"], self.strip_w, float(len(outs["preds"]))
+            losses["loss_strip"] = st["lat"] / norm * sw["loss"]
+            if outs.get("final_pred") is not None:           # mode "final": the corrected lanes
+                losses["loss_strip_iou"] = st["iou"] / norm * sw["step"] / n_steps
+                losses["loss_strip_point"] = st["pt"] / norm * sw["step"] / n_steps * self.point_loss_weight
         if self.o2m_assigner is not None:
             cls_o2m = (focal_2cls(logits_o2m, tgt_o2m, self.focal_alpha, self.focal_gamma).sum(-1)
                        / gt_counts).mean()
@@ -1381,6 +1754,13 @@ class BLRHead(_OfficialHead):
             if bool(pos.any()):
                 diag["o2o_pos_prob"] = torch.softmax(outs["cls_o2o"], -1)[..., 1][pos].mean()
                 diag["o2o_neg_prob"] = torch.softmax(outs["cls_o2o"], -1)[..., 1][~pos].mean()
+            if outs.get("strip") is not None:
+                v = outs["strip"]["valid"].float()
+                last = outs["strip"]["iters"][-1]
+                diag["strip_corr_px"] = (last.get("corr", last["u"]).abs() * v).sum() / v.sum().clamp_min(1.0)
+                diag["strip_q_w"] = self.strip_q_proj.weight.abs().mean()
+                if self.strip_mode == "steps":
+                    diag["strip_gate"] = self.strip_gate.detach() * self.strip_gate_scale
             if self.point_offsets:
                 last_pts = outs["pts"][-1]
                 base = curve_points(outs["cps"][-1], self.t_out)

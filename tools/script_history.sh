@@ -2195,7 +2195,43 @@ echo "Training launcher PID: $TRAIN_PID"
 disown -h "$TRAIN_PID"
 tail -f "$LOG"
 
+# =========================================== #
+ ######### Visited at the 2026.10.16 #########
+# =========================================== #
+CONFIG_NAME="blrnet_curvelanes_r34_bgrecipe"
+MODEL_NAME="clrbezier"
+PORT=25001
+DATASET=curvelanes
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/run1
+LOG="$WORK_DIR/train.log"
+mkdir -p "$WORK_DIR"
+nohup env CUDA_VISIBLE_DEVICES=4,5,6,7 PORT=$PORT \
+    bash tools/dist_train.sh \
+    /exhdd/seungyu/CLRBezierLane/configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py \
+    4 \
+    --work-dir "$WORK_DIR" \
+    > "$LOG" 2>&1 < /dev/null &
+TRAIN_PID=$!
+echo "Training launcher PID: $TRAIN_PID"
+disown -h "$TRAIN_PID"
+tail -f "$LOG"
 
 
-
+CONFIG_NAME="blrnet_strip_steps_curvelanes_r34_bgrecipe"
+MODEL_NAME="clrbezier"
+PORT=25000
+DATASET=curvelanes
+WORK_DIR=/exhdd/seungyu/CLRBezierLane/work_dirs/$MODEL_NAME/$DATASET/$CONFIG_NAME/run1
+LOG="$WORK_DIR/train.log"
+mkdir -p "$WORK_DIR"
+nohup env CUDA_VISIBLE_DEVICES=0,1,2,3 PORT=$PORT \
+    bash tools/dist_train.sh \
+    /exhdd/seungyu/CLRBezierLane/configs/$MODEL_NAME/$DATASET/$CONFIG_NAME.py \
+    4 \
+    --work-dir "$WORK_DIR" \
+    > "$LOG" 2>&1 < /dev/null &
+TRAIN_PID=$!
+echo "Training launcher PID: $TRAIN_PID"
+disown -h "$TRAIN_PID"
+tail -f "$LOG"
 
