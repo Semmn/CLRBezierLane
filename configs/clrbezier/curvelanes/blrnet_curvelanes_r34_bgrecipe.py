@@ -255,7 +255,7 @@ log_processor = dict(
 # Head: 1e-4 -> 1e-5 (6.1e-5 after 9 epochs, 3.3e-5 after 18, 1.6e-5 after 27);
 # backbone: base 1e-5 = the minimum, so constant.
 param_scheduler = [
-    dict(type="PolyLR", power=2.0, eta_min=3e-5, begin=0, end=total_epochs,
+    dict(type="PolyLR", power=2.0, eta_min=1e-5, begin=0, end=total_epochs,
          by_epoch=True, convert_to_iter_based=True),
 ]
 log_config = dict(
