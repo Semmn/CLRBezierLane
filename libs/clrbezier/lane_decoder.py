@@ -100,6 +100,16 @@ class LaneRelationAttention(nn.Module):
         self.out = nn.Linear(dim, dim)
         self.drop = nn.Dropout(dropout)
         self.last_self_weight = None
+        self.rel_extra = None
+
+    def add_extra_features(self, num):
+        """Per-lane features (forward's extra [B, Q, num]) whose neighbour values and
+        differences to the query's own join the relation features. Zero-initialised, so
+        the attention starts exactly as without them."""
+        dim = self.out.in_features
+        self.rel_extra = nn.Linear(2 * int(num), dim)
+        nn.init.zeros_(self.rel_extra.weight)
+        nn.init.zeros_(self.rel_extra.bias)
 
     @torch.no_grad()
     def neighbours(self, lanes, scores):
@@ -152,14 +162,25 @@ class LaneRelationAttention(nn.Module):
         f = torch.where(valid[..., None], f, torch.zeros_like(f))
         return nbr, valid, f
 
-    def forward(self, x, lanes, scores=None):
-        """x [B, Q, C]; lanes [B, Q, 6+R] (official layout); scores [B, Q] or None."""
+    def forward(self, x, lanes, scores=None, extra=None):
+        """x [B, Q, C]; lanes [B, Q, 6+R] (official layout); scores [B, Q] or None;
+        extra [B, Q, E] or None (add_extra_features; detached here like the scores)."""
         batch_size, num_q, dim = x.shape
         heads, hd = self.num_heads, dim // self.num_heads
         nbr, valid, f = self.neighbours(lanes.detach().float(),
                                         None if scores is None else scores.detach())
         k1 = nbr.shape[-1]
         e = self.rel(f.to(x.dtype))                                     # [B, Q, 1+k, C]
+        if extra is not None:
+            if self.rel_extra is None:
+                raise ValueError("LaneRelationAttention: extra features need add_extra_features()")
+            ex = extra.detach().to(x.dtype)
+            n_ex = ex.shape[-1]
+            ex_j = torch.gather(ex, 1, nbr.reshape(batch_size, num_q * k1, 1).expand(-1, -1, n_ex))
+            ex_j = ex_j.view(batch_size, num_q, k1, n_ex)
+            ex_f = torch.cat([ex_j, ex_j - ex[:, :, None]], dim=-1)
+            ex_f = torch.where(valid[..., None], ex_f, torch.zeros_like(ex_f))
+            e = e + self.rel_extra(ex_f)
         flat = nbr.reshape(batch_size, num_q * k1, 1).expand(-1, -1, dim)
 
         def gather(t):

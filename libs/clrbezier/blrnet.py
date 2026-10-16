@@ -52,7 +52,7 @@ from mmengine.model import BaseModule
 from mmdet.registry import MODELS
 
 from .assigners import build_cost_cache, build_lane_assigner
-from .batched_loss import GTLayout, batched_assign, batched_cost_cache, per_image_sum
+from .batched_loss import GTLayout, batched_assign, batched_cost_cache, per_image_spearman, per_image_sum
 from .data_adapters import CLRTargetAdapter
 from .dedup import lane_rows
 from .geometry import bernstein_basis
@@ -61,8 +61,8 @@ from .lane_decoder import LaneRelationAttention
 from .lane_iou import LaneIoULoss
 from .modules import SegDecoder
 from .priors import clrernet_style_bezier_priors
-from .raster_strip import (StripRefiner, curve_normals, nearest_lanes, normal_crossings, render_neighbours,
-                           render_rows, sample_strip, strip_cells)
+from .raster_strip import (StripQuality, StripRefiner, curve_normals, nearest_lanes, normal_crossings,
+                           render_neighbours, render_rows, sample_strip, strip_cells)
 
 
 # ------------------------------------------------------------------ geometry
@@ -551,6 +551,17 @@ class BLRHead(_OfficialHead):
                  earlier passes), loss_weight (1.0), ce_weight (1.0), l1_weight (0.5, px),
                  vis_weight (0.5), step_weight (1.0: the corrected output's LaneIoU and point
                  losses weigh as one more refinement step), mode ("final").
+                 quality: None (off) or dict(weight=1.0, topk=4, hidden=64, relation=True):
+                 a localization quality per candidate from the last pass's lateral
+                 distributions (raster_strip.StripQuality: their sharpness, their agreement
+                 with the candidate's own rendered output position, the visibility), trained
+                 with BCE towards the candidate's best LaneIoU with any GT lane (all
+                 candidates; the training LaneIoU geometry), on detached inputs. relation:
+                 the qualities enter the final relation attention as a neighbour feature
+                 (each neighbour's quality and its difference to the query's, zero-initialized),
+                 so the o2o decision compares the copies' measured fit. Logs strip_q_rank
+                 (Spearman of quality vs LaneIoU over the candidates with LaneIoU > 0.3 in
+                 an image) and strip_q_mean.
                  mode "steps": the strip runs inside the refinement loop instead of after it.
                  It is built once around the first step's output (evidence sampled once, the
                  frame fixed like a map), and every later step does one pass after its GRU
@@ -571,6 +582,10 @@ class BLRHead(_OfficialHead):
     test_cfg.output_step: None (the last output) or an index into the outputs (proposal if
                  on, the refinement steps, the strip-corrected lanes in mode "final"): the
                  lanes of that output are decoded with the final scores, to evaluate steps.
+    test_cfg.quality_score: False; True (with strip_cfg.quality): the test score is the
+                 evaluated classifier's probability times the quality (GFLv2's joint score),
+                 before the nms_topk cap and NMS. Evaluation only; can be switched on a
+                 trained checkpoint.
     """
 
     def __init__(self, num_points=72, sample_points=36, prior_feat_channels=64, num_levels=3,
@@ -820,7 +835,7 @@ class BLRHead(_OfficialHead):
     def _build_strip(self, sc):
         known = {"levels", "half_bins", "bin_px", "sigma_bins", "iters", "dim", "layers", "num_neighbours",
                  "row_step", "gamma", "loss_weight", "ce_weight", "l1_weight", "vis_weight", "step_weight",
-                 "mode"}
+                 "mode", "quality"}
         if set(sc) - known:
             raise ValueError(f"BLRHead strip_cfg: unknown keys {sorted(set(sc) - known)}")
         self.strip_mode = str(sc.get("mode", "final"))
@@ -863,6 +878,18 @@ class BLRHead(_OfficialHead):
         self.register_buffer("strip_rows", rows, persistent=False)
         self.register_buffer("strip_lo", lo, persistent=False)
         self.register_buffer("strip_frac", frac, persistent=False)
+        # quality (built last, so every other weight starts exactly as without it)
+        self.strip_quality, self.strip_qcfg = None, None
+        qc = sc.get("quality")
+        if qc is not None:
+            qc = dict(qc)
+            q_known = {"weight", "topk", "hidden", "relation"}
+            if set(qc) - q_known:
+                raise ValueError(f"BLRHead strip_cfg.quality: unknown keys {sorted(set(qc) - q_known)}")
+            self.strip_qcfg = dict(weight=float(qc.get("weight", 1.0)), relation=bool(qc.get("relation", True)))
+            self.strip_quality = StripQuality(int(qc.get("topk", 4)), int(qc.get("hidden", 64)))
+            if self.strip_qcfg["relation"]:
+                self.final_sa.add_extra_features(1)
         self._reset_strip()
 
     def _reset_strip(self):
@@ -874,6 +901,9 @@ class BLRHead(_OfficialHead):
         if self.strip_mode == "steps":
             with torch.no_grad():
                 self.strip_gate.zero_()
+        if getattr(self.final_sa, "rel_extra", None) is not None:
+            nn.init.zeros_(self.final_sa.rel_extra.weight)
+            nn.init.zeros_(self.final_sa.rel_extra.bias)
 
     # ------------------------------------------------------------------ init
     def reset_parameters(self):
@@ -1058,7 +1088,9 @@ class BLRHead(_OfficialHead):
         gate = self.strip_gate * self.strip_gate_scale
         corr = gate * (out["u"] - flat(u_own)) * flat(has).to(out["u"].dtype)               # [M, S] px
         quality = self.strip.pool(read, flat(valid))
-        it = {key: v.view((batch_size, num_q) + v.shape[1:]) for key, v in dict(out, corr=corr).items()}
+        pos = flat(u_own) + corr                                                     # the output's position
+        it = {key: v.view((batch_size, num_q) + v.shape[1:])
+              for key, v in dict(out, corr=corr, pos=pos, ok=flat(has)).items()}
         d_rows = it["corr"][..., None] * nrm                                         # [B, N, S, 2] px
         frac = self.strip_frac.to(d_rows.dtype)[:, None]
         disp = d_rows[:, :, self.strip_lo] * (1.0 - frac) + d_rows[:, :, self.strip_lo + 1] * frac
@@ -1208,7 +1240,16 @@ class BLRHead(_OfficialHead):
         h_o2o = h.detach() if self.o2o_stop_grad else h
         if strip is not None:
             h_o2o = h_o2o + self.strip_q_proj(strip["quality"].detach() if self.o2o_stop_grad else strip["quality"])
-        h_fin = self.final_norm(h_o2o + self.final_sa(h_o2o, final_pred, s_o2m))
+        extra = None
+        if strip is not None and self.strip_quality is not None:
+            last = strip["iters"][-1]
+            pos, ok = (last["u"], strip["valid"]) if self.strip_mode == "final" else (last["pos"], last["ok"])
+            q_logit = self.strip_quality(last["logits"].flatten(0, 1), pos.flatten(0, 1), last["vis"].flatten(0, 1),
+                                         ok.flatten(0, 1), self.strip.u_bins, self.strip.sigma)
+            strip["q_logit"] = q_logit.view(batch_size, num_q)
+            if self.strip_qcfg["relation"]:
+                extra = torch.sigmoid(strip["q_logit"].detach())[..., None]
+        h_fin = self.final_norm(h_o2o + self.final_sa(h_o2o, final_pred, s_o2m, extra=extra))
         cls_o2o = self.cls_o2o(h_fin).float()
         return dict(preds=preds, cps=cps_list, pts=pts_list, cls_o2o=cls_o2o, cls_o2m=cls_o2m,
                     final_pred=(final_pred if strip is not None and "pred" in strip else None), strip=strip,
@@ -1245,6 +1286,12 @@ class BLRHead(_OfficialHead):
         use_nms = bool(cfg.get("use_nms", True))
         source = self.test_score or ("o2m" if use_nms else "o2o")
         z = out["cls_o2o"] if source == "o2o" or out["cls_o2m"] is None else out["cls_o2m"]
+        if bool(cfg.get("quality_score", False)):
+            if out.get("strip") is None or "q_logit" not in out["strip"]:
+                raise ValueError("BLRHead test_cfg.quality_score needs strip_cfg.quality")
+            p = (torch.softmax(z.float(), -1)[..., 1] * torch.sigmoid(out["strip"]["q_logit"].float()))
+            p = p.clamp(1e-6, 1.0 - 1e-6)
+            z = torch.stack([torch.zeros_like(p), torch.log(p) - torch.log1p(-p)], dim=-1).to(z.dtype)
         if not use_nms:
             topk = cfg.get("nms_topk")
             if topk is not None and 0 < int(topk) < z.shape[1]:
@@ -1447,7 +1494,37 @@ class BLRHead(_OfficialHead):
         branch = outs.get("o2m_branch")
         core = core_fn(outs, valid_targets, o2m=branch is None)
         core_b = core_fn(branch, valid_targets, o2o=False, align=False) if branch is not None else None
-        return self._loss_tail(outs, core, seg_gt, core_b)
+        losses = self._loss_tail(outs, core, seg_gt, core_b)
+        if outs.get("strip") is not None and "q_logit" in outs["strip"]:
+            losses.update(self._quality_terms(outs, valid_targets))
+        return losses
+
+    def _quality_terms(self, outs, valid_targets):
+        """strip_cfg.quality: BCE of every candidate's quality logit towards its best LaneIoU
+        with any GT lane of its image (0 without GT), averaged over all candidates."""
+        q_logit = outs["strip"]["q_logit"].float()
+        batch_size, num_q = q_logit.shape
+        final = (outs["final_pred"] if outs.get("final_pred") is not None else outs["preds"][-1]).detach()
+        layout = GTLayout(valid_targets, q_logit.device)
+        with torch.no_grad():
+            target = q_logit.new_zeros((batch_size, num_q))
+            if layout.num:
+                cache = batched_cost_cache(final, layout, self.img_w, self.img_h, self.lane_width,
+                                           self.lane_width_cost, {"lane_iou_dynamic"},
+                                           iou_shape=(self.iou_w, self.iou_h))
+                iou = cache["lane_iou_dynamic"].float()                              # [B, N, Gmax]
+                iou = torch.where(layout.mask[:, None, :], iou, torch.full_like(iou, -1.0))
+                target = iou.max(-1).values.clamp(0.0, 1.0)
+        loss = F.binary_cross_entropy_with_logits(q_logit, target, reduction="mean")
+        out = dict(loss_strip_quality=loss * self.strip_qcfg["weight"])
+        with torch.no_grad():
+            q = torch.sigmoid(q_logit)
+            m = target > 0.3
+            b_idx = torch.arange(batch_size, device=q.device)[:, None].expand(-1, num_q)
+            rank, n = per_image_spearman(q[m], target[m], b_idx[m], batch_size)
+            out["strip_q_rank"] = rank / n.clamp_min(1.0)
+            out["strip_q_mean"] = q.mean()
+        return out
 
     def _loss_core_loop(self, outs, valid_targets, o2o=True, o2m=True, align=True):
         """Assignment and geometry / alignment terms, one image at a time (reference).

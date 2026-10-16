@@ -165,3 +165,44 @@ class StripRefiner(nn.Module):
             u_cur = out["u"]
             outs.append(out)
         return outs, self.pool(read, row_valid)
+
+
+class StripQuality(nn.Module):
+    """Localization quality of a candidate from its strip (strip_cfg.quality): how well the
+    candidate's own rendered position agrees with where the strip says the lane is.
+
+    Per strip row: the top-k probabilities of the lateral distribution (how sharp the
+    evidence is), the agreement sum_u p(u) g(u - pos) with the candidate's own raster g
+    (a Gaussian of the strip's sigma at its output position pos; 1 when the distribution
+    sits on it), and the visibility. Pooled over the candidate's rows (plain and
+    visibility-weighted means, the share of usable rows) -> MLP -> one logit, trained
+    towards the candidate's best LaneIoU with any GT lane (as GFLv2's distribution-guided
+    quality is for boxes). The inputs are detached, so this loss trains only this MLP."""
+
+    def __init__(self, topk=4, hidden=64):
+        super().__init__()
+        self.topk = int(topk)
+        n_row = self.topk + 2
+        self.mlp = nn.Sequential(nn.Linear(2 * n_row + 1, int(hidden)), nn.ReLU(inplace=True),
+                                 nn.Linear(int(hidden), 1))
+
+    def stats(self, logits, pos, vis, row_ok, u_bins, sigma):
+        """logits [M, S, U]; pos [M, S] px (the candidate's output position in the strip);
+        vis [M, S] logits; row_ok [M, S] bool -> [M, 2 * (topk + 2) + 1]."""
+        p = logits.detach().float().softmax(-1)
+        k = min(self.topk, p.shape[-1])
+        top = p.topk(k, dim=-1).values
+        if k < self.topk:
+            top = F.pad(top, (0, self.topk - k))
+        own = render_rows(pos.detach().float(), u_bins.float(), sigma)
+        agree = (p * own).sum(-1, keepdim=True)
+        v = torch.sigmoid(vis.detach().float())[..., None]
+        f = torch.cat([top, agree, v], dim=-1)                                  # [M, S, topk + 2]
+        w = row_ok.float()[..., None]
+        mean = (f * w).sum(1) / w.sum(1).clamp_min(1.0)
+        wv = w * v
+        vmean = (f * wv).sum(1) / wv.sum(1).clamp_min(1e-6)
+        return torch.cat([mean, vmean, w.mean(1)], dim=-1)
+
+    def forward(self, logits, pos, vis, row_ok, u_bins, sigma):
+        return self.mlp(self.stats(logits, pos, vis, row_ok, u_bins, sigma))[..., 0]
