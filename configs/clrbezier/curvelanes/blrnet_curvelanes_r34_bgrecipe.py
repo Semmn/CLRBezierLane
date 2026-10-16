@@ -148,6 +148,8 @@ model = dict(
             tau=0.1,                  # InfoNCE temperature (0.1)
             offset_weight=0.05,       # px smooth-L1 (0.05)
             feature_weight=1.0,       # (1.0)
+            detach_feats=True,
+            exclusive=True
         ),
         assign_cfg=dict(
             # one-to-one, on the last refinement step, geometry first: the score term is linear
@@ -156,7 +158,7 @@ model = dict(
                      point_weight=0.0, iou_weight=3.0),
             # one-to-many for the o2m head (feature learning, with-NMS comparison); None drops it
             o2m=dict(type="SimOTALaneAssigner", candidate_topk=3, min_dynamic_k=1, cls_weight=1.0,
-                     cls_cost_mode="log", point_weight=1.0, iou_weight=3.0),
+                     cls_cost_mode="log", point_weight=0.0, iou_weight=3.0),
         ),
         loss_cfg=dict(
             cls_loss_weight=2.0,      # softmax focal, summed over anchors / GT lanes per image (2.0)
@@ -204,7 +206,7 @@ model = dict(
                                       # "o2o" | "o2m" forces one (None)
     ),
     test_cfg=dict(
-        conf_threshold=0.3,
+        conf_threshold=0.50,
         use_nms=False,
         as_lanes=True,
         extend_bottom=True,
@@ -237,7 +239,7 @@ randomness = dict(seed=0, deterministic=True)
 # (1e-5 throughout); the head's lr follows the poly curve below.
 optim_wrapper = dict(
     type="OptimWrapper",
-    optimizer=dict(type="AdamW", lr=1e-4, weight_decay=1e-4),
+    optimizer=dict(type="AdamW", lr=3e-4, weight_decay=1e-4),
     paramwise_cfg=dict(custom_keys={"backbone": dict(lr_mult=0.1)}),
     # clip_grad=dict(max_norm=35, norm_type=2),
 )
@@ -253,7 +255,7 @@ log_processor = dict(
 # Head: 1e-4 -> 1e-5 (6.1e-5 after 9 epochs, 3.3e-5 after 18, 1.6e-5 after 27);
 # backbone: base 1e-5 = the minimum, so constant.
 param_scheduler = [
-    dict(type="PolyLR", power=2.0, eta_min=1e-5, begin=0, end=total_epochs,
+    dict(type="PolyLR", power=2.0, eta_min=3e-5, begin=0, end=total_epochs,
          by_epoch=True, convert_to_iter_based=True),
 ]
 log_config = dict(

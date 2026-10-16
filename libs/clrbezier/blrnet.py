@@ -505,7 +505,12 @@ class BLRHead(_OfficialHead):
                  smooth-L1), feature_weight (1.0), detach_feats (False: the feature
                  term's gradient also reaches the feature maps, so it can be met by making
                  the features near a lane look like the lane; True: it reaches only the
-                 sampling offsets, through the sampling locations, so it moves the read)
+                 sampling offsets, through the sampling locations, so it moves the read),
+                 exclusive (False: each GT takes its topk nearest anchors, so an anchor near
+                 two lanes can be taken by both and get opposite targets; True: an anchor can
+                 go only to its nearest GT, and each GT takes its topk nearest among those;
+                 logs align_shared, the share of the plain assignment's pairs whose anchor
+                 another GT also took)
     assign_cfg : o2o (Hungarian cls 0.15 linear, iou 3), o2m (SimOTA topk 4,
                  cls 0.15 linear, iou 3) or None to drop the o2m head
     loss_cfg   : cls_loss_weight (2.0), focal_alpha (0.25), focal_gamma (2.0),
@@ -648,7 +653,8 @@ class BLRHead(_OfficialHead):
         if align_cfg is not None:
             al = dict(align_cfg)
             known = {"offsets", "max_offset_px", "topk", "max_px", "min_cover", "target",
-                     "feature_loss", "tau", "offset_weight", "feature_weight", "detach_feats"}
+                     "feature_loss", "tau", "offset_weight", "feature_weight", "detach_feats",
+                     "exclusive"}
             if set(al) - known:
                 raise ValueError(f"BLRHead align_cfg: unknown keys {sorted(set(al) - known)}")
             self.align = dict(offsets=bool(al.get("offsets", True)),
@@ -660,7 +666,8 @@ class BLRHead(_OfficialHead):
                               tau=float(al.get("tau", 0.1)),
                               offset_weight=float(al.get("offset_weight", 0.05)),
                               feature_weight=float(al.get("feature_weight", 1.0)),
-                              detach_feats=bool(al.get("detach_feats", False)))
+                              detach_feats=bool(al.get("detach_feats", False)),
+                              exclusive=bool(al.get("exclusive", False)))
             if self.align["target"] not in ("offset", "feature", "both"):
                 raise ValueError("align_cfg.target must be 'offset', 'feature' or 'both'")
             if self.align["feature_loss"] not in ("cos", "l2", "infonce"):
@@ -1342,6 +1349,11 @@ class BLRHead(_OfficialHead):
         ok = (cnt >= al["min_cover"] * valid_g.sum(-1).float()[None].clamp_min(1.0)) & (dist <= al["max_px"])
         dist = torch.where(ok, dist, torch.full_like(dist, float("inf")))
         k = min(al["topk"], dist.shape[0])
+        terms = {}
+        if al["exclusive"]:
+            dist, terms = self._align_exclusive(dist.t(), torch.zeros(dist.shape[1], dtype=torch.long,
+                                                                      device=gt.device), 1, k)
+            dist, terms = dist.t(), {key: val[0] for key, val in terms.items()}
         d_k, n_k = dist.topk(k, dim=0, largest=False)                # [k, G]
         pair = torch.isfinite(d_k)
         if not bool(pair.any()):
@@ -1352,7 +1364,6 @@ class BLRHead(_OfficialHead):
         x_gt, on_gt = gt_x_at_y(gt[g_idx], y_q, self.img_w, self.n_strips)
         if not bool(on_gt.any()):
             return None
-        terms = {}
         x_a = outs["anchor_pts"][b, n_idx, :, 0]
         if al["target"] in ("offset", "both") and outs["offsets"] is not None:
             off_x = outs["offsets"][b, n_idx, :, 0] * float(self.img_w - 1)
@@ -1494,7 +1505,7 @@ class BLRHead(_OfficialHead):
                 if terms:
                     align_n += 1
                     for key, val in terms.items():
-                        align_sum[key] = align_sum[key] + val
+                        align_sum[key] = align_sum.get(key, zero) + val
         return dict(tgt_o2o=tgt_o2o, tgt_o2m=tgt_o2m, gt_counts=gt_counts, iou=iou_sum, pt=pt_sum,
                     cp=cp_sum, ext=ext_sum, n_img=float(n_img), align=align_sum,
                     align_n=float(align_n), num_pos_o2o=num_pos_o2o, num_pos_o2m=num_pos_o2m,
@@ -1540,6 +1551,33 @@ class BLRHead(_OfficialHead):
         n = float(len(outs["preds"]))
         return iou / n, pt / n, cp / n, ext / n
 
+    @staticmethod
+    def _align_exclusive(dist, img, batch_size, k):
+        """align_cfg.exclusive. dist [J, N]: GT j (of image img[j]) to anchor n, inf where not
+        assignable. Keeps each anchor only for its nearest GT of its image (the first on ties)
+        and counts, per image, the plain top-k pairs and those whose anchor another GT also
+        took. Returns (dist, {"pairs": [B], "shared": [B]})."""
+        num_j, num_n = dist.shape
+        onehot = img.view(-1, 1) == torch.arange(batch_size, device=dist.device).view(1, -1)   # [J, B]
+        inf = dist.new_full((), float("inf"))
+        with torch.no_grad():
+            d_p, n_p = dist.topk(k, dim=1, largest=False)                                    # [J, k]
+            fin = torch.isfinite(d_p)
+            took = torch.zeros(num_j, num_n, dtype=dist.dtype, device=dist.device)
+            took.scatter_(1, n_p, fin.to(dist.dtype))                                          # [J, N]
+            claims = onehot.t().to(dist.dtype) @ took                                          # [B, N]
+            shared = fin & (claims[img].gather(1, n_p) > 1)
+            stats = {"pairs": fin.sum(1).to(dist.dtype), "shared": shared.sum(1).to(dist.dtype)}
+            stats = {key: torch.where(onehot, val[:, None], val.new_zeros(())).sum(0)
+                     for key, val in stats.items()}                                            # [B]
+            best = torch.where(onehot[:, :, None], dist[:, None, :], inf).amin(0)              # [B, N]
+            near = torch.isfinite(dist) & (dist == best[img])
+            j_idx = torch.arange(num_j, device=dist.device).view(-1, 1)
+            first = torch.where(onehot[:, :, None] & near[:, None, :], j_idx.view(-1, 1, 1),
+                                torch.full_like(j_idx.view(-1, 1, 1), num_j)).amin(0)          # [B, N]
+            mine = j_idx == first[img]
+        return torch.where(mine, dist, inf), stats
+
     def _align_terms_batched(self, outs, layout):
         """_align_terms for every image at once. Returns per-image terms {key: [B]} and
         the mask [B] of the images the loop would count (pairs and covered points)."""
@@ -1561,6 +1599,9 @@ class BLRHead(_OfficialHead):
               & (dist <= al["max_px"]))
         dist = torch.where(ok, dist, torch.full_like(dist, float("inf")))
         k = min(al["topk"], num_q)
+        terms = {}
+        if al["exclusive"]:
+            dist, terms = self._align_exclusive(dist, img, batch_size, k)
         d_k, n_k = dist.topk(k, dim=1, largest=False)                           # [J, k]
         pair = torch.isfinite(d_k)
         j_p = torch.arange(layout.num, device=gt.device)[:, None].expand(-1, k)[pair]
@@ -1574,7 +1615,6 @@ class BLRHead(_OfficialHead):
         on_f = on_gt.to(zero.dtype)
         den = per_image_sum(on_f.sum(-1), b_p, batch_size)
         has = den > 0                                       # pairs and at least one covered point
-        terms = {}
         x_a = outs["anchor_pts"][b_p, n_p, :, 0]
         if al["target"] in ("offset", "both") and outs["offsets"] is not None:
             off_x = outs["offsets"][b_p, n_p, :, 0] * float(self.img_w - 1)
@@ -1745,6 +1785,8 @@ class BLRHead(_OfficialHead):
                 diag[f"self_w_{'final' if i == len(outs['self_w']) - 1 else i}"] = w
             if outs["offsets"] is not None:
                 diag["offset_px"] = (outs["offsets"][..., 0].abs().mean() * float(self.img_w - 1))
+            if self.align is not None and self.align["exclusive"] and "pairs" in align_sum:
+                diag["align_shared"] = align_sum["shared"] / align_sum["pairs"].clamp_min(1.0)
             if outs.get("prop_px") is not None:
                 diag["prop_px"] = outs["prop_px"][..., :4].abs().mean()
             for key in ("step_off_px", "step_self_w", "enc_rel_delta"):
