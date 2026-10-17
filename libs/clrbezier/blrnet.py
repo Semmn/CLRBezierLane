@@ -215,6 +215,98 @@ class _MLP(nn.Sequential):
                          nn.Linear(dim, dim_out or dim))
 
 
+def drawn_rows(pred, n_strips):
+    """[..., R] bool: the rows predictions_to_lanes draws of each official-layout lane (start ..
+    end, extended to the bottom while x stays in [0, 1]) where x is in [0, 1]. Lanes of one row
+    or less are not drawn at all."""
+    xs = pred[..., 6:]
+    n_rows = xs.shape[-1]
+    inside = (xs >= 0.0) & (xs <= 1.0)
+    start = torch.round((1.0 - pred[..., 2].double()) * n_strips).clamp(0, n_strips).long()
+    length = torch.round(pred[..., 5] * float(n_strips)).long()
+    end = (start + length - 1).clamp(max=n_rows - 1)
+    k = torch.arange(n_rows, device=xs.device)
+    gap = (~inside) & (k < start[..., None])                     # an outside row below the start
+    first = torch.where(gap, k, torch.full_like(k, -1)).amax(-1) + 1
+    return (inside & (k >= first[..., None]) & (k <= end[..., None])
+            & ((end - first + 1) > 1)[..., None])
+
+
+class CopyMerge(nn.Module):
+    """merge_cfg: each candidate's output rows become a learned weighted mean of its copies'
+    rows. A copy of candidate i is a candidate whose drawn rows lie within radius_px of i's
+    (mean |dx| over the rows both draw, network px) and cover at least min_share of i's drawn
+    rows. Per row, the weights are a softmax over the copies that draw the row of
+    q_i . k_j / sqrt(d) + MLP(pair geometry and scores) (+ a learned bias for i itself); a
+    learned gate (0 at init) scales the move from i's own rows to the mean. blrnet_copy_merge.py
+    is the same merge at test time with fixed weights."""
+
+    GEO = 5           # mean |dx| / radius, common / own rows, s_o2m(j), s_o2o(j), s_o2m(j) - s_o2m(i)
+
+    def __init__(self, dim, key_dim, hidden):
+        super().__init__()
+        self.key_dim = int(key_dim)
+        self.q = nn.Linear(dim, self.key_dim)
+        self.k = nn.Linear(dim, self.key_dim)
+        self.geo = _MLP(self.GEO, int(hidden), 1)
+        self.self_bias = nn.Parameter(torch.zeros(()))
+        self.gate = nn.Parameter(torch.zeros(()))
+
+    def reset_parameters(self):
+        for lin in (self.q, self.k, self.geo[0]):
+            nn.init.xavier_uniform_(lin.weight)
+            nn.init.zeros_(lin.bias)
+        nn.init.zeros_(self.geo[2].weight)                      # the score / geometry term starts at 0
+        nn.init.zeros_(self.geo[2].bias)
+        with torch.no_grad():
+            self.self_bias.zero_()
+            self.gate.zero_()
+
+    def copies(self, xs, drawn, radius_px, min_share, img_w):
+        """([B, N, N] bool copies with the diagonal, [B, N, N] mean |dx| px, [B, N, N] common rows)."""
+        both = drawn[:, :, None] & drawn[:, None]
+        common = both.sum(-1)
+        own = drawn.sum(-1)
+        dist = torch.where(both, (xs[:, :, None] - xs[:, None]).abs(), xs.new_zeros(())).sum(-1) * float(img_w - 1)
+        mean = dist / common.clamp_min(1).to(dist.dtype)
+        cp = (common > 0) & (mean < radius_px) & (common.to(dist.dtype) >= min_share * own[..., None].to(dist.dtype))
+        eye = torch.eye(xs.shape[1], dtype=torch.bool, device=xs.device)
+        cp = (cp & ~eye) | (eye & (own > 0)[..., None])
+        return cp, mean, common
+
+    def forward(self, h, pred, s_o2m, s_o2o, n_strips, img_w, radius_px, min_share, gate_scale):
+        """The merged lanes (official layout; the first 6 columns and the input rows detached)
+        and detached statistics."""
+        pred_d = pred.detach()
+        xs = pred_d[..., 6:].float()
+        drawn = drawn_rows(pred_d, n_strips)
+        copies, mean, common = self.copies(xs, drawn, radius_px, min_share, img_w)
+        own = drawn.sum(-1).clamp_min(1).to(xs.dtype)
+        geo = torch.stack([torch.where(common > 0, (mean / radius_px).clamp(max=2.0), mean.new_full((), 2.0)),
+                           common.to(xs.dtype) / own[..., None],
+                           s_o2m[:, None, :].expand_as(mean), s_o2o[:, None, :].expand_as(mean),
+                           (s_o2m[:, None, :] - s_o2m[:, :, None])], dim=-1)
+        eye = torch.eye(xs.shape[1], dtype=xs.dtype, device=xs.device)
+        logit = (self.q(h).float() @ self.k(h).float().transpose(1, 2)) / math.sqrt(self.key_dim)
+        logit = logit + self.geo(geo).squeeze(-1) + self.self_bias * eye
+        logit = logit.masked_fill(~copies, -1e4)
+        logit = logit - logit.amax(-1, keepdim=True).detach()
+        member = copies[..., None] & drawn[:, None]                          # [B, i, j, row]
+        e = torch.exp(logit)[..., None] * member.to(xs.dtype)
+        den = e.sum(2)                                                       # [B, N, R]
+        merged = (e * xs[:, None]).sum(2) / den.clamp_min(1e-12)
+        multi = drawn & (member.sum(2) > 1)
+        g = self.gate * gate_scale
+        new_xs = xs + g * torch.where(multi, merged - xs, xs.new_zeros(()))
+        out = torch.cat([pred_d[..., :6], new_xs.to(pred.dtype)], dim=-1)
+        with torch.no_grad():
+            w_self = (torch.diagonal(e, dim1=1, dim2=2).permute(0, 2, 1) / den.clamp_min(1e-12))
+            mf = multi.to(xs.dtype)
+            stats = dict(copies=(copies.sum(-1) - 1).to(xs.dtype), multi=mf, self_w=w_self,
+                         shift_px=(new_xs - xs).abs() * float(img_w - 1), drawn=drawn)
+        return out, stats
+
+
 class BLRBlock(nn.Module):
     """One semantic / geometry interaction block (design items 2.1, 2.2)."""
 
@@ -533,6 +625,21 @@ class BLRHead(_OfficialHead):
     o2o_stop_grad: False; True: the o2o head (final relation attention and classifier) reads
                  the anchor state without gradient, so the one-to-one labels train only that
                  head (Polar R-CNN). Needs the o2m head on the same anchors.
+    merge_cfg  : None (off) or dict: merge a lane's copies instead of choosing one. After the o2o
+                 head, every candidate's output rows become a learned weighted mean of its
+                 copies' rows (CopyMerge): the candidates within radius_px (10.0; mean |dx| over
+                 the rows both draw, network px) that cover min_share (0.5) of its drawn rows.
+                 Weights per row: softmax over the copies drawing that row of a query-key
+                 product of the candidates' final states plus an MLP of the pair's geometry and
+                 detached scores (key_dim 64, hidden 32). A gate (0 at init, used x gate_scale
+                 10.0) scales the move, so at init the output is the last step's. The merged
+                 lanes are the output (assignment, test) and get their own LaneIoU loss on the
+                 o2o pairs and, at o2m_reg_weight, the o2m pairs (loss_merge_iou, x weight 1.0).
+                 Inputs are detached: the rows always, the states with detach (True), so the
+                 merge loss trains only CopyMerge. The o2o selection is unchanged. Not with
+                 strip_cfg mode "final". The merged lanes are the last output for
+                 test_cfg.output_step. Logs merge_gate, merge_copies, merge_self_w and
+                 merge_shift_px (candidates with o2m score >= 0.3).
     strip_cfg  : None (off) or dict: render-and-compare refinement after the last step
                  (raster_strip.py). Each candidate gets a strip along its final curve: rows =
                  every row_step-th output point, 2 * half_bins + 1 lateral bins of bin_px along
@@ -594,6 +701,7 @@ class BLRHead(_OfficialHead):
                  test_score=None, train_cfg=None, test_cfg=None, init_cfg=None, encoder_cfg=None,
                  o2m_branch_cfg=None, o2o_stop_grad=False, strip_cfg=None, fine_cfg=None, **unused):
         BaseModule.__init__(self, init_cfg=init_cfg)
+        merge_cfg = unused.pop("merge_cfg", None)
         if unused:
             print(f"[BLRHead] ignoring unused head arguments: {sorted(unused)}")
         a = dict(anchor_cfg or {})
@@ -831,6 +939,24 @@ class BLRHead(_OfficialHead):
         self.strip = None
         if strip_cfg is not None:
             self._build_strip(dict(strip_cfg))
+        self.merge = None
+        if merge_cfg is not None:
+            self._build_merge(dict(merge_cfg))
+
+    def _build_merge(self, mc):
+        known = {"radius_px", "min_share", "weight", "key_dim", "hidden", "detach", "gate_scale"}
+        if set(mc) - known:
+            raise ValueError(f"BLRHead merge_cfg: unknown keys {sorted(set(mc) - known)}")
+        if self.strip is not None and self.strip_mode == "final":
+            raise ValueError("BLRHead merge_cfg does not combine with strip_cfg mode 'final' (both replace "
+                             "the output); use mode 'steps' or no strip")
+        self.merge = dict(radius_px=float(mc.get("radius_px", 10.0)), min_share=float(mc.get("min_share", 0.5)),
+                          weight=float(mc.get("weight", 1.0)), detach=bool(mc.get("detach", True)),
+                          gate_scale=float(mc.get("gate_scale", 10.0)))
+        if self.merge["radius_px"] <= 0 or not 0.0 < self.merge["min_share"] <= 1.0:
+            raise ValueError("BLRHead merge_cfg: radius_px must be > 0 and min_share in (0, 1]")
+        self.copy_merge = CopyMerge(self.dim, int(mc.get("key_dim", 64)), int(mc.get("hidden", 32)))
+        self.copy_merge.reset_parameters()
 
     def _build_strip(self, sc):
         known = {"levels", "half_bins", "bin_px", "sigma_bins", "iters", "dim", "layers", "num_neighbours",
@@ -939,6 +1065,8 @@ class BLRHead(_OfficialHead):
             nn.init.normal_(self.branch_anchor_embed, std=0.02)
         if getattr(self, "strip", None) is not None:
             self._reset_strip()
+        if getattr(self, "merge", None) is not None:
+            self.copy_merge.reset_parameters()
 
     def init_weights(self):
         """The official head's init touches the anchor generator this head does
@@ -1251,8 +1379,19 @@ class BLRHead(_OfficialHead):
                 extra = torch.sigmoid(strip["q_logit"].detach())[..., None]
         h_fin = self.final_norm(h_o2o + self.final_sa(h_o2o, final_pred, s_o2m, extra=extra))
         cls_o2o = self.cls_o2o(h_fin).float()
+        final_out = final_pred if strip is not None and "pred" in strip else None
+        merge = None
+        if self.merge is not None:                  # merge_cfg: the copies' learned mean is the output
+            with torch.no_grad():
+                s_o2o = torch.softmax(cls_o2o, dim=-1)[..., 1]
+            s_m = s_o2m if s_o2m is not None else s_o2o
+            mc = self.merge
+            final_out, merge = self.copy_merge(h_fin.detach() if mc["detach"] else h_fin, final_pred, s_m, s_o2o,
+                                               self.n_strips, self.img_w, mc["radius_px"], mc["min_share"],
+                                               mc["gate_scale"])
+            merge["score"] = s_m
         return dict(preds=preds, cps=cps_list, pts=pts_list, cls_o2o=cls_o2o, cls_o2m=cls_o2m,
-                    final_pred=(final_pred if strip is not None and "pred" in strip else None), strip=strip,
+                    final_pred=final_out, strip=strip, merge=merge,
                     anchor_lanes=lanes0.detach(), anchor_pts=pts_s.detach(), raw_feats=raw,
                     align_feats=align_feats, offsets=offsets, feats=feats, h=h, prop_px=prop_px,
                     step_off_px=(torch.stack(step_off).mean() if step_off else None),
@@ -1461,7 +1600,7 @@ class BLRHead(_OfficialHead):
             lat = lat + g * ((w["ce"] * ce + w["l1"] * l1) * hf).sum(-1)
             bce = F.binary_cross_entropy_with_logits(it["vis"][b_idx, n_idx], hf, reduction="none")
             vis = vis + g * (bce * vf).sum(-1)
-        if outs.get("final_pred") is None:                   # mode "steps": the steps' own losses
+        if self.strip_mode != "final":                      # mode "steps": the steps' own losses
             zero = lat.new_zeros(lat.shape)
             return dict(lat_num=lat, lat_den=hf.sum(-1), vis_num=vis, vis_den=vf.sum(-1), iou=zero,
                         pt_num=zero, pt_den=zero)
@@ -1473,6 +1612,11 @@ class BLRHead(_OfficialHead):
         on_f = on.to(err.dtype)
         return dict(lat_num=lat, lat_den=hf.sum(-1), vis_num=vis, vis_den=vf.sum(-1), iou=iou,
                     pt_num=(err * on_f).sum(-1), pt_den=on_f.sum(-1))
+
+    def _merge_pair_iou(self, outs, b_idx, n_idx, gt):
+        """merge_cfg: LaneIoU loss [P] of the merged lanes of the matched pairs."""
+        scale = float(self.img_w - 1) / float(self.img_w)
+        return self.iou_loss(outs["final_pred"][b_idx, n_idx, 6:] * scale, gt[:, 6:] / float(self.img_w))
 
     def _strip_reduce(self, t, b_idx, batch_size):
         """Per-image strip terms [B]: lateral and visibility terms and the point loss pooled over
@@ -1544,6 +1688,8 @@ class BLRHead(_OfficialHead):
         num_pos_o2o = num_pos_o2m = 0
         strip_sum = {"lat": zero, "iou": zero, "pt": zero}
         use_strip = outs.get("strip") is not None
+        use_merge = outs.get("merge") is not None
+        merge_sum = zero
         pred_o2o = (torch.cat([outs["cls_o2o"].detach(), final[..., 2:].detach()], dim=-1)
                     if o2o else None)
         pred_o2m = (torch.cat([outs["cls_o2m"].detach(), final[..., 2:].detach()], dim=-1)
@@ -1565,6 +1711,9 @@ class BLRHead(_OfficialHead):
                     if use_strip:
                         for key, val in self._strip_image_terms(outs, b, rows, gt[cols]).items():
                             strip_sum[key] = strip_sum[key] + val
+                    if use_merge:
+                        merge_sum = merge_sum + self._merge_pair_iou(outs, torch.full_like(rows, b), rows,
+                                                                     gt[cols]).mean()
             if o2m:
                 rows_m, cols_m = self._assign(self.o2m_assigner, pred_o2m[b], gt)
                 tgt_o2m[b, rows_m] = 1
@@ -1577,6 +1726,9 @@ class BLRHead(_OfficialHead):
                     if use_strip:
                         for key, val in self._strip_image_terms(outs, b, rows_m, gt[cols_m]).items():
                             strip_sum[key] = strip_sum[key] + w * val
+                    if use_merge:
+                        merge_sum = merge_sum + w * self._merge_pair_iou(outs, torch.full_like(rows_m, b), rows_m,
+                                                                         gt[cols_m]).mean()
             if align and self.align is not None:
                 terms = self._align_terms(outs, b, gt)
                 if terms:
@@ -1586,7 +1738,7 @@ class BLRHead(_OfficialHead):
         return dict(tgt_o2o=tgt_o2o, tgt_o2m=tgt_o2m, gt_counts=gt_counts, iou=iou_sum, pt=pt_sum,
                     cp=cp_sum, ext=ext_sum, n_img=float(n_img), align=align_sum,
                     align_n=float(align_n), num_pos_o2o=num_pos_o2o, num_pos_o2m=num_pos_o2m,
-                    strip=strip_sum)
+                    strip=strip_sum, merge=merge_sum)
 
     def _geometry_terms_batched(self, outs, b_idx, n_idx, j_idx, gt_flat, gt_cps, gt_ok, gt_pts,
                                 batch_size):
@@ -1754,8 +1906,14 @@ class BLRHead(_OfficialHead):
         zero = outs["preds"][-1].new_zeros(())
         out = dict(tgt_o2o=tgt_o2o, tgt_o2m=tgt_o2m, gt_counts=gt_counts, iou=zero, pt=zero, cp=zero,
                    ext=zero, n_img=n_img, align={"offset": zero, "feature": zero}, align_n=zero,
-                   num_pos_o2o=0, num_pos_o2m=0, strip={"lat": zero, "iou": zero, "pt": zero})
+                   num_pos_o2o=0, num_pos_o2m=0, strip={"lat": zero, "iou": zero, "pt": zero}, merge=zero)
         use_strip = outs.get("strip") is not None
+        use_merge = outs.get("merge") is not None
+
+        def merge_mean(b_idx, n_idx, g_idx):          # merge_cfg: per-image mean LaneIoU loss, summed
+            v = self._merge_pair_iou(outs, b_idx, n_idx, layout.flat[layout.flat_index(b_idx, g_idx)])
+            cnt = per_image_sum(torch.ones_like(v), b_idx, batch_size).clamp_min(1.0)
+            return (per_image_sum(v, b_idx, batch_size) / cnt).sum()
         if layout.num == 0:
             return out
         gt_cps, gt_ok = fit_gt_bezier(layout.flat, self.prior_ys, self.img_w, self.img_h, self.cp_fit_ridge)
@@ -1780,6 +1938,8 @@ class BLRHead(_OfficialHead):
             if use_strip and n_o.numel():
                 r = self._strip_reduce(self._strip_pair_terms(outs, b_o, n_o, layout.flat[j_o]), b_o, batch_size)
                 out["strip"] = {key: val.sum() for key, val in r.items()}
+            if use_merge and n_o.numel():
+                out["merge"] = merge_mean(b_o, n_o, g_o)
         if o2m:
             pred_o2m = torch.cat([outs["cls_o2m"].detach(), final[..., 2:]], dim=-1)
             if cache is None:                       # the o2m branch: its own geometry
@@ -1804,6 +1964,8 @@ class BLRHead(_OfficialHead):
                     j_m = layout.flat_index(b_m, g_m)
                     r = self._strip_reduce(self._strip_pair_terms(outs, b_m, n_m, layout.flat[j_m]), b_m, batch_size)
                     out["strip"] = {key: out["strip"][key] + w * val.sum() for key, val in r.items()}
+                if use_merge:
+                    out["merge"] = out["merge"] + w * merge_mean(b_m, n_m, g_m)
         out.update(iou=iou_sum, pt=pt_sum, cp=cp_sum, ext=ext_sum)
         if align and self.align is not None:
             terms, has = self._align_terms_batched(outs, layout)
@@ -1837,9 +1999,11 @@ class BLRHead(_OfficialHead):
         if outs.get("strip") is not None:          # strip_cfg (main anchors only)
             st, sw, n_steps = core["strip"], self.strip_w, float(len(outs["preds"]))
             losses["loss_strip"] = st["lat"] / norm * sw["loss"]
-            if outs.get("final_pred") is not None:           # mode "final": the corrected lanes
+            if self.strip_mode == "final":                    # mode "final": the corrected lanes
                 losses["loss_strip_iou"] = st["iou"] / norm * sw["step"] / n_steps
                 losses["loss_strip_point"] = st["pt"] / norm * sw["step"] / n_steps * self.point_loss_weight
+        if outs.get("merge") is not None:             # merge_cfg: the merged lanes
+            losses["loss_merge_iou"] = core["merge"] / norm * self.merge["weight"]
         if self.o2m_assigner is not None:
             cls_o2m = (focal_2cls(logits_o2m, tgt_o2m, self.focal_alpha, self.focal_gamma).sum(-1)
                        / gt_counts).mean()
@@ -1880,6 +2044,14 @@ class BLRHead(_OfficialHead):
                 diag["strip_q_w"] = self.strip_q_proj.weight.abs().mean()
                 if self.strip_mode == "steps":
                     diag["strip_gate"] = self.strip_gate.detach() * self.strip_gate_scale
+            if outs.get("merge") is not None:
+                mg = outs["merge"]
+                sel = mg["score"] >= 0.3
+                selr = mg["multi"] * sel[..., None].to(mg["multi"].dtype)
+                diag["merge_gate"] = self.copy_merge.gate.detach() * self.merge["gate_scale"]
+                diag["merge_copies"] = (mg["copies"] * sel).sum() / sel.sum().clamp_min(1)
+                diag["merge_self_w"] = (mg["self_w"] * selr).sum() / selr.sum().clamp_min(1.0)
+                diag["merge_shift_px"] = (mg["shift_px"] * selr).sum() / selr.sum().clamp_min(1.0)
             if self.point_offsets:
                 last_pts = outs["pts"][-1]
                 base = curve_points(outs["cps"][-1], self.t_out)

@@ -114,7 +114,7 @@ def step_labels(head, n_preds, has_final):
         labels.append("proposal")
     labels += [f"step{i}" for i in range(n_preds - len(labels))]
     if has_final:
-        labels.append("strip")
+        labels.append("merge" if getattr(head, "merge", None) is not None else "strip")
     return labels
 
 
