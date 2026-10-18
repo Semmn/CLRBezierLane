@@ -2459,7 +2459,7 @@ disown -h $TEST_PID"
 tail -f "$LOG"
 
 
-CONFIG_NAME="hblrnet_a16_2d_curvelanes_r34_bgrecipe"
+CONFIG_NAME="hblrnet_a16_2d_mono_curvelanes_r34_bgrecipe"
 MODEL_NAME="clrbezier"
 PORT=25000
 DATASET=curvelanes
@@ -2477,7 +2477,7 @@ echo "Training launcher PID: $TRAIN_PID"
 disown -h "$TRAIN_PID"
 tail -f "$LOG"
 
-CONFIG_NAME="hblrnet_a16_2d_hier_curvelanes_r34_bgrecipe"
+CONFIG_NAME="hblrnet_a16_2d_hier_mono_curvelanes_r34_bgrecipe"
 MODEL_NAME="clrbezier"
 PORT=25001
 DATASET=curvelanes
