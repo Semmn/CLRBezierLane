@@ -31,6 +31,13 @@ before each segment layer, each segment token reads its lane token and its sibli
 exchanges start as the identity (zero-initialized output projections). Every lane layer's cubic gets the
 control-point loss; every layer's curve gets the LaneIoU and endpoint losses.
 
+curve_cfg.orientation_free (False): a lane has no direction. The GT runs bottom -> top, so the start of a
+near-horizontal lane is set by a tiny slope (and flips under the rotation augmentation), while the IoU
+loss and the matching ignore direction. With the switch on, the endpoint and control-point losses take
+the better of the two GT directions per pair and step (MapTR's permutation-equivalent polylines), the
+relation features read every lane bottom end first, and the test output turns each lane bottom -> top
+before the rows. Logs end_rev_frac (o2o pairs scored against the reversed GT, last output).
+
 Not supported here (raise): the row residual (point_offsets), the proposal, the alignment offsets,
 strip / merge, the o2m branch, o2o_stop_grad, per-step matching (step_cls). step_blocks and
 resample "fine" are required.
@@ -234,6 +241,14 @@ def fit_cubic_2d(pts, ridge=1e-2):
     return torch.linalg.solve(lhs, basis.T @ pts + ridge * c_lin)
 
 
+def bottom_first(pts, *others):
+    """Points [..., P, 2] (image y down) reversed where the first point is above the last; others [..., K, 2]
+    are reversed with them. Returns pts alone, or (pts, *others)."""
+    flip = (pts[..., 0, 1] < pts[..., -1, 1])[..., None, None]
+    out = [torch.where(flip, x.flip(-2), x) for x in (pts,) + others]
+    return out[0] if not others else tuple(out)
+
+
 # ------------------------------------------------------------------ relation attention in 2D
 class LaneRelationAttention2D(LaneRelationAttention):
     """LaneRelationAttention with 2D relation features. ``lanes`` are points [B, Q, P, 2] in px along
@@ -241,10 +256,15 @@ class LaneRelationAttention2D(LaneRelationAttention):
     (REL_FEATURES = 11, as the row version): chamfer distance both ways, the distances between the two
     starts and the two ends (in dist_scale units, capped at max_dist), the share of each lane's points
     within dist_scale of the other, the length difference (image widths), the neighbour's score, its
-    difference to the query's, has_score, is_self."""
+    difference to the query's, has_score, is_self. orientation_free (set by HBLRHead): each lane is read
+    from its lower end, so the start / end features do not depend on its direction."""
+
+    orientation_free = False
 
     @torch.no_grad()
     def neighbours(self, lanes, scores):
+        if self.orientation_free:
+            lanes = bottom_first(lanes)
         batch_size, num_q, num_p = lanes.shape[:3]
         dev = lanes.device
         d = torch.cdist(lanes.reshape(batch_size, num_q * num_p, 2),
@@ -329,7 +349,8 @@ class HBLRHead(BLRHead):
     curve_cfg (all optional): gt_points (48, arc-length samples of each GT lane), out_per_segment (24:
     output samples per third of the lane, so 3 * 24 + 1 points per lane), rel_points (12, per lane in the
     relation attention), cost_points (25, per lane in the matching cost), end_loss_weight (0.05, px
-    smooth-L1 on the start and end points), min_gt_len_px (8). The loss_cfg widths are reused:
+    smooth-L1 on the start and end points), min_gt_len_px (8), orientation_free (False: module docstring).
+    The loss_cfg widths are reused:
     lane_width (loss) and lane_width_cost (matching), as half-widths in the iou_eval_shape space.
     hier_cfg: None, or segments (3), seg_iters (3, steps after the lane steps), seg_deform_points (12,
     curve-attention reference points per segment), seg_sample_points (12, re-sampled per segment),
@@ -357,7 +378,8 @@ class HBLRHead(BLRHead):
         if problems:
             raise ValueError("HBLRHead: " + "; ".join(problems))
         cc = dict(curve_cfg or {})
-        known = {"gt_points", "out_per_segment", "rel_points", "cost_points", "end_loss_weight", "min_gt_len_px"}
+        known = {"gt_points", "out_per_segment", "rel_points", "cost_points", "end_loss_weight", "min_gt_len_px",
+                 "orientation_free"}
         if set(cc) - known:
             raise ValueError(f"HBLRHead curve_cfg: unknown keys {sorted(set(cc) - known)}")
         super().__init__(**kwargs)
@@ -367,6 +389,7 @@ class HBLRHead(BLRHead):
         self.cost_points = int(cc.get("cost_points", 25))
         self.end_loss_weight = float(cc.get("end_loss_weight", 0.05))
         self.min_gt_len_px = float(cc.get("min_gt_len_px", 8.0))
+        self.orientation_free = bool(cc.get("orientation_free", False))
         self.register_buffer("px_scale", torch.tensor([float(self.img_w - 1), float(self.img_h - 1)]),
                              persistent=False)
         self.register_buffer("eval_scale", torch.tensor([float(self.iou_w), float(self.iou_h)]), persistent=False)
@@ -387,6 +410,8 @@ class HBLRHead(BLRHead):
         for m in self.modules():
             if type(m) is LaneRelationAttention:
                 m.__class__ = LaneRelationAttention2D
+                if self.orientation_free:
+                    m.orientation_free = True
 
     def anchor_control_points_init(self):
         return anchor_control_points(self.anchor_params.detach().float()).clone()
@@ -590,7 +615,10 @@ class HBLRHead(BLRHead):
         rel_fin = self._px(curves[-1][:, :, sub]).detach()
         h_fin = self.final_norm(h + self.final_sa(h, rel_fin, s_o2m))
         cls_o2o = self.cls_o2o(h_fin).float()
-        preds = [self._layout(c, e) for c, e in zip(curves, ends)]
+        if self.orientation_free:
+            preds = [self._layout(*bottom_first(c, e)) for c, e in zip(curves, ends)]
+        else:
+            preds = [self._layout(c, e) for c, e in zip(curves, ends)]
         return dict(preds=preds, curves=curves, cps=cps_list, num_lane_steps=num_lane_steps, lane_cps=lane_cps,
                     cls_o2o=cls_o2o, cls_o2m=cls_o2m, final_pred=None, strip=None, merge=None,
                     h=h, offsets=None, raw_feats=raw, align_feats=raw, feats=feats, prop_px=None,
@@ -743,9 +771,11 @@ class HBLRHead(BLRHead):
                 "iou_cost_assign": 1.0 - torch.nan_to_num(iou_cost, nan=0.0),
                 "lane_iou_dynamic": torch.nan_to_num(iou_dyn, nan=0.0)}
 
-    def _pair_terms(self, outs, b, n, j, gt_flat, gt_cps, batch_size):
+    def _pair_terms(self, outs, b, n, j, gt_flat, gt_cps, batch_size, rev_out=None):
         """Per-image means over the pairs (b, n) <- GT j, averaged over the steps: 1 - LaneIoU, endpoint
-        and control-point smooth-L1 (the outputs with a lane cubic in outs["lane_cps"]) -> three [B] tensors."""
+        and control-point smooth-L1 (the outputs with a lane cubic in outs["lane_cps"]) -> three [B] tensors.
+        orientation_free: the endpoint and control-point terms against the better GT direction per pair and
+        step (jointly where both exist); rev_out (a list) receives the last output's reversed-pair share."""
         cnt = per_image_sum(torch.ones_like(b, dtype=torch.float), b, batch_size).clamp_min(1.0)
         g = gt_flat[j].float()
         g_eval, g_px = g * self.eval_scale, self._px(g)
@@ -760,10 +790,24 @@ class HBLRHead(BLRHead):
             p_px = self._px(p)
             e = torch.stack([p_px[:, 0] - g_px[:, 0], p_px[:, -1] - g_px[:, -1]], dim=1)
             l_end = _smooth_l1(e, 0.0, self.smooth_l1_beta).mean(dim=(-1, -2))
-            end = end + per_image_sum(l_end, b, batch_size) / cnt
             if c is not None:
                 l_cp = _smooth_l1(self._px(c[b, n].float()) - self._px(gt_cps[j]), 0.0,
                                   self.smooth_l1_beta).mean(dim=(-1, -2))
+            if self.orientation_free:
+                e_r = torch.stack([p_px[:, 0] - g_px[:, -1], p_px[:, -1] - g_px[:, 0]], dim=1)
+                l_end_r = _smooth_l1(e_r, 0.0, self.smooth_l1_beta).mean(dim=(-1, -2))
+                if c is not None:
+                    l_cp_r = _smooth_l1(self._px(c[b, n].float()) - self._px(gt_cps[j].flip(-2)), 0.0,
+                                        self.smooth_l1_beta).mean(dim=(-1, -2))
+                    rev = (l_end_r + l_cp_r < l_end + l_cp).detach()
+                    l_cp = torch.where(rev, l_cp_r, l_cp)
+                else:
+                    rev = (l_end_r < l_end).detach()
+                l_end = torch.where(rev, l_end_r, l_end)
+                if rev_out is not None and k == len(outs["curves"]) - 1 and rev.numel():
+                    rev_out.append(rev.float().mean())
+            end = end + per_image_sum(l_end, b, batch_size) / cnt
+            if c is not None:
                 cp = cp + per_image_sum(l_cp, b, batch_size) / cnt
         return iou / n_steps, end / n_steps, cp / float(max(1, n_cp))
 
@@ -779,6 +823,7 @@ class HBLRHead(BLRHead):
         zero = outs["cls_o2o"].new_zeros(())
         iou_sum = end_sum = cp_sum = zero
         num_pos_o2o = num_pos_o2m = 0
+        rev_o2o = []
         if layout.num:
             gt_cps = fit_cubic_2d(gt_flat.float(), self.cp_fit_ridge)
             final = outs["curves"][-1].detach()
@@ -787,7 +832,8 @@ class HBLRHead(BLRHead):
             b_o, n_o, g_o = batched_assign(self.o2o_assigner, cache, layout)
             tgt_o2o[b_o, n_o] = 1
             num_pos_o2o = int(n_o.numel())
-            iou, end, cp = self._pair_terms(outs, b_o, n_o, layout.flat_index(b_o, g_o), gt_flat, gt_cps, batch_size)
+            iou, end, cp = self._pair_terms(outs, b_o, n_o, layout.flat_index(b_o, g_o), gt_flat, gt_cps, batch_size,
+                                            rev_out=rev_o2o)
             iou_sum, end_sum, cp_sum = iou.sum(), end.sum(), cp.sum()
             if self.o2m_assigner is not None:
                 with torch.no_grad():
@@ -827,6 +873,8 @@ class HBLRHead(BLRHead):
             if bool(pos.any()):
                 p = torch.softmax(outs["cls_o2o"], -1)[..., 1]
                 diag["o2o_pos_prob"], diag["o2o_neg_prob"] = p[pos].mean(), p[~pos].mean()
+            if self.orientation_free:
+                diag["end_rev_frac"] = rev_o2o[0].detach() if rev_o2o else torch.zeros((), device=dev)
         losses.update(diag)
         return losses
 
