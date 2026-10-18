@@ -38,6 +38,22 @@ the better of the two GT directions per pair and step (MapTR's permutation-equiv
 relation features read every lane bottom end first, and the test output turns each lane bottom -> top
 before the rows. Logs end_rev_frac (o2o pairs scored against the reversed GT, last output).
 
+curve_cfg.y_order / frame / match_end_len (YSY, 2026-10-18; defaults keep the head as above):
+- frame "image": every update (lane and segment level) is in the image axes, px per control point, instead
+  of the lane's own tangent / normal; the chain's residual is then in the image axes too. The levels share
+  one frame and the control-point target lives in it.
+- y_order "monotone" (needs frame "image"): every curve is monotone in y by construction. A chain of
+  control points (the lane's 4, or the 3S + 1 of the segments) keeps its bottom point, and each next
+  point's y is the previous minus a softplus increment; x is free. Updates move x (px), the bottom y (px)
+  and the increments' pre-activations. A split of a monotone cubic is monotone, so the segments stay one
+  monotone chain with shared joints; the G1 handles are shortened where needed to keep the y order. The
+  anchors are made monotone (cumulative min of y). Lanes run bottom -> top, as the GT does.
+- y_order "penalty": control points stay free and a hinge on every rise of y along them (px, every output,
+  every anchor) is added as loss_order (order_loss_weight, 0.05).
+- match_end_len: the matching cost's point term (assign_cfg point_weight) becomes the endpoint distance
+  (mean of the two ends, px / (img_h - 1); the better direction with orientation_free) plus the length
+  term |len_pred / len_gt - 1| (at most 1), as in BezierFormer's matching cost.
+
 Not supported here (raise): the row residual (point_offsets), the proposal, the alignment offsets,
 strip / merge, the o2m branch, o2o_stop_grad, per-step matching (step_cls). step_blocks and
 resample "fine" are required.
@@ -126,6 +142,55 @@ def frame_delta(c_px, upd):
     tan = cubic_tangents(c_px.detach(), torch.linspace(0.0, 1.0, 4, device=c_px.device))
     nrm = torch.stack([-tan[..., 1], tan[..., 0]], dim=-1)
     return upd[..., :1] * tan + upd[..., 1:] * nrm
+
+
+MONO_EPS_PX = 1e-2      # smallest y increment between consecutive control points (px), y_order "monotone"
+
+
+def inv_softplus(x):
+    """Inverse of softplus for x > 0."""
+    return torch.where(x > 20.0, x, x + torch.log(-torch.expm1(-x)))
+
+
+def monotone_step(q_px, d, index, count, eps=MONO_EPS_PX):
+    """y-monotone update of chains of control points q_px [..., 3S + 1, 2] (px, image y down, bottom first):
+    d [..., S, 4, 2] per piece moves x of the piece's 4 points (d[..., 0]; shared joints averaged), adds to
+    the softplus pre-activations of the piece's 3 y increments (d[..., 1:, 1]) and moves the chain's bottom
+    y (d[..., 0, 0, 1]). Each point's y is the previous minus a positive increment (in floating point it can
+    round to 0 for extreme updates: the chain is then non-increasing, still monotone)."""
+    dx = q_px.new_zeros(q_px.shape[:-1]).index_add(-1, index, d[..., 0].flatten(-2)) / count
+    y = q_px[..., 1]
+    inc = (y[..., :-1] - y[..., 1:]).clamp_min(eps)
+    inc = F.softplus(inv_softplus(inc) + d[..., 1:, 1].flatten(-2))
+    y0 = y[..., :1] + d[..., 0, 0, 1:2]
+    return torch.stack([q_px[..., 0] + dx, torch.cat([y0, y0 - torch.cumsum(inc, dim=-1)], dim=-1)], dim=-1)
+
+
+def monotone_fix(c_px):
+    """Control points [..., K, 2] (px) made non-increasing in y (cumulative min)."""
+    return torch.stack([c_px[..., 0], torch.cummin(c_px[..., 1], dim=-1).values], dim=-1)
+
+
+def g1_project_monotone(q_px, eps=1e-3):
+    """c1_project for y-monotone chains: the same collinear handles, each shortened where needed so that the
+    chain stays non-increasing in y (no handle goes below the point before it or above the point after)."""
+    rows = list(q_px.unbind(-2))
+    for j in range(3, q_px.shape[-2] - 1, 3):
+        a, jt, c = rows[j - 1], rows[j], rows[j + 1]
+        d = c - a
+        n = d.norm(dim=-1, keepdim=True)
+        u = d / n.clamp_min(eps)
+        ok = n > eps
+        up = (-u[..., 1:]).clamp_min(0.0)                     # a monotone chain runs up: u_y <= 0
+        la, lc = (jt - a).norm(dim=-1, keepdim=True), (c - jt).norm(dim=-1, keepdim=True)
+        room_a = (rows[j - 2][..., 1:] - jt[..., 1:]).clamp_min(0.0)
+        room_c = (jt[..., 1:] - rows[j + 2][..., 1:]).clamp_min(0.0)
+        steep = up > 0
+        la = torch.where(steep, torch.minimum(la, room_a / up.clamp_min(1e-12)), la)
+        lc = torch.where(steep, torch.minimum(lc, room_c / up.clamp_min(1e-12)), lc)
+        rows[j - 1] = torch.where(ok, jt - la * u, a)
+        rows[j + 1] = torch.where(ok, jt + lc * u, c)
+    return torch.stack(rows, dim=-2)
 
 
 def c1_project(q_px, eps=1e-3):
@@ -349,7 +414,9 @@ class HBLRHead(BLRHead):
     curve_cfg (all optional): gt_points (48, arc-length samples of each GT lane), out_per_segment (24:
     output samples per third of the lane, so 3 * 24 + 1 points per lane), rel_points (12, per lane in the
     relation attention), cost_points (25, per lane in the matching cost), end_loss_weight (0.05, px
-    smooth-L1 on the start and end points), min_gt_len_px (8), orientation_free (False: module docstring).
+    smooth-L1 on the start and end points), min_gt_len_px (8), orientation_free (False), frame ("lane" or
+    "image"), y_order (None, "monotone" or "penalty"), order_loss_weight (0.05), match_end_len (False): module
+    docstring.
     The loss_cfg widths are reused:
     lane_width (loss) and lane_width_cost (matching), as half-widths in the iou_eval_shape space.
     hier_cfg: None, or segments (3), seg_iters (3, steps after the lane steps), seg_deform_points (12,
@@ -379,9 +446,15 @@ class HBLRHead(BLRHead):
             raise ValueError("HBLRHead: " + "; ".join(problems))
         cc = dict(curve_cfg or {})
         known = {"gt_points", "out_per_segment", "rel_points", "cost_points", "end_loss_weight", "min_gt_len_px",
-                 "orientation_free"}
+                 "orientation_free", "frame", "y_order", "order_loss_weight", "match_end_len"}
         if set(cc) - known:
             raise ValueError(f"HBLRHead curve_cfg: unknown keys {sorted(set(cc) - known)}")
+        if cc.get("frame", "lane") not in ("lane", "image"):
+            raise ValueError("HBLRHead curve_cfg.frame must be 'lane' or 'image'")
+        if cc.get("y_order") not in (None, "monotone", "penalty"):
+            raise ValueError("HBLRHead curve_cfg.y_order must be None, 'monotone' or 'penalty'")
+        if cc.get("y_order") == "monotone" and cc.get("frame", "lane") != "image":
+            raise ValueError("HBLRHead curve_cfg.y_order 'monotone' updates in the image axes: set frame='image'")
         super().__init__(**kwargs)
         self.gt_points = int(cc.get("gt_points", 48))
         self.out_per_segment = int(cc.get("out_per_segment", 24))
@@ -390,6 +463,10 @@ class HBLRHead(BLRHead):
         self.end_loss_weight = float(cc.get("end_loss_weight", 0.05))
         self.min_gt_len_px = float(cc.get("min_gt_len_px", 8.0))
         self.orientation_free = bool(cc.get("orientation_free", False))
+        self.frame = str(cc.get("frame", "lane"))
+        self.y_order = cc.get("y_order")
+        self.order_loss_weight = float(cc.get("order_loss_weight", 0.05))
+        self.match_end_len = bool(cc.get("match_end_len", False))
         self.register_buffer("px_scale", torch.tensor([float(self.img_w - 1), float(self.img_h - 1)]),
                              persistent=False)
         self.register_buffer("eval_scale", torch.tensor([float(self.iou_w), float(self.iou_h)]), persistent=False)
@@ -509,6 +586,26 @@ class HBLRHead(BLRHead):
     def _norm(self, xy_px):
         return xy_px / self.px_scale.to(xy_px.dtype)
 
+    def _lane_step(self, c_px, upd):
+        """One lane update of cubics c_px [B, N, 4, 2] (px) by upd [B, N, 4, 2] (curve_cfg.frame / y_order)."""
+        if self.frame == "lane":
+            return c_px + frame_delta(c_px, upd)
+        if self.y_order == "monotone":
+            index, count = self._joint_index(1, c_px.device)
+            return monotone_step(c_px, upd[..., None, :, :], index, count)
+        return c_px + upd
+
+    def _chain_step(self, q_px, upd, index, count):
+        """One segment update of piecewise control points q_px [B, N, 3S + 1, 2] (px) by upd [B, N, S, 4, 2]
+        -> (new points, their move px)."""
+        if self.y_order == "monotone":
+            q_new = g1_project_monotone(monotone_step(q_px, upd, index, count))
+            return q_new, q_new - q_px
+        delta = frame_delta(pieces_of(q_px), upd) if self.frame == "lane" else upd
+        d_q = delta.new_zeros(q_px.shape).index_add(2, index, delta.flatten(2, 3))
+        d_q = d_q / count.view(1, 1, -1, 1)                                     # shared joints: the mean
+        return c1_project(q_px + d_q), d_q
+
     def _layout(self, pts, cps_ends):
         """Official rows of points [B, N, P, 2] for the test output; cps_ends [B, N, 4, 2] give the end
         tangents (bezier_end_slopes) that continue the lane beyond its ends."""
@@ -519,6 +616,8 @@ class HBLRHead(BLRHead):
         batch_size = feats[0].shape[0]
         num_q, dim = self.num_anchors, self.dim
         cps0 = self.anchor_cps[None].expand(batch_size, -1, -1, -1).float()      # [B, N, 4, 2]
+        if self.y_order == "monotone":
+            cps0 = self._norm(monotone_fix(self._px(cps0)))
         pts_s = curve_points(cps0, self.t_sample)
         sem = self.anchor_embed[None].expand(batch_size, -1, -1) + self.geo_enc(curve_code(self._px(cps0), self.img_h - 1))
         if img_tok is None:
@@ -553,7 +652,7 @@ class HBLRHead(BLRHead):
                    self.resample_enc(sample_points(fine, cur_pts).float().flatten(2)).reshape(-1, dim)]
             hf = self.gru(torch.cat(inp, dim=-1), hf)
             upd = self.update(hf).view(batch_size, num_q, 4, 2).float() * self.step_scale   # px, lane frame
-            cps = self._norm(self._px(cps) + frame_delta(self._px(cps), upd))
+            cps = self._norm(self._lane_step(self._px(cps), upd))
             curves.append(curve_points(cps, self.t_out_2d))
             cps_list.append(cps)
             ends.append(cps)
@@ -587,10 +686,8 @@ class HBLRHead(BLRHead):
                        self.seg_resample_enc(sample_points(fine, pts_seg).float().flatten(2)).reshape(-1, dim)]
                 hs = self.seg_gru(torch.cat(inp, dim=-1), hs)
                 upd = self.seg_update(hs).view(batch_size, num_q, segs, 4, 2).float() * self.step_scale
-                delta = frame_delta(self._px(pc), upd)                            # [B, N, S, 4, 2] px
-                d_q = delta.new_zeros(batch_size, num_q, 3 * segs + 1, 2).index_add(2, index, delta.flatten(2, 3))
-                d_q = d_q / count.view(1, 1, -1, 1)                               # shared joints: the mean
-                q = self._norm(c1_project(self._px(q) + d_q))
+                q_px, d_q = self._chain_step(self._px(q), upd, index, count)
+                q = self._norm(q_px)
                 moves.append(d_q.detach().norm(dim=-1).mean())
                 curves.append(piecewise_points(q, self.out_per_segment))
                 cps_list.append(q)
@@ -643,7 +740,9 @@ class HBLRHead(BLRHead):
         projected -> piecewise control points [B, N, 3S + 1, 2] (normalized)."""
         segs = res.shape[2]
         base = self._px(subdivide_cubic(c, segs))
-        delta = frame_delta(pieces_of(base), res)                                   # [B, N, S, 4, 2] px
+        if self.y_order == "monotone":
+            return self._norm(g1_project_monotone(monotone_step(base, res, index, count)))
+        delta = frame_delta(pieces_of(base), res) if self.frame == "lane" else res   # [B, N, S, 4, 2] px
         d_q = delta.new_zeros(base.shape).index_add(2, index, delta.flatten(2, 3)) / count.view(1, 1, -1, 1)
         return self._norm(c1_project(base + d_q))
 
@@ -688,7 +787,7 @@ class HBLRHead(BLRHead):
                    self.resample_enc(sample_points(fine, pts_q).float().flatten(2)).reshape(-1, dim)]
             hf = self.gru(torch.cat(inp, dim=-1), hf)
             upd = self.update(hf).view(batch_size, num_q, 4, 2).float() * self.step_scale   # px, lane frame
-            c = self._norm(self._px(c) + frame_delta(self._px(c), upd))
+            c = self._norm(self._lane_step(self._px(c), upd))
             q = self._compose(c, res, index, count)
             record(c)
 
@@ -764,12 +863,28 @@ class HBLRHead(BLRHead):
         gt = gt * self.eval_scale
         iou_cost = lane_iou_2d(a, gt, self.lane_width_cost * self.iou_w, pairwise=True)
         iou_dyn = lane_iou_2d(a, gt, self.lane_width * self.iou_w, pairwise=True)
+        point_cost = torch.zeros_like(iou_cost)
+        if self.match_end_len:
+            point_cost = self._end_len_cost(a / self.eval_scale, gt / self.eval_scale)
         fg = torch.softmax(logits.float(), dim=-1)[..., 1].clamp(1e-6, 1.0 - 1e-6)
         cls_cost = torch.nan_to_num(-torch.log(fg), nan=100.0, posinf=100.0, neginf=100.0)
         return {"cls_cost": cls_cost[..., None].expand(-1, -1, gmax),
-                "point_cost": torch.zeros_like(iou_cost),
+                "point_cost": point_cost,
                 "iou_cost_assign": 1.0 - torch.nan_to_num(iou_cost, nan=0.0),
                 "lane_iou_dynamic": torch.nan_to_num(iou_dyn, nan=0.0)}
+
+    def _end_len_cost(self, a, gt):
+        """curve_cfg.match_end_len: pairwise endpoint + length cost of curves a [B, N, P, 2] against gt
+        [B, G, P, 2] (normalized) -> [B, N, G]."""
+        a_px, g_px = self._px(a)[:, :, None], self._px(gt)[:, None]
+        ends = 0.5 * ((a_px[..., 0, :] - g_px[..., 0, :]).norm(dim=-1) + (a_px[..., -1, :] - g_px[..., -1, :]).norm(dim=-1))
+        if self.orientation_free:
+            rev = 0.5 * ((a_px[..., 0, :] - g_px[..., -1, :]).norm(dim=-1)
+                         + (a_px[..., -1, :] - g_px[..., 0, :]).norm(dim=-1))
+            ends = torch.minimum(ends, rev)
+        length = (a_px[..., 1:, :] - a_px[..., :-1, :]).norm(dim=-1).sum(-1)
+        g_len = (g_px[..., 1:, :] - g_px[..., :-1, :]).norm(dim=-1).sum(-1).clamp_min(1.0)
+        return ends / float(self.img_h - 1) + (length / g_len - 1.0).abs().clamp_max(1.0)
 
     def _pair_terms(self, outs, b, n, j, gt_flat, gt_cps, batch_size, rev_out=None):
         """Per-image means over the pairs (b, n) <- GT j, averaged over the steps: 1 - LaneIoU, endpoint
@@ -857,6 +972,10 @@ class HBLRHead(BLRHead):
             cls_o2m = (focal_2cls(outs["cls_o2m"], tgt_o2m, self.focal_alpha, self.focal_gamma).sum(-1)
                        / gt_counts).mean()
             losses["loss_cls_o2m"] = cls_o2m * self.cls_loss_weight * self.o2m_cls_weight
+        if self.y_order == "penalty":
+            rise = [F.relu(self._px(c.float())[..., 1:, 1] - self._px(c.float())[..., :-1, 1]).sum(-1).mean()
+                    for c in outs["cps"]]
+            losses["loss_order"] = torch.stack(rise).mean() * self.order_loss_weight
         if seg_gt is not None and "seg" in outs:
             losses["loss_seg"] = F.nll_loss(F.log_softmax(outs["seg"], dim=1), seg_gt, weight=self.seg_class_weights,
                                             ignore_index=self.seg_ignore_label) * self.seg_loss_weight
