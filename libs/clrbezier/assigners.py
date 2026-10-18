@@ -125,14 +125,21 @@ class TopKLaneAssigner(_CachedCostAssigner):
 
 
 class SimOTALaneAssigner(_CachedCostAssigner):
-    """Dynamic-k assignment; k from the narrow-width LaneIoU (V11 stage-2 aux)."""
+    """Dynamic-k assignment; k from the narrow-width LaneIoU (V11 stage-2 aux).
+
+    A prediction picked by several GTs keeps the lowest-cost one, so a GT whose picks are all
+    taken ends with no positive although it asked for min_dynamic_k. ensure_one=True prevents
+    that: a Hungarian matching on the same cost goes in first and its pairs cannot be taken, so
+    every GT keeps at least one positive whenever num_gt <= num_pred (few anchors, many lanes).
+    """
 
     required_cache_keys = frozenset({"cls_cost", "point_cost", "iou_cost_assign", "lane_iou_dynamic"})
 
-    def __init__(self, candidate_topk=10, min_dynamic_k=1, **kwargs):
+    def __init__(self, candidate_topk=10, min_dynamic_k=1, ensure_one=False, **kwargs):
         super().__init__(**kwargs)
         self.candidate_topk = int(candidate_topk)
         self.min_dynamic_k = int(min_dynamic_k)
+        self.ensure_one = bool(ensure_one)
 
     @torch.no_grad()
     def assign(self, cache):
@@ -149,6 +156,12 @@ class SimOTALaneAssigner(_CachedCostAssigner):
         for g in range(num_gt):
             _, pos = torch.topk(cost[:, g], k=int(dynamic_ks[g].item()), largest=False)
             matching[pos, g] = True
+        if self.ensure_one:
+            h_rows, h_cols = linear_sum_assignment(cost.detach().cpu().numpy())
+            h_rows = torch.as_tensor(h_rows, device=dev, dtype=torch.long)
+            h_cols = torch.as_tensor(h_cols, device=dev, dtype=torch.long)
+            matching[h_rows] = False
+            matching[h_rows, h_cols] = True
         multi = matching.sum(1) > 1
         if bool(multi.any()):
             best = torch.argmin(cost[multi], dim=1)

@@ -292,6 +292,17 @@ def batched_assign(assigner, cache, layout):
         bi = torch.arange(cost.shape[0], device=dev).view(-1, 1, 1).expand_as(pos)
         gi = torch.arange(cost.shape[2], device=dev).view(1, 1, -1).expand_as(pos)
         matching[bi[take], pos[take], gi[take]] = True
+        if getattr(assigner, "ensure_one", False):
+            # SimOTALaneAssigner.ensure_one: Hungarian pairs go in first and cannot be taken
+            host = cost.cpu().numpy()
+            for b, g in enumerate(layout.counts):
+                if g == 0:
+                    continue
+                r, c = linear_sum_assignment(host[b, :, :g])
+                r = torch.as_tensor(r, dtype=torch.long, device=dev)
+                c = torch.as_tensor(c, dtype=torch.long, device=dev)
+                matching[b, r] = False
+                matching[b, r, c] = True
         multi = matching.sum(2) > 1                          # [B, N]
         best = torch.argmin(cost_inf, dim=2)                 # first minimum, as before
         one_hot = torch.zeros_like(matching)
