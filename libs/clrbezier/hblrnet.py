@@ -54,11 +54,42 @@ curve_cfg.y_order / frame / match_end_len (YSY, 2026-10-18; defaults keep the he
   (mean of the two ends, px / (img_h - 1); the better direction with orientation_free) plus the length
   term |len_pred / len_gt - 1| (at most 1), as in BezierFormer's matching cost.
 
+pattern_cfg (None; needs frame "image" and y_order "monotone"; hier schedule "sequential" only): lanes as pose x
+pattern (clrbezierlane/pose_pattern_design.md, libs/clrbezier/pattern.py). A lane cubic is its pose (bottom and
+top points, image axes, the top above the bottom by a softplus gap) and its pattern (the two inner control points in
+the lane's own chord frame: shift, tilt and length removed). The pattern is a softmax mixture of K prototypes (a
+codebook from k-means of training lanes, tools/clrbezier/build_pattern_codebook.py) plus a residual. Each lane step
+moves the pose (px), adds to the prototype logits and to the residual. The anchors start as their own pose and
+pattern (soft-assignment logits + the exact residual). With hier_cfg, each segment is a pose (its two joints,
+shared with its neighbours, one monotone chain) and a pattern from a segment codebook in its own chord frame; at
+the split the pieces are read exactly; after each step the inner points are clamped monotone and the joint handles
+made collinear (g1_project_monotone). Losses: the control-point loss is replaced by the pattern loss (smooth-L1 on
+the pattern difference times the GT chord length, px; a segment against the GT between the projections of its
+joints) and a soft cross-entropy on the logits (target: soft assignment of the GT pattern), every output; LaneIoU,
+endpoint and matching unchanged. Logs pat_acc / seg_pat_acc (o2o pairs whose top prototype is the GT's, last
+output of each level) and pat_ent (entropy of the lane mixture weights).
+
+centre_cfg (None; needs pattern_cfg; YSY 2026-10-19, clrbezierlane/dynamic_anchor_design.md): the step-0 curves are
+inferred from the image instead of being 16 learned anchors. A light conv head on the finest head level (all levels
+upsampled and concatenated) predicts per cell a lane-centre heatmap, a pose (bottom and top points as offsets from the
+cell, the bottom below and the top above it by softplus gaps) and a pattern (logits over the lane codebook + a
+residual, decoded as the lane steps decode theirs). The num_anchors strongest 3 x 3 peaks are the queries: their
+decoded curves (detached) are the step-0 curves, their logits the step-0 pattern logits. No anchor control points and
+no anchor embedding: a query's content is the encoding of its curve, the projected head feature of its cell (zero
+initialized) and one shared token; everything after step 0 is unchanged. Targets: each GT lane's centre is its
+arc-length midpoint; heatmap = a Gaussian at the centre's cell (sigma_cells), CenterNet focal loss; the cells within
+radius_cells of a centre (each cell to its nearest centre, weighted by the Gaussian) get the pose smooth-L1 (px, end
+weight), the 2D LaneIoU of their decoded curve (iou weight) and the pattern smooth-L1 / soft CE (pattern_cfg weights).
+Logs centre_recall (GT lanes with a selected peak within radius_cells of their centre cell). With pattern_cfg (static
+anchors or centre_cfg) the loss also logs cov0 / iou0: the share of GT lanes whose best step-0 curve has 2D LaneIoU
+>= 0.5, and the mean of that best IoU (negative IoUs of far curves counted as 0).
+
 Not supported here (raise): the row residual (point_offsets), the proposal, the alignment offsets,
 strip / merge, the o2m branch, o2o_stop_grad, per-step matching (step_cls). step_blocks and
 resample "fine" are required.
 """
 import math
+import os
 
 import numpy as np
 import torch
@@ -73,6 +104,8 @@ from .data_adapters import _lookup
 from .geometry import bernstein_basis
 from .head import _smooth_l1
 from .lane_decoder import REL_FEATURES, LaneRelationAttention
+from .pattern import (assemble_pieces, assign_logits, clamp_inner_monotone, fit_cubic_pinned, from_canon, mixture,
+                      pose_chain_step, prior_logits, reverse_canon, segment_targets, soft_ce, to_canon)
 
 
 # ------------------------------------------------------------------ 2D curve geometry
@@ -422,9 +455,16 @@ class HBLRHead(BLRHead):
     hier_cfg: None, or segments (3), seg_iters (3, steps after the lane steps), seg_deform_points (12,
     curve-attention reference points per segment), seg_sample_points (12, re-sampled per segment),
     seg_neighbors (16), seg_rel_points (8), schedule ("sequential": the lane steps, then the segment
-    steps; "chain": alternating lane / segment layers with the level exchange, seg_iters = num_iters)."""
+    steps; "chain": alternating lane / segment layers with the level exchange, seg_iters = num_iters).
+    pattern_cfg: None, or codebook (path of build_pattern_codebook.py's output; the prototypes are buffers, so a
+    checkpoint carries them), lane_protos (32), seg_protos (32), ce_weight (0.5), l1_weight (0.05, px smooth-L1 as
+    the control-point loss), seg_target_points (16), min_seg_len_px (4: shorter GT pieces get no segment pattern
+    loss), tau_scale (1.0, multiplies the codebook's soft-assignment width).
+    centre_cfg: None, or channels (64, conv width of the proposal head), sigma_cells (2.0, heatmap Gaussian),
+    radius_cells (2, regression cells around each centre), scale_px (100, pose offsets per unit), hm_weight (1.0),
+    iou_weight (1.0), end_weight (0.05, px smooth-L1 of the bottom and top points)."""
 
-    def __init__(self, curve_cfg=None, hier_cfg=None, **kwargs):
+    def __init__(self, curve_cfg=None, hier_cfg=None, pattern_cfg=None, centre_cfg=None, **kwargs):
         r = dict(kwargs.get("refine_cfg") or {})
         problems = []
         if r.get("point_offsets", True):
@@ -455,6 +495,13 @@ class HBLRHead(BLRHead):
             raise ValueError("HBLRHead curve_cfg.y_order must be None, 'monotone' or 'penalty'")
         if cc.get("y_order") == "monotone" and cc.get("frame", "lane") != "image":
             raise ValueError("HBLRHead curve_cfg.y_order 'monotone' updates in the image axes: set frame='image'")
+        if pattern_cfg is not None:
+            if cc.get("frame", "lane") != "image" or cc.get("y_order") != "monotone":
+                raise ValueError("HBLRHead pattern_cfg needs curve_cfg frame='image' and y_order='monotone'")
+            if hier_cfg is not None and dict(hier_cfg).get("schedule", "sequential") != "sequential":
+                raise ValueError("HBLRHead pattern_cfg supports hier_cfg schedule 'sequential' only")
+        if centre_cfg is not None and pattern_cfg is None:
+            raise ValueError("HBLRHead centre_cfg needs pattern_cfg (the proposals predict a pose and a pattern)")
         super().__init__(**kwargs)
         self.gt_points = int(cc.get("gt_points", 48))
         self.out_per_segment = int(cc.get("out_per_segment", 24))
@@ -483,6 +530,12 @@ class HBLRHead(BLRHead):
         self.hier = None
         if hier_cfg is not None:
             self._build_hier(dict(hier_cfg), r, dict(kwargs.get("anchor_cfg") or {}))
+        self.pattern = None
+        if pattern_cfg is not None:
+            self._build_pattern(dict(pattern_cfg))
+        self.centre = None
+        if centre_cfg is not None:
+            self._build_centre(dict(centre_cfg))
         # the same weights; only the relation geometry changes to 2D
         for m in self.modules():
             if type(m) is LaneRelationAttention:
@@ -550,6 +603,149 @@ class HBLRHead(BLRHead):
         self.register_buffer("t_seg_rel", torch.linspace(0.0, 1.0, self.hier["rel_points"]), persistent=False)
         self._reset_hier()
 
+    def _build_pattern(self, pc):
+        known = {"codebook", "lane_protos", "seg_protos", "ce_weight", "l1_weight", "seg_target_points",
+                 "min_seg_len_px", "tau_scale"}
+        if set(pc) - known:
+            raise ValueError(f"HBLRHead pattern_cfg: unknown keys {sorted(set(pc) - known)}")
+        k_lane, k_seg = int(pc.get("lane_protos", 32)), int(pc.get("seg_protos", 32))
+        self.pattern = dict(codebook=pc.get("codebook"), k_lane=k_lane, k_seg=k_seg,
+                            ce_weight=float(pc.get("ce_weight", 0.5)), l1_weight=float(pc.get("l1_weight", 0.05)),
+                            seg_target_points=int(pc.get("seg_target_points", 16)),
+                            min_seg_len_px=float(pc.get("min_seg_len_px", 4.0)),
+                            tau_scale=float(pc.get("tau_scale", 1.0)))
+        self.register_buffer("lane_protos", torch.zeros(k_lane, 4))
+        self.register_buffer("lane_sigma", torch.zeros(()))
+        self.register_buffer("seg_protos", torch.zeros(k_seg, 4))
+        self.register_buffer("seg_sigma", torch.zeros(()))
+        path = self.pattern["codebook"]
+        if path and os.path.exists(path):
+            self.load_codebook(torch.load(path, map_location="cpu"))
+        # per lane: pose (x bottom, x top, gap, y bottom; px), prototype logits, pattern residual
+        self.update = nn.Linear(self.dim, 4 + k_lane + 4)
+        nn.init.normal_(self.update.weight, std=1.0e-2)
+        nn.init.zeros_(self.update.bias)
+        if self.hier is not None:
+            self.seg_update = nn.Linear(self.dim, 4 + k_seg + 4)
+            nn.init.normal_(self.seg_update.weight, std=1.0e-2)
+            nn.init.zeros_(self.seg_update.bias)
+
+    def _build_centre(self, cc):
+        known = {"channels", "sigma_cells", "radius_cells", "scale_px", "hm_weight", "iou_weight", "end_weight"}
+        if set(cc) - known:
+            raise ValueError(f"HBLRHead centre_cfg: unknown keys {sorted(set(cc) - known)}")
+        self.centre = dict(channels=int(cc.get("channels", 64)), sigma=float(cc.get("sigma_cells", 2.0)),
+                           radius=int(cc.get("radius_cells", 2)), scale_px=float(cc.get("scale_px", 100.0)),
+                           hm_weight=float(cc.get("hm_weight", 1.0)), iou_weight=float(cc.get("iou_weight", 1.0)),
+                           end_weight=float(cc.get("end_weight", 0.05)))
+        del self.anchor_cps, self.anchor_embed               # no static anchors, no per-index identity
+        w, k = self.centre["channels"], self.pattern["k_lane"]
+        self.centre_trunk = nn.Sequential(nn.Conv2d(self.prior_feat_channels * self.num_levels, w, 3, padding=1),
+                                          nn.ReLU(inplace=True), nn.Conv2d(w, w, 3, padding=1), nn.ReLU(inplace=True))
+        self.centre_hm = nn.Conv2d(w, 1, 1)
+        self.centre_pose = nn.Conv2d(w, 4, 1)                # x bottom, y bottom gap, x top, y top gap
+        self.centre_pat = nn.Conv2d(w, k + 4, 1)             # prototype logits, pattern residual
+        nn.init.normal_(self.centre_hm.weight, std=1.0e-2)
+        nn.init.constant_(self.centre_hm.bias, -math.log(9.0))   # CenterNet: every cell starts at 0.1
+        for m in (self.centre_pose, self.centre_pat):
+            nn.init.normal_(m.weight, std=1.0e-2)
+            nn.init.zeros_(m.bias)
+        self.centre_feat = nn.Linear(w, self.dim)            # the cell's context into the query; starts at zero
+        nn.init.zeros_(self.centre_feat.weight)
+        nn.init.zeros_(self.centre_feat.bias)
+        self.query_token = nn.Parameter(torch.zeros(self.dim))
+
+    def _cell_px(self, idx, hc, wc):
+        """Flat cell indices [...] of an hc x wc grid -> cell centres [..., 2] (px)."""
+        sx, sy = float(self.img_w) / wc, float(self.img_h) / hc
+        return torch.stack([((idx % wc).float() + 0.5) * sx, (torch.div(idx, wc, rounding_mode="floor").float() + 0.5) * sy],
+                           dim=-1)
+
+    def _centre_decode(self, pose, pat, cell):
+        """Per-cell outputs pose [..., 4], pat [..., K + 4] at cell centres [..., 2] (px) -> bottom, top [..., 2] (px),
+        logits [..., K], residual [..., 4], cubic [..., 4, 2] (px)."""
+        s, k = self.centre["scale_px"], self.pattern["k_lane"]
+        bottom = torch.stack([cell[..., 0] + s * pose[..., 0], cell[..., 1] + s * F.softplus(pose[..., 1])], dim=-1)
+        top = torch.stack([cell[..., 0] + s * pose[..., 2], cell[..., 1] - s * F.softplus(pose[..., 3])], dim=-1)
+        z, r = pat[..., :k], pat[..., k:]
+        c_px = clamp_inner_monotone(from_canon(bottom, top, mixture(z, self.lane_protos) + r))
+        return bottom, top, z, r, c_px
+
+    def _centre_proposals(self, feats):
+        """centre_cfg: the dense maps and the num_anchors strongest 3 x 3 peaks -> dict(hm [B, 1, H, W], pose
+        [B, 4, H, W], pat [B, K + 4, H, W], idx [B, N] flat cells, cps [B, N, 4, 2] normalized (detached), z [B, N, K]
+        (detached), feat [B, N, C])."""
+        size = feats[-1].shape[-2:]
+        x = torch.cat([f if f.shape[-2:] == size else F.interpolate(f, size=size, mode="bilinear", align_corners=False)
+                       for f in feats], dim=1)
+        t = self.centre_trunk(x)
+        hm, pose, pat = self.centre_hm(t).float(), self.centre_pose(t).float(), self.centre_pat(t).float()
+        hc, wc = hm.shape[-2:]
+        with torch.no_grad():
+            s = hm.sigmoid()
+            peak = s == F.max_pool2d(s, 3, stride=1, padding=1)
+            idx = torch.where(peak, s, s - 2.0).flatten(1).topk(self.num_anchors, dim=1).indices      # peaks first
+
+        def take(m):
+            return m.flatten(2).gather(2, idx[:, None].expand(-1, m.shape[1], -1)).transpose(1, 2)
+
+        _, _, z, _, c_px = self._centre_decode(take(pose), take(pat), self._cell_px(idx, hc, wc))
+        return dict(hm=hm, pose=pose, pat=pat, idx=idx, cps=self._norm(c_px).detach(), z=z.detach(), feat=take(t))
+
+    def load_codebook(self, cb):
+        """Prototypes and soft-assignment widths from build_pattern_codebook.py's output (a dict)."""
+        for key, protos, sigma in (("lane", self.lane_protos, self.lane_sigma), ("seg", self.seg_protos, self.seg_sigma)):
+            p = torch.as_tensor(cb[key]).float()
+            if p.shape != protos.shape:
+                raise ValueError(f"HBLRHead pattern codebook: {tuple(p.shape)} {key} prototypes, pattern_cfg asks "
+                                 f"for {tuple(protos.shape)}")
+            protos.copy_(p)
+            sigma.fill_(float(cb[key + "_sigma"]))
+
+    def _sigma(self, key):
+        sigma = float(self.lane_sigma if key == "lane" else self.seg_sigma) * self.pattern["tau_scale"]
+        if sigma <= 0.0:
+            raise RuntimeError("HBLRHead pattern_cfg: no codebook loaded. Run tools/clrbezier/build_pattern_codebook.py "
+                               f"CONFIG first (it writes pattern_cfg.codebook = {self.pattern['codebook']})")
+        return sigma
+
+    def _pattern_lane_init(self, cps0, z=None):
+        """Anchors [B, N, 4, 2] (normalized, monotone) -> pose [B, N, 2, 2] px, logits [B, N, K] (z, the proposals'
+        logits with centre_cfg; else their soft assignment with a uniform floor, prior_logits), residual [B, N, 4]:
+        they decode exactly to the anchors."""
+        c_px = self._px(cps0)
+        can = to_canon(c_px)
+        if z is None:
+            z = prior_logits(can.detach(), self.lane_protos, self._sigma("lane"))
+        return c_px[..., [0, 3], :], z, can - mixture(z, self.lane_protos)
+
+    def _pattern_lane_step(self, pose, z, r, out):
+        """One lane step from the update out [B, N, 4 + K + 4] -> (pose, z, r, cubic px [B, N, 4, 2])."""
+        k = self.pattern["k_lane"]
+        pose = pose_chain_step(pose, out[..., None, :4] * self.step_scale, MONO_EPS_PX)
+        z = z + out[..., 4:4 + k]
+        r = r + out[..., 4 + k:] * (self.step_scale / float(self.img_h - 1))
+        c_px = from_canon(pose[..., 0, :], pose[..., 1, :], mixture(z, self.lane_protos) + r)
+        return pose, z, r, clamp_inner_monotone(c_px)
+
+    def _pattern_seg_init(self, q):
+        """Piecewise control points q [B, N, 3S + 1, 2] (normalized, an exact split) -> joints [B, N, S + 1, 2] px,
+        logits [B, N, S, Ks], residual [B, N, S, 4]."""
+        pcs = pieces_of(self._px(q))
+        can = to_canon(pcs)
+        z = prior_logits(can.detach(), self.seg_protos, self._sigma("seg"))
+        joints = torch.cat([pcs[..., :, 0, :], pcs[..., -1:, 3, :]], dim=-2)
+        return joints, z, can - mixture(z, self.seg_protos)
+
+    def _pattern_seg_step(self, joints, z, r, out):
+        """One segment step from the update out [B, N, S, 4 + Ks + 4] -> (joints, z, r, piecewise px)."""
+        k = self.pattern["k_seg"]
+        joints = pose_chain_step(joints, out[..., :4] * self.step_scale, MONO_EPS_PX)
+        z = z + out[..., 4:4 + k]
+        r = r + out[..., 4 + k:] * (self.step_scale / float(self.img_h - 1))
+        pcs = from_canon(joints[..., :-1, :], joints[..., 1:, :], mixture(z, self.seg_protos) + r)
+        return joints, z, r, g1_project_monotone(assemble_pieces(clamp_inner_monotone(pcs)))
+
     def _reset_hier(self):
         for mod in (self.seg_geo, self.seg_blocks, self.seg_delta_enc, self.seg_resample_enc, self.seg_norm):
             for m in mod.modules():
@@ -615,11 +811,18 @@ class HBLRHead(BLRHead):
     def _forward(self, feats, img_tok=None, branch="main", strip_maps=None, fine=None):
         batch_size = feats[0].shape[0]
         num_q, dim = self.num_anchors, self.dim
-        cps0 = self.anchor_cps[None].expand(batch_size, -1, -1, -1).float()      # [B, N, 4, 2]
-        if self.y_order == "monotone":
-            cps0 = self._norm(monotone_fix(self._px(cps0)))
+        prop = None
+        if self.centre is not None:
+            prop = self._centre_proposals(feats)
+            cps0 = prop["cps"]                                                   # monotone by construction
+            sem = (self.query_token + self.geo_enc(curve_code(self._px(cps0), self.img_h - 1))
+                   + self.centre_feat(prop["feat"]))
+        else:
+            cps0 = self.anchor_cps[None].expand(batch_size, -1, -1, -1).float()      # [B, N, 4, 2]
+            if self.y_order == "monotone":
+                cps0 = self._norm(monotone_fix(self._px(cps0)))
+            sem = self.anchor_embed[None].expand(batch_size, -1, -1) + self.geo_enc(curve_code(self._px(cps0), self.img_h - 1))
         pts_s = curve_points(cps0, self.t_sample)
-        sem = self.anchor_embed[None].expand(batch_size, -1, -1) + self.geo_enc(curve_code(self._px(cps0), self.img_h - 1))
         if img_tok is None:
             img_tok = self._image_tokens(feats)
         sem = self.sem_pre_norm[0](sem)
@@ -640,6 +843,10 @@ class HBLRHead(BLRHead):
         hf = h.reshape(batch_size * num_q, dim)
         cps, cur_pts = cps0, pts_s.detach()
         curves, cps_list, ends, step_off, step_w = [], [], [], [], []
+        pat_logits = None
+        if self.pattern is not None:
+            pose, z, r = self._pattern_lane_init(cps0, None if prop is None else prop["z"])
+            pat_logits = []
         for i in range(self.num_iters):
             ref = (cur_pts if self.deform_curve_points == self.sample_points
                    else curve_points(cps, self.t_deform).detach())
@@ -651,8 +858,13 @@ class HBLRHead(BLRHead):
             inp = [hf, self.delta_enc((cps - cps0).detach().flatten(-2)).reshape(-1, dim),
                    self.resample_enc(sample_points(fine, cur_pts).float().flatten(2)).reshape(-1, dim)]
             hf = self.gru(torch.cat(inp, dim=-1), hf)
-            upd = self.update(hf).view(batch_size, num_q, 4, 2).float() * self.step_scale   # px, lane frame
-            cps = self._norm(self._lane_step(self._px(cps), upd))
+            if self.pattern is not None:
+                pose, z, r, c_px = self._pattern_lane_step(pose, z, r, self.update(hf).view(batch_size, num_q, -1).float())
+                cps = self._norm(c_px)
+                pat_logits.append(z)
+            else:
+                upd = self.update(hf).view(batch_size, num_q, 4, 2).float() * self.step_scale   # px, lane frame
+                cps = self._norm(self._lane_step(self._px(cps), upd))
             curves.append(curve_points(cps, self.t_out_2d))
             cps_list.append(cps)
             ends.append(cps)
@@ -672,6 +884,8 @@ class HBLRHead(BLRHead):
             index = torch.tensor([3 * s + k for s in range(segs) for k in range(4)], device=q.device)
             count = torch.zeros(3 * segs + 1, device=q.device).index_add_(0, index, torch.ones_like(index, dtype=torch.float))
             moves = []
+            if self.pattern is not None:
+                joints, zs, rs = self._pattern_seg_init(q)
             for j in range(hc["iters"]):
                 pc = pieces_of(q)                                                 # [B, N, S, 4, 2]
                 rel = self._px(curve_points(pc, self.t_seg_rel)).reshape(batch_size, num_q * segs, -1, 2).detach()
@@ -685,8 +899,14 @@ class HBLRHead(BLRHead):
                 inp = [hs, self.seg_delta_enc((pc - pieces_of(q_start)).detach().flatten(-2)).reshape(-1, dim),
                        self.seg_resample_enc(sample_points(fine, pts_seg).float().flatten(2)).reshape(-1, dim)]
                 hs = self.seg_gru(torch.cat(inp, dim=-1), hs)
-                upd = self.seg_update(hs).view(batch_size, num_q, segs, 4, 2).float() * self.step_scale
-                q_px, d_q = self._chain_step(self._px(q), upd, index, count)
+                if self.pattern is not None:
+                    joints, zs, rs, q_px = self._pattern_seg_step(
+                        joints, zs, rs, self.seg_update(hs).view(batch_size, num_q, segs, -1).float())
+                    d_q = q_px - self._px(q)
+                    pat_logits.append(zs)
+                else:
+                    upd = self.seg_update(hs).view(batch_size, num_q, segs, 4, 2).float() * self.step_scale
+                    q_px, d_q = self._chain_step(self._px(q), upd, index, count)
                 q = self._norm(q_px)
                 moves.append(d_q.detach().norm(dim=-1).mean())
                 curves.append(piecewise_points(q, self.out_per_segment))
@@ -695,13 +915,21 @@ class HBLRHead(BLRHead):
             h = h + self.seg_pool(hs.view(batch_size, num_q, segs, dim).mean(2))
             seg_move = torch.stack(moves).mean()
         lane_cps = cps_list[:num_lane_steps] + [None] * (len(curves) - num_lane_steps)
-        return self._finish(h, raw, feats, curves, cps_list, ends, lane_cps, num_lane_steps, step_off, step_w,
-                            seg_move=seg_move)
+        if self.pattern is not None:                       # the pattern loss replaces the control-point loss
+            lane_cps = [None] * len(curves)
+        out = self._finish(h, raw, feats, curves, cps_list, ends, lane_cps, num_lane_steps, step_off, step_w,
+                           seg_move=seg_move, pat_logits=pat_logits)
+        if self.pattern is not None:
+            out["curve0"] = curve_points(cps0, self.t_out_2d).detach()          # the step-0 curves (cov0 log)
+        if prop is not None:
+            out["centre"] = prop
+        return out
 
     def _finish(self, h, raw, feats, curves, cps_list, ends, lane_cps, num_lane_steps, step_off, step_w,
-                seg_move=None, seg_res=None):
+                seg_move=None, seg_res=None, pat_logits=None):
         """Scores and the output dict. lane_cps: per output, the lane cubic [B, N, 4, 2] that gets the
-        control-point loss, or None."""
+        control-point loss, or None. pat_logits (pattern_cfg): per output, the prototype logits ([B, N, K] lane
+        outputs, [B, N, S, Ks] segment outputs)."""
         # scores: o2m per anchor; o2o after the converged lanes have interacted
         cls_o2m, s_o2m = None, None
         if self.cls_o2m is not None:
@@ -724,7 +952,7 @@ class HBLRHead(BLRHead):
                     step_self_w=(torch.stack([w for w in step_w if w is not None]).mean()
                                  if all(w is not None for w in step_w) else None),
                     enc_rel_delta=(self.encoder.last_rel_delta if self.encoder is not None else None),
-                    step_cls=None,
+                    step_cls=None, pat_logits=pat_logits,
                     self_w=[b.sem_sa.last_self_weight for b in self.blocks] + [self.final_sa.last_self_weight])
 
     def _joint_index(self, segs, device):
@@ -886,11 +1114,14 @@ class HBLRHead(BLRHead):
         g_len = (g_px[..., 1:, :] - g_px[..., :-1, :]).norm(dim=-1).sum(-1).clamp_min(1.0)
         return ends / float(self.img_h - 1) + (length / g_len - 1.0).abs().clamp_max(1.0)
 
-    def _pair_terms(self, outs, b, n, j, gt_flat, gt_cps, batch_size, rev_out=None):
+    def _pair_terms(self, outs, b, n, j, gt_flat, gt_cps, batch_size, rev_out=None, pat_out=None):
         """Per-image means over the pairs (b, n) <- GT j, averaged over the steps: 1 - LaneIoU, endpoint
         and control-point smooth-L1 (the outputs with a lane cubic in outs["lane_cps"]) -> three [B] tensors.
         orientation_free: the endpoint and control-point terms against the better GT direction per pair and
-        step (jointly where both exist); rev_out (a list) receives the last output's reversed-pair share."""
+        step (jointly where both exist); rev_out (a list) receives the last output's reversed-pair share.
+        pat_out (a list; pattern_cfg) receives the pattern smooth-L1 and cross-entropy [B] (averaged over the
+        steps; lane outputs against the GT lane's pinned cubic, jointly with the endpoint for the direction;
+        segment outputs against the GT between their joints) and a dict of logs."""
         cnt = per_image_sum(torch.ones_like(b, dtype=torch.float), b, batch_size).clamp_min(1.0)
         g = gt_flat[j].float()
         g_eval, g_px = g * self.eval_scale, self._px(g)
@@ -898,6 +1129,18 @@ class HBLRHead(BLRHead):
         iou = end = cp = zero
         n_steps = float(len(outs["curves"]))
         n_cp = sum(c is not None for c in outs["lane_cps"])
+        pat = pat_out is not None and outs.get("pat_logits") is not None
+        if pat:
+            n_lane, n_out, beta = outs["num_lane_steps"], len(outs["curves"]), self.smooth_l1_beta
+            fit = fit_cubic_pinned(g_px)
+            can_gt = to_canon(fit)
+            len_gt = (fit[:, 3] - fit[:, 0]).norm(dim=-1, keepdim=True).clamp_min(1.0)
+            tgt = torch.softmax(assign_logits(can_gt, self.lane_protos, self._sigma("lane")), dim=-1)
+            if self.orientation_free:
+                can_gt_r = reverse_canon(can_gt)
+                tgt_r = torch.softmax(assign_logits(can_gt_r, self.lane_protos, self._sigma("lane")), dim=-1)
+            pat_l1 = pat_ce = zero
+            logs = {}
         for k, (curve, c) in enumerate(zip(outs["curves"], outs["lane_cps"])):
             p = curve[b, n].float()
             l_iou = 1.0 - lane_iou_2d(p * self.eval_scale, g_eval, self.lane_width * self.iou_w)
@@ -908,6 +1151,27 @@ class HBLRHead(BLRHead):
             if c is not None:
                 l_cp = _smooth_l1(self._px(c[b, n].float()) - self._px(gt_cps[j]), 0.0,
                                   self.smooth_l1_beta).mean(dim=(-1, -2))
+            l_pl = None
+            if pat:
+                logits = outs["pat_logits"][k][b, n].float()
+                if k < n_lane:
+                    can_p = to_canon(self._px(outs["cps"][k][b, n].float()))
+                    l_pl = _smooth_l1((can_p - can_gt) * len_gt, 0.0, beta).mean(-1)
+                    l_pc = soft_ce(logits, tgt)
+                    tgt_used = tgt
+                    if self.orientation_free:
+                        l_pl_r = _smooth_l1((can_p - can_gt_r) * len_gt, 0.0, beta).mean(-1)
+                        l_pc_r = soft_ce(logits, tgt_r)
+                else:
+                    pcs = pieces_of(self._px(outs["cps"][k][b, n].float()))                   # [P, S, 4, 2]
+                    joints = torch.cat([pcs[:, :, 0], pcs[:, -1:, 3]], dim=1)
+                    can_t, len_t, valid = segment_targets(joints.detach(), g_px, self.pattern["seg_target_points"],
+                                                          self.pattern["min_seg_len_px"])
+                    vw = valid.float()
+                    den = vw.sum(-1).clamp_min(1.0)
+                    l_pl = (_smooth_l1((to_canon(pcs) - can_t) * len_t[..., None], 0.0, beta).mean(-1) * vw).sum(-1) / den
+                    t_seg = torch.softmax(assign_logits(can_t, self.seg_protos, self._sigma("seg")), dim=-1)
+                    l_pc = (soft_ce(logits, t_seg) * vw).sum(-1) / den
             if self.orientation_free:
                 e_r = torch.stack([p_px[:, 0] - g_px[:, -1], p_px[:, -1] - g_px[:, 0]], dim=1)
                 l_end_r = _smooth_l1(e_r, 0.0, self.smooth_l1_beta).mean(dim=(-1, -2))
@@ -916,6 +1180,11 @@ class HBLRHead(BLRHead):
                                         self.smooth_l1_beta).mean(dim=(-1, -2))
                     rev = (l_end_r + l_cp_r < l_end + l_cp).detach()
                     l_cp = torch.where(rev, l_cp_r, l_cp)
+                elif l_pl is not None and k < n_lane:
+                    rev = (l_end_r + l_pl_r < l_end + l_pl).detach()
+                    l_pl = torch.where(rev, l_pl_r, l_pl)
+                    l_pc = torch.where(rev, l_pc_r, l_pc)
+                    tgt_used = torch.where(rev[:, None], tgt_r, tgt)
                 else:
                     rev = (l_end_r < l_end).detach()
                 l_end = torch.where(rev, l_end_r, l_end)
@@ -924,7 +1193,106 @@ class HBLRHead(BLRHead):
             end = end + per_image_sum(l_end, b, batch_size) / cnt
             if c is not None:
                 cp = cp + per_image_sum(l_cp, b, batch_size) / cnt
+            if l_pl is not None:
+                pat_l1 = pat_l1 + per_image_sum(l_pl, b, batch_size) / cnt
+                pat_ce = pat_ce + per_image_sum(l_pc, b, batch_size) / cnt
+                with torch.no_grad():
+                    if k == n_lane - 1 and b.numel():
+                        logs["pat_acc"] = (logits.argmax(-1) == tgt_used.argmax(-1)).float().mean()
+                        prob = torch.softmax(logits, dim=-1)
+                        logs["pat_ent"] = -(prob * prob.clamp_min(1e-12).log()).sum(-1).mean()
+                    if k == n_out - 1 and k >= n_lane and b.numel():
+                        logs["seg_pat_acc"] = (((logits.argmax(-1) == t_seg.argmax(-1)).float() * vw).sum()
+                                               / vw.sum().clamp_min(1.0))
+        if pat:
+            pat_out.extend([pat_l1 / n_steps, pat_ce / n_steps, logs])
         return iou / n_steps, end / n_steps, cp / float(max(1, n_cp))
+
+    def _coverage(self, curve0, layout, gt_flat):
+        """Best 2D LaneIoU (loss width) of each GT lane against the step-0 curves curve0 [B, N, P, 2] -> [G]."""
+        sub_p = torch.linspace(0, curve0.shape[2] - 1, self.cost_points, device=curve0.device).round().long()
+        sub_g = torch.linspace(0, self.gt_points - 1, self.cost_points, device=curve0.device).round().long()
+        a = curve0[:, :, sub_p].float() * self.eval_scale
+        gt = curve0.new_zeros(curve0.shape[0], layout.gmax, self.cost_points, 2)
+        gt[layout.img, layout.slot] = gt_flat[:, sub_g].float()
+        iou = lane_iou_2d(a, gt * self.eval_scale, self.lane_width * self.iou_w, pairwise=True)     # [B, N, Gmax]
+        return torch.nan_to_num(iou, nan=0.0).max(dim=1).values[layout.img, layout.slot]
+
+    def _centre_loss(self, c, layout, gt_flat, n_img):
+        """centre_cfg losses of the dense maps c (outs["centre"]) and the centre_recall log."""
+        hm, cc = c["hm"][:, 0], self.centre
+        batch_size, hc, wc = hm.shape
+        sx, sy = float(self.img_w) / wc, float(self.img_h) / hc
+        dev = hm.device
+        target = hm.new_zeros(batch_size, hc * wc)
+        out = {}
+        if layout.num:
+            g_px = self._px(bottom_first(gt_flat.float()))                                      # [G, M, 2]
+            m = g_px.shape[1]
+            centre = 0.5 * (g_px[:, (m - 1) // 2] + g_px[:, m // 2])                             # arc-length midpoint
+            ci = (centre[:, 0] / sx).floor().clamp(0, wc - 1).long()
+            cj = (centre[:, 1] / sy).floor().clamp(0, hc - 1).long()
+            gx, gy = torch.arange(wc, device=dev), torch.arange(hc, device=dev)
+            d2 = ((gx[None, None, :] - ci[:, None, None]) ** 2 + (gy[None, :, None] - cj[:, None, None]) ** 2).float()
+            gauss = torch.exp(-d2 / (2.0 * cc["sigma"] ** 2)).flatten(1)                       # [G, H * W]
+            target = target.scatter_reduce(0, layout.img[:, None].expand_as(gauss), gauss, "amax")
+        pos = target == 1.0
+        num_pos = float(max(1, int(pos.sum())))
+        x = hm.flatten(1)
+        l_pos = -F.logsigmoid(x) * (1.0 - torch.sigmoid(x)) ** 2
+        l_neg = -F.logsigmoid(-x) * torch.sigmoid(x) ** 2 * (1.0 - target) ** 4
+        out["loss_centre_hm"] = torch.where(pos, l_pos, l_neg).sum() / num_pos * cc["hm_weight"]
+        zero = (c["pose"].sum() + c["pat"].sum()) * 0.0                                     # keeps the maps in the graph
+        out.update(loss_centre_end=zero, loss_centre_iou=zero, loss_centre_pat=zero, loss_centre_pat_ce=zero)
+        if not layout.num:
+            return out
+        # regression cells: within radius_cells of a centre, each cell to its nearest centre in its image
+        rad = cc["radius"]
+        o = torch.arange(-rad, rad + 1, device=dev)
+        oy, ox = torch.meshgrid(o, o, indexing="ij")
+        yy, xx = cj[:, None] + oy.flatten()[None], ci[:, None] + ox.flatten()[None]           # [G, (2R + 1)^2]
+        dd = (oy.flatten() ** 2 + ox.flatten() ** 2).float()[None].expand_as(yy)
+        g_idx = torch.arange(layout.num, device=dev)[:, None].expand_as(yy)
+        inside = (yy >= 0) & (yy < hc) & (xx >= 0) & (xx < wc)
+        yy, xx, dd, g_idx = yy[inside], xx[inside], dd[inside], g_idx[inside]
+        key = layout.img[g_idx] * (hc * wc) + yy * wc + xx
+        order = torch.sort(dd, stable=True).indices
+        order = order[torch.sort(key[order], stable=True).indices]
+        key_s = key[order]
+        first = torch.ones_like(key_s, dtype=torch.bool)
+        first[1:] = key_s[1:] != key_s[:-1]
+        sel = order[first]
+        g_idx, yy, xx, w = g_idx[sel], yy[sel], xx[sel], torch.exp(-dd[sel] / (2.0 * cc["sigma"] ** 2))
+        b = layout.img[g_idx]
+        cell = torch.stack([(xx.float() + 0.5) * sx, (yy.float() + 0.5) * sy], dim=-1)
+        bottom, top, z, r, c_px = self._centre_decode(c["pose"][b, :, yy, xx], c["pat"][b, :, yy, xx], cell)
+        g_sel = g_px[g_idx]
+        beta = self.smooth_l1_beta
+        l_end = _smooth_l1(torch.stack([bottom - g_sel[:, 0], top - g_sel[:, -1]], dim=1), 0.0, beta).mean(dim=(-1, -2))
+        curve = curve_points(self._norm(c_px), self.t_out_2d)
+        l_iou = 1.0 - lane_iou_2d(curve * self.eval_scale, gt_flat[g_idx].float() * self.eval_scale,
+                                  self.lane_width * self.iou_w)
+        fit = fit_cubic_pinned(g_px)
+        can_gt = to_canon(fit)
+        len_gt = (fit[:, 3] - fit[:, 0]).norm(dim=-1, keepdim=True).clamp_min(1.0)
+        tgt = torch.softmax(assign_logits(can_gt, self.lane_protos, self._sigma("lane")), dim=-1)
+        l_pat = _smooth_l1((mixture(z, self.lane_protos) + r - can_gt[g_idx]) * len_gt[g_idx], 0.0, beta).mean(-1)
+        l_ce = soft_ce(z, tgt[g_idx])
+        den = per_image_sum(w, b, batch_size).clamp_min(1e-6)
+
+        def red(v):
+            return (per_image_sum(w * v, b, batch_size) / den).sum() / n_img
+
+        out["loss_centre_end"] = red(l_end) * cc["end_weight"]
+        out["loss_centre_iou"] = red(l_iou) * cc["iou_weight"]
+        out["loss_centre_pat"] = red(l_pat) * self.pattern["l1_weight"]
+        out["loss_centre_pat_ce"] = red(l_ce) * self.pattern["ce_weight"]
+        with torch.no_grad():
+            picks = c["idx"][layout.img]                                                         # [G, N]
+            py, px_ = torch.div(picks, wc, rounding_mode="floor"), picks % wc
+            near = torch.maximum((py - cj[:, None]).abs(), (px_ - ci[:, None]).abs()) <= rad
+            out["centre_recall"] = near.any(dim=1).float().mean()
+        return out
 
     def loss_by_outputs_2d(self, outs, gts, seg_gt=None):
         batch_size, num_q = outs["cls_o2o"].shape[:2]
@@ -936,9 +1304,10 @@ class HBLRHead(BLRHead):
         tgt_o2o = torch.zeros((batch_size, num_q), dtype=torch.long, device=dev)
         tgt_o2m = torch.zeros_like(tgt_o2o)
         zero = outs["cls_o2o"].new_zeros(())
-        iou_sum = end_sum = cp_sum = zero
+        iou_sum = end_sum = cp_sum = pat_l1_sum = pat_ce_sum = zero
         num_pos_o2o = num_pos_o2m = 0
         rev_o2o = []
+        pat_o2o = [] if self.pattern is not None else None
         if layout.num:
             gt_cps = fit_cubic_2d(gt_flat.float(), self.cp_fit_ridge)
             final = outs["curves"][-1].detach()
@@ -948,8 +1317,10 @@ class HBLRHead(BLRHead):
             tgt_o2o[b_o, n_o] = 1
             num_pos_o2o = int(n_o.numel())
             iou, end, cp = self._pair_terms(outs, b_o, n_o, layout.flat_index(b_o, g_o), gt_flat, gt_cps, batch_size,
-                                            rev_out=rev_o2o)
+                                            rev_out=rev_o2o, pat_out=pat_o2o)
             iou_sum, end_sum, cp_sum = iou.sum(), end.sum(), cp.sum()
+            if pat_o2o:
+                pat_l1_sum, pat_ce_sum = pat_o2o[0].sum(), pat_o2o[1].sum()
             if self.o2m_assigner is not None:
                 with torch.no_grad():
                     cache_m = dict(cache)
@@ -959,15 +1330,22 @@ class HBLRHead(BLRHead):
                 tgt_o2m[b_m, n_m] = 1
                 num_pos_o2m = int(n_m.numel())
                 if n_m.numel() and self.o2m_reg_weight > 0:
+                    pat_m = [] if self.pattern is not None else None
                     iou, end, cp = self._pair_terms(outs, b_m, n_m, layout.flat_index(b_m, g_m), gt_flat, gt_cps,
-                                                    batch_size)
+                                                    batch_size, pat_out=pat_m)
                     w = self.o2m_reg_weight
                     iou_sum, end_sum, cp_sum = iou_sum + w * iou.sum(), end_sum + w * end.sum(), cp_sum + w * cp.sum()
+                    if pat_m:
+                        pat_l1_sum, pat_ce_sum = pat_l1_sum + w * pat_m[0].sum(), pat_ce_sum + w * pat_m[1].sum()
         cls_o2o = (focal_2cls(outs["cls_o2o"], tgt_o2o, self.focal_alpha, self.focal_gamma).sum(-1) / gt_counts).mean()
         losses = dict(loss_cls=cls_o2o * self.cls_loss_weight,
                       loss_iou=iou_sum / n_img * self.iou_loss.loss_weight,
                       loss_end=end_sum / n_img * self.end_loss_weight,
                       loss_cp=cp_sum / n_img * self.cp_loss_weight)
+        if self.pattern is not None:
+            del losses["loss_cp"]
+            losses["loss_pat"] = pat_l1_sum / n_img * self.pattern["l1_weight"]
+            losses["loss_pat_ce"] = pat_ce_sum / n_img * self.pattern["ce_weight"]
         if self.o2m_assigner is not None:
             cls_o2m = (focal_2cls(outs["cls_o2m"], tgt_o2m, self.focal_alpha, self.focal_gamma).sum(-1)
                        / gt_counts).mean()
@@ -979,6 +1357,8 @@ class HBLRHead(BLRHead):
         if seg_gt is not None and "seg" in outs:
             losses["loss_seg"] = F.nll_loss(F.log_softmax(outs["seg"], dim=1), seg_gt, weight=self.seg_class_weights,
                                             ignore_index=self.seg_ignore_label) * self.seg_loss_weight
+        if outs.get("centre") is not None:
+            losses.update(self._centre_loss(outs["centre"], layout, gt_flat, n_img))
         with torch.no_grad():
             diag = dict(num_pos_o2o=torch.tensor(float(num_pos_o2o), device=dev),
                         num_pos_o2m=torch.tensor(float(num_pos_o2m), device=dev),
@@ -994,6 +1374,11 @@ class HBLRHead(BLRHead):
                 diag["o2o_pos_prob"], diag["o2o_neg_prob"] = p[pos].mean(), p[~pos].mean()
             if self.orientation_free:
                 diag["end_rev_frac"] = rev_o2o[0].detach() if rev_o2o else torch.zeros((), device=dev)
+            if pat_o2o:
+                diag.update({k: v.detach() for k, v in pat_o2o[2].items()})
+            if outs.get("curve0") is not None and layout.num:
+                best = self._coverage(outs["curve0"], layout, gt_flat)
+                diag["cov0"], diag["iou0"] = (best >= 0.5).float().mean(), best.clamp_min(0.0).mean()
         losses.update(diag)
         return losses
 
