@@ -159,8 +159,8 @@ model = dict(
             focal_alpha=0.25,         # (0.25)
             focal_gamma=2.0,          # (2.0)
             iou_loss_weight=4.0,      # 1 - symmetric 2D LaneIoU (lane_iou_2d), every step (4.0)
-            point_loss_weight=0.05,   # unused by HBLRHead
-            cp_loss_weight=0.05,      # px smooth-L1 on the 4 control points against the arc-length LS fit
+            point_loss_weight=0.0,   # unused by HBLRHead
+            cp_loss_weight=0.0,      # px smooth-L1 on the 4 control points against the arc-length LS fit
                                       # of the GT polyline, every lane step (0.05)
             extent_loss_weight=0.2,   # unused by HBLRHead (curve_cfg.end_loss_weight instead)
             smooth_l1_beta=1.0,       # (1.0)

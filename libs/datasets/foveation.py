@@ -14,6 +14,8 @@ lane sorted bottom -> top sorted (the CLR row targets and cut_unsorted still app
 
     LaneFoveate               transform: after LaneAlbumentation / albumentation, before PackCLRNetInputs
     FoveatedCurvelanesMetric  CurvelanesMetric after mapping each predicted lane back through the inverse warp
+    ToContextFrame            FovealLaneNet (libs/clrbezier/foveal_lane.py): keeps the 2x image, puts the GT points
+                              and masks in the context frame (the network's 800 x 320 frame); no warp
 
 Import with custom_imports "libs.datasets.foveation". Config: configs/*/curvelanes/dataset_curvelanes_*_fovea.py."""
 import cv2
@@ -127,6 +129,38 @@ class LaneFoveate:
         wx, wy = self.warp.wx, self.warp.wy
         return (f"LaneFoveate(out={self.out_w}x{self.out_h}, x=(c {wx.centre}, s {wx.sigma}, a {wx.amp}), "
                 f"y=(c {wy.centre}, s {wy.sigma}, a {wy.amp}))")
+
+
+@TRANSFORMS.register_module()
+class ToContextFrame:
+    """For FovealLaneNet: after LaneAlbumentation / albumentation at 2x, the image stays as it is (the network pools
+    it to the context view and crops its fovea from it); gt_points (flat [x0, y0, ...] lists, px) are scaled into
+    the out_w x out_h context frame and gt_masks resized to it (nearest). Pixel j of the context frame covers the
+    image's pixels [j * w / out_w, (j + 1) * w / out_w), so a point x maps to x * out_w / w."""
+
+    def __init__(self, out_w=800, out_h=320):
+        self.out_w, self.out_h = int(out_w), int(out_h)
+
+    def _resize(self, m, src_h, src_w):
+        if isinstance(m, np.ndarray) and m.ndim >= 2 and m.shape[:2] == (src_h, src_w):
+            return cv2.resize(np.ascontiguousarray(m), (self.out_w, self.out_h), interpolation=cv2.INTER_NEAREST)
+        return m
+
+    def __call__(self, results):
+        src_h, src_w = results["img"].shape[:2]
+        sx, sy = self.out_w / float(src_w), self.out_h / float(src_h)
+        masks = results.get("gt_masks")
+        if isinstance(masks, (list, tuple)):
+            results["gt_masks"] = [self._resize(m, src_h, src_w) for m in masks]
+        elif masks is not None:
+            results["gt_masks"] = self._resize(masks, src_h, src_w)
+        if results.get("gt_points"):
+            results["gt_points"] = [[float(c) * (sx if i % 2 == 0 else sy) for i, c in enumerate(lane)]
+                                    for lane in results["gt_points"]]
+        return results
+
+    def __repr__(self):
+        return f"ToContextFrame(out={self.out_w}x{self.out_h})"
 
 
 @METRICS.register_module()
