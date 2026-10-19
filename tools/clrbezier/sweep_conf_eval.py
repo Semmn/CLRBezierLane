@@ -15,7 +15,9 @@ can hand its lane to another prediction).
 
     CurvelanesMetric  cached here, with vega's own lane drawing; checked against
                       CurvelanesMetric on a subset of images before the sweep
-                      is reported (--check-images), exact to the last bit
+                      is reported (--check-images), exact to the last bit; also
+                      its subclasses that only map the lanes in process(), e.g.
+                      FoveatedCurvelanesMetric (libs/datasets/foveation.py)
     CULaneMetric      tools/clrbezier/fast_sweep.py (build_records + sweep)
     LLAMAS, TuSimple  the config's evaluator re-run per threshold
 
@@ -187,8 +189,9 @@ _CL = {}   # read by the forked workers: metric, lane class, dump
 
 
 def curvelanes_cache_supported(metric):
-    """CurvelanesMetric, with or without the F1@ thresholds of curvelanes_f1_thresholds.patch."""
-    return type(metric).__name__ == "CurvelanesMetric" and all(
+    """CurvelanesMetric, with or without the F1@ thresholds of curvelanes_f1_thresholds.patch, or a subclass
+    that only maps the lanes in process() (FoveatedCurvelanesMetric): the cache calls process() per image."""
+    return any(c.__name__ == "CurvelanesMetric" for c in type(metric).__mro__) and all(
         hasattr(metric, a) for a in ("process", "parse_anno", "iou_thresh", "eval_width",
                                      "eval_height", "lane_width"))
 
@@ -438,10 +441,14 @@ def run_inference(cfg_path, checkpoint, conf, split, cfg_options, max_images, wo
     # Runner handles custom_imports, default_scope, data_preprocessor and the
     # checkpoint exactly as tools/test.py does.
     runner = Runner.from_cfg(cfg)
+    import torch
+    # Inference only. The configs set randomness.deterministic=True, which makes the Runner
+    # call torch.use_deterministic_algorithms(True); tools/train.py turns it off again after
+    # building its runner, and so does this (BLRNet's CUDA cumsum has no deterministic kernel).
+    torch.use_deterministic_algorithms(False)
     runner.load_or_resume()
     model = runner.model
     model.eval()
-    import torch
 
     dump, seen = [], 0
     with torch.no_grad():
@@ -460,6 +467,10 @@ def run_inference(cfg_path, checkpoint, conf, split, cfg_options, max_images, wo
 def metric_factory_from(evaluator_cfg, index):
     from mmdet.registry import METRICS
     import libs.datasets  # noqa: F401  (registers the lane metrics)
+    try:   # FoveatedCurvelanesMetric; inference imports it through custom_imports, --load-dump does not
+        import libs.datasets.foveation  # noqa: F401
+    except ImportError:
+        pass
 
     cfgs = evaluator_cfg if isinstance(evaluator_cfg, (list, tuple)) else [evaluator_cfg]
     metric_cfg = copy.deepcopy(cfgs[index])
