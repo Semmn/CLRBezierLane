@@ -38,11 +38,17 @@ Losses: HBLRHead's o2o / o2m matching and per-step LaneIoU + endpoint losses (no
 dec_cfg.cp_loss), the proposal heatmap focal loss + endpoint smooth-L1 + LaneIoU of the decoded proposal at the cells
 around each centre, the vanishing-column smooth-L1, the seg auxiliary on C's stride-8 map.
 fovea_cfg.mode: "window" (the method), "off" (C only; the same network otherwise), "full" (the window is the whole
-crop: F = the 2x image; the upper bound).
-Logs: vp_err_px, vp_gt_frac, fovea_share (F's share of the last lane step's curve-attention weight), prop_recall (GT
-lanes with a selected peak within radius_cells of their centre cell, in their view; prop_recall_fov: of the lanes
-centred in the window), prop_fovea_frac (queries from F), win_lane_frac (GT lanes whose centre is in the window),
-cov0 / iou0 (HBLRHead)."""
+crop: F = the 2x image; the upper bound), "polar" (clrbezierlane/polar_view/polar_view_design.md: the second view is
+the VP-polar view P instead of F. P resamples the 2x image around the vanishing point v: columns = the angle around v,
+rows = log(r + r0) of the distance r from v, so a lane through v is a vertical line of P whatever its slant in the
+image. The vanishing-point head also predicts the row. P's maps are read with offsets in P's own cells. P's proposals
+are decoded in P, mapped to the context frame (the proposal losses use the mapped polyline) and fitted with the
+monotone cubic for the queries. P owns every lane centred in its angle range, i.e. below the vanishing point).
+Logs: vp_err_px (vp_err_y_px: the row, polar), vp_gt_frac, fovea_share (F's share of the last lane step's
+curve-attention weight), prop_recall (GT lanes with a selected peak within radius_cells of their centre cell, in their
+view; prop_recall_fov: of the lanes centred in the window), prop_fovea_frac (queries from F), win_lane_frac (GT lanes
+whose centre is in the window), cov0 / iou0 (HBLRHead). In polar mode the F logs are P's (the window = P's angle
+range)."""
 import contextlib
 import math
 
@@ -60,7 +66,8 @@ from .head import StagePredictions, _smooth_l1
 from .hblrnet import (HBLRHead, LaneRelationAttention2D, bottom_first, curve_code, lane_iou_2d, monotone_fix,
                       pieces_of, piecewise_points, subdivide_cubic)
 
-CTX, FOV = 0, 1
+CTX, FOV = 0, 1                      # the context view and the second view (F, or P in polar mode)
+POLAR_KEYS = ("polar_w", "polar_h", "theta_deg", "r0_px", "supersample", "jitter_y_px")
 
 
 # ------------------------------------------------------------------ geometry
@@ -135,16 +142,100 @@ class ViewFrame:
         r = loc - self._o(loc)
         return (r[..., 0] >= 0) & (r[..., 0] < self.win[0]) & (r[..., 1] >= 0) & (r[..., 1] < self.win[1])
 
+    def sample_grid(self, ref, off, mp):
+        """grid_sample coordinates in map mp of the points ref + off (ref [..., 2] context px, off in mp's cells)."""
+        return self.grid(ref + off * mp.cell, mp.view)
 
-def _sample_maps(values, maps, frame, loc, weights, heads):
-    """Deformable sampling over several maps. values [B, T, H, c] (the token values); loc: per map [B, Q, H, K, 2]
-    (context px); weights [B, Q, H, M, K] -> [B, Q, H * c]."""
+
+class PolarFrame:
+    """The polar view P (polar_w x polar_h px) around the vanishing point v [B, 2] (context px) for one batch. Column u
+    runs from theta_max (left) to theta_min (right), theta = atan2(y - v_y, x - v_x): 0 to the right of v, 90 deg below
+    it; angles under theta_min count + 360 deg. Row w runs from v (top) to r_max (bottom), linear in
+    rho = log(r + r0), r = |p - v|, r_max per image = the crop corner farthest from v. A ray from v is a column of P.
+    C's maps are read as in ViewFrame, P's with offsets in P's own cells (mp.cell, P px)."""
+
+    def __init__(self, ctx_w, ctx_h, polar_w, polar_h, theta_deg, r0, vp):
+        self.ctx = (float(ctx_w), float(ctx_h))
+        self.size = (float(polar_w), float(polar_h))
+        self.theta = (math.radians(theta_deg[0]), math.radians(theta_deg[1]))
+        self.r0 = float(r0)
+        self.origin = vp                                                       # [B, 2] context px
+        corners = vp.new_tensor([[0.0, 0.0], [ctx_w, 0.0], [0.0, ctx_h], [ctx_w, ctx_h]])
+        self.r_max = (corners[None] - vp[:, None]).norm(dim=-1).amax(-1)        # [B]
+        self.rho0 = math.log(self.r0)
+        self.rho1 = torch.log(self.r_max + self.r0)                              # [B]
+
+    def _b(self, t, loc, img):
+        """Per-image t [B, ...] against loc [B, ..., 2], or loc [R, ..., 2] of the images img [R]."""
+        if img is not None:
+            t = t[img]
+        return t.to(loc.dtype).view(t.shape[0], *([1] * (loc.dim() - 2)), *t.shape[1:])
+
+    def polar(self, loc, img=None):
+        """Context px loc [B | R, ..., 2] -> P px [..., 2] and the angle theta [...] (radians, >= theta_min)."""
+        d = loc - self._b(self.origin, loc, img)
+        th = torch.atan2(d[..., 1], d[..., 0])
+        th = torch.where(th < self.theta[0], th + 2.0 * math.pi, th)
+        rho = torch.log(torch.hypot(d[..., 0], d[..., 1]) + self.r0)
+        u = (self.theta[1] - th) * (self.size[0] / (self.theta[1] - self.theta[0]))
+        w = (rho - self.rho0) / (self._b(self.rho1, loc, img) - self.rho0) * self.size[1]
+        return torch.stack([u, w], dim=-1), th
+
+    def context(self, q, img=None):
+        """P px q [B | R, ..., 2] -> context px [..., 2]."""
+        th = self.theta[1] - q[..., 0] * ((self.theta[1] - self.theta[0]) / self.size[0])
+        rho1 = self._b(self.rho1, q, img)
+        r = torch.exp(self.rho0 + q[..., 1] / self.size[1] * (rho1 - self.rho0)) - self.r0
+        return self._b(self.origin, q, img) + r[..., None] * torch.stack([th.cos(), th.sin()], dim=-1)
+
+    def grid(self, loc, view):
+        """Context px loc [B, ..., 2] -> grid_sample coordinates in the maps of `view`."""
+        if view == CTX:
+            return loc * loc.new_tensor([2.0 / self.ctx[0], 2.0 / self.ctx[1]]) - 1.0
+        return self.polar(loc)[0] * loc.new_tensor([2.0 / self.size[0], 2.0 / self.size[1]]) - 1.0
+
+    def inside(self, loc):
+        """[B, ...] bool: context px loc [B, ..., 2] within P's angle range (P reaches every distance in the crop)."""
+        return self.polar(loc)[1] <= self.theta[1]
+
+    def sample_grid(self, ref, off, mp):
+        """As ViewFrame.sample_grid; on P, the offsets are added in P (mp.cell P px per cell)."""
+        if mp.view == CTX:
+            return self.grid(ref + off * mp.cell, CTX)
+        step = off.new_tensor([2.0 * mp.cell / self.size[0], 2.0 * mp.cell / self.size[1]])
+        return self.grid(ref, mp.view) + off * step
+
+
+def fit_cubic(q, eps=1e-6):
+    """Least-squares cubic Bezier [..., 4, 2] through the two ends of polylines q [..., T, 2] (T >= 4), chord-length
+    parameters; the straight chord where the inner points are undetermined."""
+    seg = (q[..., 1:, :] - q[..., :-1, :]).norm(dim=-1)
+    s = torch.cat([seg.new_zeros(seg.shape[:-1] + (1,)), seg.cumsum(-1)], dim=-1)
+    total = s[..., -1:]
+    uniform = torch.linspace(0.0, 1.0, q.shape[-2], device=q.device, dtype=q.dtype)
+    t = torch.where(total > eps, s / total.clamp_min(eps), uniform)
+    b = torch.stack([(1 - t) ** 3, 3 * t * (1 - t) ** 2, 3 * t ** 2 * (1 - t), t ** 3], dim=-1)    # [..., T, 4]
+    p0, p3 = q[..., 0, :], q[..., -1, :]
+    r = q - b[..., :1] * p0[..., None, :] - b[..., 3:] * p3[..., None, :]
+    a11, a12, a22 = (b[..., 1] ** 2).sum(-1), (b[..., 1] * b[..., 2]).sum(-1), (b[..., 2] ** 2).sum(-1)
+    r1, r2 = (b[..., 1:2] * r).sum(-2), (b[..., 2:3] * r).sum(-2)
+    det = a11 * a22 - a12 ** 2
+    ok = (det > 1e-4 * q.shape[-2])[..., None]
+    det = det.clamp_min(eps)[..., None]
+    p1 = torch.where(ok, (a22[..., None] * r1 - a12[..., None] * r2) / det, p0 + (p3 - p0) / 3.0)
+    p2 = torch.where(ok, (a11[..., None] * r2 - a12[..., None] * r1) / det, p0 + 2.0 * (p3 - p0) / 3.0)
+    return torch.stack([p0, p1, p2, p3], dim=-2)
+
+
+def _sample_maps(values, maps, grids, weights, heads):
+    """Deformable sampling over several maps. values [B, T, H, c] (the token values); grids: per map [B, Q, H, K, 2]
+    (grid_sample coordinates in the map, frame.sample_grid); weights [B, Q, H, M, K] -> [B, Q, H * c]."""
     batch_size, _, _, c_h = values.shape
     num_q, k = weights.shape[1], weights.shape[-1]
     out = 0.0
     for m, mp in enumerate(maps):
         v = values[:, mp.start:mp.start + mp.n].permute(0, 2, 3, 1).reshape(batch_size * heads, c_h, mp.h, mp.w)
-        g = frame.grid(loc[m].float(), mp.view).permute(0, 2, 1, 3, 4).reshape(batch_size * heads, num_q, k, 2)
+        g = grids[m].permute(0, 2, 1, 3, 4).reshape(batch_size * heads, num_q, k, 2)
         s = F.grid_sample(v, g.to(v.dtype), mode="bilinear", padding_mode="zeros", align_corners=False)
         w = weights[:, :, :, m].permute(0, 2, 1, 3).reshape(batch_size * heads, num_q, k)
         out = out + torch.einsum("bcqk,bqk->bqc", s, w.to(s.dtype))                    # [BH, Q, c]
@@ -196,8 +287,9 @@ class CrossViewEncoderLayer(nn.Module):
             is_f = torch.tensor([mp.view == FOV for mp in maps], device=x.device)
             logit = logit.masked_fill(fov_mask[:, :, None, None, None] & is_f.view(1, 1, 1, M, 1), float("-inf"))
         w = torch.softmax(logit.view(batch_size, num_t, H, M * K), dim=-1).view(batch_size, num_t, H, M, K)
-        loc = [ref[:, :, None, None, :].float() + off[:, :, :, m] * mp.cell for m, mp in enumerate(maps)]
-        a = _sample_maps(self.value_proj(x).view(batch_size, num_t, H, self.c_h), maps, frame, loc, w, H)
+        ref_q = ref[:, :, None, None, :].float()
+        grids = [frame.sample_grid(ref_q, off[:, :, :, m], mp) for m, mp in enumerate(maps)]
+        a = _sample_maps(self.value_proj(x).view(batch_size, num_t, H, self.c_h), maps, grids, w, H)
         x = self.norms[0](x + self.drop(self.out(a.to(x.dtype))))
         return self.norms[1](x + self.drop(self.ffn(x)))
 
@@ -245,9 +337,10 @@ class DualCurveAttention(nn.Module):
         w = w.view(batch_size, num_q, H, S, M, K)
         # per map: [B, N * S, H, K] as the query axis
         w_m = w.permute(0, 1, 3, 2, 4, 5).reshape(batch_size, num_q * S, H, M, K)
-        loc = [(ref[:, :, :, None, None, :].float() + off[:, :, :, :, m] * mp.cell).reshape(batch_size, num_q * S, H, K, 2)
-               for m, mp in enumerate(maps)]
-        a = _sample_maps(self.value_proj(tokens).view(batch_size, tokens.shape[1], H, self.c_h), maps, frame, loc, w_m,
+        ref_q = ref[:, :, :, None, None, :].float()
+        grids = [frame.sample_grid(ref_q, off[:, :, :, :, m], mp).reshape(batch_size, num_q * S, H, K, 2)
+                 for m, mp in enumerate(maps)]
+        a = _sample_maps(self.value_proj(tokens).view(batch_size, tokens.shape[1], H, self.c_h), maps, grids, w_m,
                          H)
         a = a.view(batch_size, num_q, S, dim).sum(2)                                  # the softmax spans S
         with torch.no_grad():
@@ -368,10 +461,35 @@ class VanishingColumnHead(nn.Module):
         nn.init.zeros_(self.out.bias)
 
     def forward(self, c5, ctx_w):
-        logit = self.out(F.relu(self.conv(c5))).float().mean(2)[:, 0]                 # [B, W5]
+        return self._column(F.relu(self.conv(c5)), ctx_w)
+
+    def _column(self, t, ctx_w):
+        logit = self.out(t).float().mean(2)[:, 0]                                      # [B, W5]
         w5 = logit.shape[-1]
         centres = (torch.arange(w5, device=logit.device, dtype=torch.float32) + 0.5) * (float(ctx_w) / w5)
         return (torch.softmax(logit, dim=-1) * centres).sum(-1)
+
+
+class VanishingPointHead(VanishingColumnHead):
+    """The vanishing point (x, y) from C5 (polar mode): the column as VanishingColumnHead; the row regressed from the
+    pooled conv features (MLP, sigmoid) in [-0.5 ctx_h, ctx_h], as the point can sit above the crop. It starts at the
+    centre column and row 0.1 ctx_h."""
+
+    def __init__(self, in_channels, channels):
+        super().__init__(in_channels, channels)
+        self.row = nn.Sequential(nn.Linear(channels, channels), nn.ReLU(inplace=True), nn.Linear(channels, 1))
+
+    def reset_parameters(self):
+        super().reset_parameters()
+        nn.init.xavier_uniform_(self.row[0].weight)
+        nn.init.zeros_(self.row[0].bias)
+        nn.init.zeros_(self.row[2].weight)
+        nn.init.constant_(self.row[2].bias, math.log(0.4 / 0.6))                # sigmoid 0.4: row 0.1 ctx_h
+
+    def forward(self, c5, ctx_w, ctx_h):
+        t = F.relu(self.conv(c5))
+        y = float(ctx_h) * (1.5 * torch.sigmoid(self.row(t.float().mean((2, 3)))[:, 0].float()) - 0.5)
+        return torch.stack([self._column(t, ctx_w), y], dim=-1)
 
 
 @contextlib.contextmanager
@@ -438,11 +556,18 @@ class FovealLaneHead(HBLRHead):
     hier_cfg (HBLRHead's, schedule "sequential"; seg_sample_points unused, seg_neighbors only with relation),
     assign_cfg / loss_cfg / target_adapter / test_score / test_cfg (as BLRHead; loss_cfg.cp_loss_weight only with
     dec_cfg.cp_loss).
-    fovea_cfg: mode ("window" | "off" | "full"), window_w (400) / window_h (80) / window_top (0) in context px (2x
-    each must be a multiple of 32), p_gt (0.5, training windows placed on the GT vanishing column), jitter_px (40,
-    uniform jitter of that GT column), bn ("context": F is normalized with the backbone's running statistics, which
-    only C updates, so training and test treat F alike; "batch": plain training-mode BatchNorm on F too).
-    vp_cfg: channels (128), loss_weight (1.0), beta (0.05; smooth-L1 on the error / (img_w / 2)), in every mode.
+    fovea_cfg: mode ("window" | "off" | "full" | "polar"), window_w (400) / window_h (80) / window_top (0) in context
+    px (2x each must be a multiple of 32; not in polar mode), p_gt (0.5, training windows placed on the GT vanishing
+    column), jitter_px (40, uniform jitter of that GT column), bn ("context": F is normalized with the backbone's
+    running statistics, which only C updates, so training and test treat F alike; "batch": plain training-mode
+    BatchNorm on F too). Polar mode only (POLAR_KEYS): polar_w (800) / polar_h (256), P's size in px (multiples of
+    32); theta_deg ((-10, 190), P's angle range around the vanishing point, 90 = straight down); r0_px (24, P's rows
+    are linear in log(r + r0); a row then spans about 0.3 px next to the vanishing point, close to the 2x image's
+    0.5 px, and 5 px near the bottom corners); supersample ((2, 4), bilinear samples of the 2x image per P pixel
+    along a row and a column, averaged); jitter_y_px (10, uniform jitter of the GT row; p_gt and jitter_px as for
+    the window, P is centred on the GT vanishing point).
+    vp_cfg: channels (128), loss_weight (1.0), beta (0.05; smooth-L1 on the error / (img_w / 2), plus the row error /
+    (img_h / 2) in polar mode), in every mode.
     enc_cfg: num_layers (3), num_heads (8), num_points (4), ffn_dim (1024), dropout (0.0), checkpoint (False:
     recompute each layer in the backward pass to save memory).
     prop_cfg: channels (64), sigma_cells (2.0), radius_cells (2), scale_px (100; F's offsets at half, its own px),
@@ -457,6 +582,7 @@ class FovealLaneHead(HBLRHead):
                  prop_cfg=None, dec_cfg=None, assign_cfg=None, loss_cfg=None, target_adapter=None, test_score=None,
                  train_cfg=None, test_cfg=None, init_cfg=None):
         fc, vc, ec, pc, dc = (dict(c or {}) for c in (fovea_cfg, vp_cfg, enc_cfg, prop_cfg, dec_cfg))
+        polar_cfg = {k: fc.pop(k) for k in POLAR_KEYS if k in fc}
         for name, cfg, known in (
                 ("fovea_cfg", fc, {"mode", "window_w", "window_h", "window_top", "p_gt", "jitter_px", "bn"}),
                 ("vp_cfg", vc, {"channels", "loss_weight", "beta"}),
@@ -507,18 +633,33 @@ class FovealLaneHead(HBLRHead):
 
         # views
         self.fovea_mode = str(fc.get("mode", "window"))
-        if self.fovea_mode not in ("window", "off", "full"):
-            raise ValueError("FovealLaneHead fovea_cfg.mode must be 'window', 'off' or 'full'")
+        if self.fovea_mode not in ("window", "off", "full", "polar"):
+            raise ValueError("FovealLaneHead fovea_cfg.mode must be 'window', 'off', 'full' or 'polar'")
+        unused = sorted(set(fc) & {"window_w", "window_h", "window_top"} if self.fovea_mode == "polar" else polar_cfg)
+        if unused:
+            raise ValueError(f"FovealLaneHead fovea_cfg: {unused} unused in mode '{self.fovea_mode}'")
         self.fovea_bn = str(fc.get("bn", "context"))
         if self.fovea_bn not in ("context", "batch"):
             raise ValueError("FovealLaneHead fovea_cfg.bn must be 'context' or 'batch'")
         if self.fovea_mode == "full":
             self.win_w, self.win_h, self.win_top = float(self.img_w), float(self.img_h), 0.0
+        elif self.fovea_mode == "polar":                   # win_w / win_h: P's size (px)
+            self.win_w, self.win_h = float(polar_cfg.get("polar_w", 800)), float(polar_cfg.get("polar_h", 256))
+            self.win_top = 0.0
+            self.polar_theta = tuple(float(a) for a in polar_cfg.get("theta_deg", (-10.0, 190.0)))
+            self.polar_r0 = float(polar_cfg.get("r0_px", 24.0))
+            self.polar_ss = tuple(int(k) for k in polar_cfg.get("supersample", (2, 4)))
+            self.jitter_y_px = float(polar_cfg.get("jitter_y_px", 10.0))
+            if self.win_w % 32 or self.win_h % 32 or len(self.polar_theta) != 2 or len(self.polar_ss) != 2 or \
+                    not 0.0 < self.polar_theta[1] - self.polar_theta[0] <= 360.0 or self.polar_r0 <= 0 or \
+                    min(self.polar_ss) < 1:
+                raise ValueError("FovealLaneHead fovea_cfg (polar): polar_w and polar_h must be multiples of 32, "
+                                 "theta_deg (min, max) with 0 < max - min <= 360, r0_px > 0, supersample two ints >= 1")
         else:
             self.win_w, self.win_h = float(fc.get("window_w", 400)), float(fc.get("window_h", 80))
             self.win_top = float(fc.get("window_top", 0))
-        if (2 * self.win_w) % 32 or (2 * self.win_h) % 32 or self.win_w > self.img_w or \
-                self.win_top + self.win_h > self.img_h or self.win_top % 0.5:
+        if self.fovea_mode != "polar" and ((2 * self.win_w) % 32 or (2 * self.win_h) % 32 or self.win_w > self.img_w
+                                           or self.win_top + self.win_h > self.img_h or self.win_top % 0.5):
             raise ValueError("FovealLaneHead fovea_cfg: 2 x window_w and 2 x window_h must be multiples of 32 and the "
                              "window must fit in the crop")
         self.p_gt = float(fc.get("p_gt", 0.5))
@@ -541,8 +682,9 @@ class FovealLaneHead(HBLRHead):
                                   for _ in range(int(ec.get("num_layers", 3)))])
         self.enc_checkpoint = bool(ec.get("checkpoint", False))
 
-        # vanishing column
-        self.vp_head = VanishingColumnHead(in_channels[-1], int(vc.get("channels", 128)))
+        # vanishing column (point, in polar mode)
+        vp_cls = VanishingPointHead if self.fovea_mode == "polar" else VanishingColumnHead
+        self.vp_head = vp_cls(in_channels[-1], int(vc.get("channels", 128)))
         self.vp_weight, self.vp_beta = float(vc.get("loss_weight", 1.0)), float(vc.get("beta", 0.05))
 
         # proposals
@@ -606,16 +748,30 @@ class FovealLaneHead(HBLRHead):
     # ------------------------------------------------------------------ views
     def place_window(self, c_feats, batch_data_samples=None):
         """The vanishing column from C5 and the window origin [B, 2] (context px; zeros for "off" / "full"). With
-        data samples (training), also the GT lanes and the GT vanishing column (NaN where undefined)."""
-        vp = self.vp_head(c_feats[-1], self.img_w)
+        data samples (training), also the GT lanes and the GT vanishing column (NaN where undefined). Polar mode: the
+        vanishing point [B, 2] and its GT [B, 2]; the origin is P's centre, the point (clamped to the head's range)."""
+        polar = self.fovea_mode == "polar"
+        vp = self.vp_head(c_feats[-1], self.img_w, self.img_h) if polar else self.vp_head(c_feats[-1], self.img_w)
         batch_size, dev = vp.shape[0], vp.device
         out = dict(vp=vp, vp_gt=None, gts=None)
         if batch_data_samples is not None:
             gts = self.extract_lanes_2d(batch_data_samples, dev)
             out["gts"] = gts
             v = [vanishing_point(self._px(g.double()).cpu().numpy(), self.img_h) for g in gts]
-            out["vp_gt"] = torch.tensor([math.nan if p is None else p[0] for p in v], device=dev)
+            if polar:
+                out["vp_gt"] = torch.tensor([[math.nan, math.nan] if p is None else list(p) for p in v], device=dev)
+            else:
+                out["vp_gt"] = torch.tensor([math.nan if p is None else p[0] for p in v], device=dev)
         origin = torch.zeros(batch_size, 2, device=dev)
+        if polar:
+            centre = vp.detach().float()
+            if self.training and out["vp_gt"] is not None and self.p_gt > 0:
+                use = (torch.rand(batch_size, device=dev) < self.p_gt) & torch.isfinite(out["vp_gt"]).all(-1)
+                jit = (torch.rand(batch_size, 2, device=dev) * 2.0 - 1.0) * torch.tensor(
+                    [self.jitter_px, self.jitter_y_px], device=dev)
+                gt = self._vp_clamp(torch.nan_to_num(out["vp_gt"].float()))
+                centre = torch.where(use[:, None], gt + jit, centre)
+            origin = self._vp_clamp(centre)
         if self.fovea_mode == "window":
             centre = vp.detach().float()
             if self.training and out["vp_gt"] is not None and self.p_gt > 0:
@@ -628,8 +784,39 @@ class FovealLaneHead(HBLRHead):
         out["origin"] = origin
         return out
 
+    def _vp_clamp(self, v):
+        """Vanishing points [..., 2] clamped to the head's range: x in [0, img_w], y in [-0.5 img_h, img_h]."""
+        lo = v.new_tensor([0.0, -0.5 * self.img_h])
+        hi = v.new_tensor([float(self.img_w), float(self.img_h)])
+        return torch.maximum(torch.minimum(v, hi), lo)
+
+    def _frame(self, origin, second):
+        """The batch's frame: PolarFrame around origin (polar mode), else ViewFrame (no second view: origin None)."""
+        if self.fovea_mode == "polar":
+            return PolarFrame(self.img_w, self.img_h, self.win_w, self.win_h, self.polar_theta, self.polar_r0,
+                              origin.float())
+        return ViewFrame(self.img_w, self.img_h, self.win_w, self.win_h, origin.float() if second else None)
+
+    def polar_image(self, x2, frame):
+        """P [B, C, polar_h, polar_w]: the 2x image x2 (the context frame at 2x) sampled bilinearly at supersample
+        points per P pixel (along a row, along a column; averaged); zero outside the crop."""
+        ku, kw = self.polar_ss
+        dev = x2.device
+        with torch.no_grad():
+            hf, wf = int(self.win_h) * kw, int(self.win_w) * ku
+            ys = (torch.arange(hf, device=dev, dtype=torch.float32) + 0.5) / kw
+            xs = (torch.arange(wf, device=dev, dtype=torch.float32) + 0.5) / ku
+            q = torch.stack(torch.meshgrid(xs, ys, indexing="xy"), dim=-1)            # [hf, wf, 2] P px (u, w)
+            p = frame.context(q[None].expand(x2.shape[0], -1, -1, -1))
+            g = p * p.new_tensor([2.0 / self.img_w, 2.0 / self.img_h]) - 1.0
+            img = F.grid_sample(x2, g.to(x2.dtype), mode="bilinear", padding_mode="zeros", align_corners=False)
+            return F.avg_pool2d(img, (kw, ku)) if kw * ku > 1 else img
+
     def crop_fovea(self, x2, origin):
-        """The F view: per image, the 2x pixels of the window at origin (context px) -> [B, C, 2 win_h, 2 win_w]."""
+        """The F view: per image, the 2x pixels of the window at origin (context px) -> [B, C, 2 win_h, 2 win_w].
+        Polar mode: P around the vanishing point origin (polar_image)."""
+        if self.fovea_mode == "polar":
+            return self.polar_image(x2, self._frame(origin, True))
         if self.fovea_mode == "full":
             return x2
         w2, h2 = int(2 * self.win_w), int(2 * self.win_h)
@@ -638,10 +825,10 @@ class FovealLaneHead(HBLRHead):
 
     def _view_layout(self, x):
         """The frame of x (window origin) and its maps (C's levels fine -> coarse, then F's), with each map's token
-        centres [B, h * w, 2] (context px, row-major)."""
+        centres [B, h * w, 2] (context px, row-major; P's: its cell centres mapped to the context frame; a P map's
+        cell is in P px)."""
         origin = x["origin"]
-        frame = ViewFrame(self.img_w, self.img_h, self.win_w, self.win_h,
-                          origin.float() if x.get("fov") is not None else None)
+        frame = self._frame(origin, x.get("fov") is not None)
         views = [(CTX, x["ctx"])] + ([(FOV, x["fov"])] if x.get("fov") is not None else [])
         maps, refs, start = [], [], 0
         batch_size, dev = origin.shape[0], origin.device
@@ -656,7 +843,9 @@ class FovealLaneHead(HBLRHead):
                                         torch.arange(w, device=dev, dtype=torch.float32), indexing="ij")
                 ref = torch.stack([(xs.reshape(-1) + 0.5) * cell[0], (ys.reshape(-1) + 0.5) * cell[1]], dim=-1)
                 ref = ref[None].expand(batch_size, -1, -1)
-                refs.append(ref + origin[:, None, :].float() if v == FOV else ref)
+                if v == FOV:
+                    ref = frame.context(ref) if self.fovea_mode == "polar" else ref + origin[:, None, :].float()
+                refs.append(ref)
                 maps.append(_Map(v, lvl, h, w, start, cell[0]))
                 start += h * w
         return frame, maps, refs
@@ -684,12 +873,12 @@ class FovealLaneHead(HBLRHead):
 
     # ------------------------------------------------------------------ proposals
     def _cell_centres(self, view, h, w, frame, dev):
-        """Cell centres of a view's stride-8 grid -> [B or 1, h * w, 2] (context px)."""
+        """Cell centres of a view's stride-8 grid -> [B or 1, h * w, 2] (context px; P px for P)."""
         span_w, span_h = (self.img_w, self.img_h) if view == CTX else (self.win_w, self.win_h)
         ys, xs = torch.meshgrid(torch.arange(h, device=dev, dtype=torch.float32),
                                 torch.arange(w, device=dev, dtype=torch.float32), indexing="ij")
         c = torch.stack([(xs.reshape(-1) + 0.5) * (span_w / w), (ys.reshape(-1) + 0.5) * (span_h / h)], dim=-1)[None]
-        return c + frame.origin[:, None, :].float() if view == FOV else c
+        return c + frame.origin[:, None, :].float() if view == FOV and self.fovea_mode != "polar" else c
 
     def _prop_decode(self, reg, cell, scale):
         """Regression channels reg [..., 8] at cell centres cell [..., 2] (context px), offsets in units of scale
@@ -701,6 +890,30 @@ class FovealLaneHead(HBLRHead):
         p1 = bottom + (1.0 / 3.0 + reg[..., 4:5]) * d + reg[..., 5:6] * nrm
         p2 = bottom + (2.0 / 3.0 + reg[..., 6:7]) * d + reg[..., 7:8] * nrm
         return bottom, top, monotone_fix(torch.stack([bottom, p1, p2, top], dim=-2))
+
+    def _polar_decode(self, reg, cell, scale, frame, img=None):
+        """P's proposals: the cubic decoded in P px at cell centres cell (P px; its row order is the distance from the
+        vanishing point), sampled at t_out_2d and mapped to the context frame -> bottom, top [..., 2] and the polyline
+        [..., T, 2] (context px, bottom first: the end with the larger y)."""
+        _, _, c_p = self._prop_decode(reg, cell, scale)
+        poly = frame.context(curve_points(c_p, self.t_out_2d), img)
+        flip = poly[..., 0, 1] < poly[..., -1, 1]
+        poly = torch.where(flip[..., None, None], poly.flip(-2), poly)
+        return poly[..., 0, :], poly[..., -1, :], poly
+
+    def _decode_rows_polar(self, reg, cell, scale, view, img, frame):
+        """Regression rows [R] of both views in polar mode -> bottom, top [R, 2] (context px) and the curves
+        [R, T, 2] (normalized): C's rows as _prop_decode, P's through _polar_decode."""
+        is_p = view == FOV
+        ic, ip = torch.nonzero(~is_p)[:, 0], torch.nonzero(is_p)[:, 0]
+        b_c, t_c, c_c = self._prop_decode(reg[ic], cell[ic], scale[ic])
+        b_p, t_p, poly = self._polar_decode(reg[ip], cell[ip], scale[ip], frame, img[ip])
+        num, num_t = reg.shape[0], self.t_out_2d.numel()
+        ends = reg.new_zeros(num, 2, 2).index_copy(0, ic, torch.stack([b_c, t_c], 1)) \
+            .index_copy(0, ip, torch.stack([b_p, t_p], 1))
+        curve = reg.new_zeros(num, num_t, 2).index_copy(0, ic, curve_points(self._norm(c_c), self.t_out_2d)) \
+            .index_copy(0, ip, self._norm(poly))
+        return ends[:, 0], ends[:, 1], curve
 
     def _view_scale(self, view):
         return self.prop["scale_px"] * (1.0 if view == CTX else 0.5)
@@ -736,7 +949,12 @@ class FovealLaneHead(HBLRHead):
             return torch.cat(t, dim=1).gather(1, idx[..., None].expand(-1, -1, t[0].shape[-1]))
 
         scale = torch.cat(scales)[idx]
-        _, _, c_px = self._prop_decode(take(regs_f), take(cells), scale)
+        reg_q, cell_q = take(regs_f), take(cells)
+        _, _, c_px = self._prop_decode(reg_q, cell_q, scale)
+        if self.fovea_mode == "polar":                   # P's peaks: decoded in P, mapped, fitted with the cubic
+            with torch.no_grad():
+                c_pol = monotone_fix(fit_cubic(self._polar_decode(reg_q, cell_q, scale, frame)[2]))
+            c_px = torch.where((view == FOV)[..., None, None], c_pol, c_px)
         return dict(hm=hms, reg=regs, view=view, cell=cell, cps=self._norm(c_px).detach(), tok=take(toks))
 
     # ------------------------------------------------------------------ forward
@@ -855,7 +1073,16 @@ class FovealLaneHead(HBLRHead):
         vp, vp_gt = x["vp"], x.get("vp_gt")
         zero = vp.sum() * 0.0
         out["loss_vp"] = zero
-        if vp_gt is not None:
+        if vp_gt is not None and vp.dim() == 2:             # polar: (x, y); the target clamped to the head's range
+            ok = torch.isfinite(vp_gt).all(-1)
+            out["vp_gt_frac"] = ok.float().mean()
+            if bool(ok.any()):
+                d = vp[ok] - self._vp_clamp(vp_gt[ok].float())
+                err = d / d.new_tensor([0.5 * self.img_w, 0.5 * self.img_h])
+                out["loss_vp"] = _smooth_l1(err, 0.0, self.vp_beta).sum(-1).mean() * self.vp_weight
+                out["vp_err_px"] = d[:, 0].detach().abs().mean()
+                out["vp_err_y_px"] = d[:, 1].detach().abs().mean()
+        elif vp_gt is not None:
             ok = torch.isfinite(vp_gt)
             out["vp_gt_frac"] = ok.float().mean()
             if bool(ok.any()):
@@ -883,7 +1110,10 @@ class FovealLaneHead(HBLRHead):
         and the cell size (px)."""
         span_w, span_h = (self.img_w, self.img_h) if view == CTX else (self.win_w, self.win_h)
         sx, sy = span_w / wc, span_h / hc
-        o = frame.origin[img].float() if view == FOV else centre.new_zeros(img.numel(), 2)
+        if view == FOV and self.fovea_mode == "polar":     # P: the centres in P px
+            centre, o = frame.polar(centre, img)[0], centre.new_zeros(img.numel(), 2)
+        else:
+            o = frame.origin[img].float() if view == FOV else centre.new_zeros(img.numel(), 2)
         ci = ((centre[:, 0] - o[:, 0]) / sx).floor().clamp(0, wc - 1).long()
         cj = ((centre[:, 1] - o[:, 1]) / sy).floor().clamp(0, hc - 1).long()
         return ci, cj, sx, sy
@@ -893,8 +1123,8 @@ class FovealLaneHead(HBLRHead):
         owns); at the cells within radius_cells of each owned centre (each cell to its nearest centre), the endpoint
         smooth-L1 and 1 - LaneIoU of the decoded proposal, weighted by the Gaussian, averaged per image."""
         cc = self.prop
-        frame = ViewFrame(self.img_w, self.img_h, self.win_w, self.win_h,
-                          origin.float() if len(p["hm"]) > 1 else None)
+        frame = self._frame(origin, len(p["hm"]) > 1)
+        polar = self.fovea_mode == "polar"
         batch_size = p["hm"][0].shape[0]
         out = {}
         zero = sum(r.sum() for r in p["reg"]) * 0.0
@@ -935,7 +1165,7 @@ class FovealLaneHead(HBLRHead):
         oy, ox = torch.meshgrid(off, off, indexing="ij")
         oy, ox = oy.flatten(), ox.flatten()
         dd0 = (oy ** 2 + ox ** 2).float()
-        reg_rows, cell_px, scales, g_idx_all, w_all = [], [], [], [], []
+        reg_rows, cell_px, scales, g_idx_all, w_all, views_r, imgs_r = [], [], [], [], [], [], []
         recall = torch.zeros(layout.num, dtype=torch.bool, device=centre.device)
         for v, sel, ci, cj, reg, hc, wc, sx, sy in cells:
             yy, xx = cj[:, None] + oy[None], ci[:, None] + ox[None]                         # [g, (2R + 1)^2]
@@ -952,7 +1182,9 @@ class FovealLaneHead(HBLRHead):
             first[1:] = key_s[1:] != key_s[:-1]
             pick = order[first]
             gi, yy, xx, dd, img = gi[pick], yy[pick], xx[pick], dd[pick], img[pick]
-            o = frame.origin[img].float() if v == FOV else centre.new_zeros(img.numel(), 2)
+            o = frame.origin[img].float() if v == FOV and not polar else centre.new_zeros(img.numel(), 2)
+            views_r.append(torch.full_like(gi, v))
+            imgs_r.append(img)
             cell_px.append(torch.stack([(xx.float() + 0.5) * sx, (yy.float() + 0.5) * sy], dim=-1) + o)
             reg_rows.append(reg[img, :, yy, xx])
             scales.append(torch.full_like(dd, self._view_scale(v)))
@@ -966,11 +1198,16 @@ class FovealLaneHead(HBLRHead):
                 near = (torch.maximum((qy - cj[:, None]).abs(), (qx - ci[:, None]).abs()) <= rad) & q_ok
                 recall[sel] = near.any(dim=1)
         g_idx, w = torch.cat(g_idx_all), torch.cat(w_all)
-        bottom, top, c_px = self._prop_decode(torch.cat(reg_rows), torch.cat(cell_px), torch.cat(scales))
+        reg_r, cell_r, scale_r = torch.cat(reg_rows), torch.cat(cell_px), torch.cat(scales)
+        if polar:                                        # P's rows: decoded in P, the mapped polyline
+            bottom, top, curve = self._decode_rows_polar(reg_r, cell_r, scale_r, torch.cat(views_r), torch.cat(imgs_r),
+                                                         frame)
+        else:
+            bottom, top, c_px = self._prop_decode(reg_r, cell_r, scale_r)
+            curve = curve_points(self._norm(c_px), self.t_out_2d)
         g_sel = g_px[g_idx]
         beta = self.smooth_l1_beta
         l_end = _smooth_l1(torch.stack([bottom - g_sel[:, 0], top - g_sel[:, -1]], dim=1), 0.0, beta).mean(dim=(-1, -2))
-        curve = curve_points(self._norm(c_px), self.t_out_2d)
         l_iou = 1.0 - lane_iou_2d(curve * self.eval_scale, gt_flat[g_idx].float() * self.eval_scale,
                                   self.lane_width * self.iou_w)
         b = layout.img[g_idx]
