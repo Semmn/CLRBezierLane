@@ -6,8 +6,13 @@ threshold and NMS, low scores included, so a lane the head found but scored low
 is told apart from a lane it never proposed). The evaluation is then rebuilt as
 the test loop runs it: threshold, lane NMS as the CUDA kernel computes it (or
 none), predictions_to_lanes, CurvelanesMetric and vega's LaneMetricCore (lanes
-drawn 5 px wide on 224x224, Hungarian on 1 - IoU). Works for CLRBezierHead and
-for the official CLRerHead (line anchors).
+drawn 5 px wide on 224x224, Hungarian on 1 - IoU). Works for CLRBezierHead, the
+official CLRerHead (line anchors) and the 2D heads (BLRHead, HBLRHead, FovealLaneHead
+with its 2x configs): they all emit the official rows. For the BLR-family heads the
+stored scores are the ones the config's test path uses (o2o when use_nms=False, the
+header says which), and --mode defaults to that path. For FovealLaneHead every
+stored prediction also carries the view its query's proposal came from (context or
+the second view: window / full / polar), reported per bin as hit-v2 / low-v2.
 
 The report has:
 
@@ -49,7 +54,7 @@ extends below the lowest annotated point.
     # other modes / thresholds from the dump (CPU)
     python tools/clrbezier/curvelanes_error_breakdown.py CONFIG --load-dump work_dirs/err/RUN.pkl \\
         --mode both --out-dir work_dirs/err/RUN
-    # side by side (e.g. Bezier o2o, Bezier o2m, CLRerNet line)
+    # side by side (e.g. A-mono and the foveal runs off / window / polar; per bin R@50, R@75, low_score)
     python tools/clrbezier/curvelanes_error_breakdown.py --compare A/summary.json B/summary.json
 
 Outputs in --out-dir: summary.txt, summary.json (for --compare), gt_lanes.csv
@@ -514,6 +519,7 @@ def unpack_near(c):
 # ----------------------------------------------------------------------------
 def evaluate_image(c, rec, thr, mode, ctx):
     score, valid, iou = rec["score"], c["valid"], c["iou"]
+    view = rec.get("view")
     near = unpack_near(c)
     kept, fate, by = select(score, near, thr, mode, ctx["top_k"])
     out = output_order(kept, valid, mode, rec["idx"])
@@ -524,10 +530,12 @@ def evaluate_image(c, rec, thr, mode, ctx):
         p, v = matched.get(g, (-1, 0.0))
         row = dict(image=c["filename"], gt=g, iou=v, hit50=v > HIT, hit75=v > TIGHT,
                    **c["attrs"][g])
+        src = -1                                 # the prediction the lane's row describes (view column)
         if v > HIT:
             row["reason"] = "hit"
             row["pair"] = c["pairs"].get((g, p))
             row["score"] = float(score[p])
+            src = p
         else:
             cand = np.nonzero(valid & (iou[g] > HIT))[0]
             f = fate[cand]
@@ -539,11 +547,13 @@ def evaluate_image(c, rec, thr, mode, ctx):
                 q = q[np.argmax(score[q])]
                 row["suppressor_is_hit"] = int(by[q]) in hit_of
                 row["score"] = float(score[q])
+                src = q
             elif (f == CAPPED).any():
                 row["reason"] = "capped"
             elif len(cand):
                 row["reason"] = "low_score"
-                row["score"] = float(score[cand].max())
+                src = cand[np.argmax(score[cand])]
+                row["score"] = float(score[src])
             else:
                 best_p, best = -1, 0.0
                 if valid.any():
@@ -556,8 +566,13 @@ def evaluate_image(c, rec, thr, mode, ctx):
                     row["pair"] = c["pairs"].get((g, best_p))
                     row["best_in_output"] = best_p in out
                     row["score"] = float(score[best_p])
+                    src = best_p
                 else:
                     row["reason"] = "absent"
+        if src >= 0:
+            row["pred"] = int(rec["idx"][src])
+            if view is not None:
+                row["view"] = int(view[src])
         lanes.append(row)
     fps = []
     for p in out:
@@ -570,6 +585,8 @@ def evaluate_image(c, rec, thr, mode, ctx):
         row = dict(image=c["filename"], pred=int(rec["idx"][p]), score=float(score[p]), kind=kind,
                    best_iou=best, slant=float(c["pred_attr"][p, 0]), extent=float(c["pred_attr"][p, 1]),
                    twin_dist=math.nan, twin_near=False)
+        if view is not None:
+            row["view"] = int(view[p])
         if kind == "duplicate" and g in matched and matched[g][1] > HIT:
             twin = matched[g][0]
             nr, mean = kernel_pairs(rec["rows"][[p, twin]], ctx["n_strips"], ctx["img_w"], ctx["nms_thres"])
@@ -614,8 +631,15 @@ def _q(values):
     return f"{q2:6.2f} [{q1:.2f}, {q3:.2f}]"
 
 
-def breakdown(lanes, fps, counts, mode, thr, specs):
-    """Everything the report and summary.json show for one mode."""
+def _v2(items):
+    """Share of the items (lane / false-positive rows) whose prediction came from the second view (NaN if none)."""
+    v = [it["view"] for it in items if "view" in it]
+    return float(np.mean(np.asarray(v) == 1)) if v else math.nan
+
+
+def breakdown(lanes, fps, counts, mode, thr, specs, second_view=None):
+    """Everything the report and summary.json show for one mode. second_view: the FovealLaneHead's second view
+    (window / full / polar) when the records carry the view of each prediction, else None."""
     G = sum(k["gt"] for k in counts)
     n_out = sum(k["out"] for k in counts)
     tp = sum(k["tp50"] for k in counts)
@@ -674,6 +698,9 @@ def breakdown(lanes, fps, counts, mode, thr, specs):
                              r50=sum(ln["hit50"] for ln in sub) / n, r75=sum(ln["hit75"] for ln in sub) / n,
                              reasons={k: rcb[k] / n for k in FN_REASONS},
                              miss_share=sum(1 for ln in sub if not ln["hit50"]) / misses))
+            if second_view:
+                rows[-1].update(v2_hits=_v2([ln for ln in sub if ln["reason"] == "hit"]),
+                                v2_low=_v2([ln for ln in sub if ln["reason"] == "low_score"]))
         tables[name] = dict(desc=desc, rows=rows)
     fp_tables = {}
     for name, desc, spec in PRED_ATTR_SPECS:
@@ -696,7 +723,10 @@ def breakdown(lanes, fps, counts, mode, thr, specs):
                 dup_twin=dict(n=len(dups), median=float(np.median([fp["twin_dist"] for fp in dups]))
                               if dups else math.nan,
                               near=float(np.mean([fp["twin_near"] for fp in dups])) if dups else math.nan),
-                oracles=oracles, loose=loose_stats, tables=tables, fp_tables=fp_tables)
+                oracles=oracles, loose=loose_stats, tables=tables, fp_tables=fp_tables,
+                views=(dict(second=second_view, hits=_v2([ln for ln in lanes if ln["reason"] == "hit"]),
+                            low=_v2([ln for ln in lanes if ln["reason"] == "low_score"]), fp=_v2(fps))
+                       if second_view else None))
 
 
 def format_mode(b, cfg_thr, chosen, say, nms_thres):
@@ -721,6 +751,11 @@ def format_mode(b, cfg_thr, chosen, say, nms_thres):
     if dt["n"]:
         say(f"  duplicates vs the prediction that took their GT lane: median kernel distance "
             f"{dt['median']:.1f} px (nms_thres {nms_thres:g}); {100 * dt['near']:.0f}% within it")
+    vw = b.get("views")
+    if vw:
+        say(f"second view ({vw['second']}): its queries made {_pct(vw['hits'])}% of the hits, "
+            f"{_pct(vw['fp'])}% of the false positives, and the best candidate of {_pct(vw['low'])}% of the "
+            f"low_score misses (columns hit-v2 / low-v2 below)")
     say(f"F1@50 if one error class were fixed alone (from {100 * b['F1_50']:.2f}):")
     for lab, v in b["oracles"]:
         say(f"  {lab:48s} {v:6.2f}  ({v - 100 * b['F1_50']:+.2f})")
@@ -737,14 +772,16 @@ def format_mode(b, cfg_thr, chosen, say, nms_thres):
         say("")
         say(f"by {t['desc']}")
         say(f"  {'bin':>12} {'GT%':>6} {'R@50':>6} {'R@75':>6} |" +
-            "".join(f"{FN_SHORT[k]:>7}" for k in reasons) + f" | {'misses%':>7}")
+            "".join(f"{FN_SHORT[k]:>7}" for k in reasons) + f" | {'misses%':>7}" +
+            (f" | {'hit-v2':>6} {'low-v2':>6}" if vw else ""))
         for row in t["rows"]:
             if row["n"] == 0:
                 say(f"  {row['bin']:>12} {0:6.2f}      -      - |")
                 continue
             say(f"  {row['bin']:>12} {100 * row['share']:6.2f} {100 * row['r50']:6.2f} {100 * row['r75']:6.2f} |" +
                 "".join(f"{100 * row['reasons'][k]:7.2f}" for k in reasons) +
-                f" | {100 * row['miss_share']:7.2f}")
+                f" | {100 * row['miss_share']:7.2f}" +
+                (f" | {_pct(row['v2_hits']):>6} {_pct(row['v2_low']):>6}" if vw else ""))
     for name, t in b["fp_tables"].items():
         say("")
         say(f"false positives by {t['desc']}: kinds in % of the bin's false positives")
@@ -752,6 +789,10 @@ def format_mode(b, cfg_thr, chosen, say, nms_thres):
         for row in t["rows"]:
             say(f"  {row['bin']:>12} {row['n']:7d} {100 * row['share']:6.2f} | " +
                 " ".join(f"{100 * row['kinds'][k]:6.2f}" for k in FP_KINDS) + f" | {row['twin_dist']}")
+
+
+def _pct(v):
+    return "-" if v is None or math.isnan(v) else f"{100 * v:.1f}"
 
 
 def dataset_lines(lanes, say, nms_thres):
@@ -767,10 +808,10 @@ def dataset_lines(lanes, say, nms_thres):
 
 
 def write_csvs(out_dir, per_mode):
-    gt_keys = ["mode", "image", "gt", "reason", "iou", "hit50", "hit75", "score", "best_iou",
+    gt_keys = ["mode", "image", "gt", "reason", "pred", "iou", "hit50", "hit75", "score", "best_iou",
                "best_in_output", "suppressor_is_hit", "coverage", "beyond", "dx", "normal",
                "slant", "extent", "bend", "nn_dist", "fork", "lanes", "resolution", "reversing",
-               "above_frac", "n_points"]
+               "above_frac", "n_points", "view"]
     with open(osp.join(out_dir, "gt_lanes.csv"), "w", newline="") as f:
         wr = csv.DictWriter(f, fieldnames=gt_keys, extrasaction="ignore")
         wr.writeheader()
@@ -780,7 +821,8 @@ def write_csvs(out_dir, per_mode):
                 pair = ln.get("pair") or (math.nan,) * 4
                 row.update(coverage=pair[0], beyond=pair[1], dx=pair[2], normal=pair[3])
                 wr.writerow({k: _fmt(row.get(k, "")) for k in gt_keys})
-    fp_keys = ["mode", "image", "pred", "score", "kind", "best_iou", "slant", "extent", "twin_dist", "twin_near"]
+    fp_keys = ["mode", "image", "pred", "score", "kind", "best_iou", "slant", "extent", "twin_dist", "twin_near",
+               "view"]
     with open(osp.join(out_dir, "false_positives.csv"), "w", newline="") as f:
         wr = csv.DictWriter(f, fieldnames=fp_keys, extrasaction="ignore")
         wr.writeheader()
@@ -819,7 +861,7 @@ def compare(paths, say):
         with open(p) as f:
             runs.append(json.load(f))
     labels = [r["label"] for r in runs]
-    width = max(14, max(len(lab) for lab in labels) + 2)
+    width = max(20, max(len(lab) for lab in labels) + 2)
     say("=" * 100)
     say("comparison")
     for lab, p in zip(labels, paths):
@@ -844,19 +886,35 @@ def compare(paths, say):
         say("  false positives (% of output):")
         for k in FP_KINDS:
             line(f"    {k}", lambda b, k=k: f"{100 * b['fp'][k]:.2f}")
+        if any(r["modes"][mode].get("views") for r in have):
+            line("second view: % hits / low_sc / FP", lambda b: (
+                f"{_pct(b['views']['hits'])} / {_pct(b['views']['low'])} / {_pct(b['views']['fp'])}"
+                if b.get("views") else "-"))
         first = have[0]["modes"][mode]
-        for name, t in first["tables"].items():
+
+        def table(name, desc, rows, get):
             say("")
-            say(f"  R@50 / R@75 by {t['desc']}")
-            for row in t["rows"]:
-                def cell(b, binname=row["bin"], name=name):
+            say(f"  {desc}")
+            for row in rows:
+                def cell(b, binname=row["bin"]):
                     for rr in b["tables"].get(name, {}).get("rows", []):
                         if rr["bin"] == binname and rr.get("n"):
-                            return f"{100 * rr['r50']:.1f} / {100 * rr['r75']:.1f}"
+                            return get(rr)
                     return "-"
                 share = f"({100 * row.get('share', 0):.1f}% GT)"
                 say(f"  {row['bin'] + ' ' + share:34s}" + "".join(
                     f"{(cell(r['modes'][mode]) if mode in r['modes'] else '-'):>{width}}" for r in runs))
+        for name, t in first["tables"].items():
+            table(name, f"R@50 / R@75 / low_score (points of the bin's recall) by {t['desc']}", t["rows"],
+                  lambda rr: f"{100 * rr['r50']:.1f} / {100 * rr['r75']:.1f} / "
+                             f"{100 * rr['reasons']['low_score']:.1f}")
+        if any(r["modes"][mode].get("views") for r in have):
+            for name in ("slant", "extent"):
+                if name in first["tables"]:
+                    t = first["tables"][name]
+                    table(name, f"second view: % of the bin's hits / % of its low_score misses whose best "
+                                f"candidate came from it, by {t['desc']}", t["rows"],
+                          lambda rr: (f"{_pct(rr['v2_hits'])} / {_pct(rr['v2_low'])}" if "v2_hits" in rr else "-"))
 
 
 # ----------------------------------------------------------------------------
@@ -881,7 +939,8 @@ def pred_rows(pred_dict):
     return rows, score
 
 
-def image_records(pred_dict, samples, floor, max_n):
+def image_records(pred_dict, samples, floor, max_n, view=None):
+    """view [B, Q] (FovealLaneHead): the view each query's proposal came from, stored per prediction."""
     rows, score = pred_rows(pred_dict)
     out = []
     for b, ds in enumerate(samples):
@@ -897,7 +956,43 @@ def image_records(pred_dict, samples, floor, max_n):
                         idx=order.cpu().numpy().astype(np.int64),
                         rows=rows[b, order].float().cpu().numpy(),
                         score=s[order].float().cpu().numpy(), n_above=int(len(keep)), trunc=trunc))
+        if view is not None:
+            out[-1]["view"] = view[b, order.to(view.device)].cpu().numpy().astype(np.int8)
     return out
+
+
+class ViewCapture:
+    """FovealLaneHead: the view (0 the context, 1 the second view) of each query's proposal, read from the head's
+    internal output during head(feats); None for every other head."""
+
+    def __init__(self, head):
+        self.head, self.view = head, None
+        self.on = hasattr(head, "fovea_mode") and hasattr(head, "_forward")
+
+    def __enter__(self):
+        if self.on:
+            fwd = self.head._forward
+
+            def capture(*a, **k):
+                out = fwd(*a, **k)
+                prop = out.get("prop") if isinstance(out, dict) else None
+                self.view = None if prop is None else prop["view"]
+                return out
+            self.head._forward = capture
+        return self
+
+    def __exit__(self, *exc):
+        if self.on:
+            del self.head._forward                   # back to the class method
+        return False
+
+
+def score_source(head):
+    """Which scores head(feats)[-1] carries for the BLR-family heads (BLRHead, HBLRHead, FovealLaneHead): the o2o
+    scores on the NMS-free test path, the o2m scores with NMS, unless test_score fixes one; None for others."""
+    if not hasattr(head, "cls_o2o"):
+        return None
+    return getattr(head, "test_score", None) or ("o2m" if bool(head.test_cfg.get("use_nms", True)) else "o2o")
 
 
 @torch.no_grad()
@@ -936,6 +1031,7 @@ def run_inference(cfg, args, device):
     model = build_model(cfg, args.checkpoint, device)
     head = model.bbox_head
     meta = head_meta(head)
+    meta.update(score_source=score_source(head), second_view=getattr(head, "fovea_mode", None))
     decoder = Decoder(type(head).predictions_to_lanes, meta["prior_ys"], meta["n_strips"], meta["test_cfg"])
     top_k = int(head.test_cfg["nms_topk"])
     loader = Runner.build_dataloader(copy.deepcopy(cfg.test_dataloader if args.split == "test"
@@ -945,8 +1041,9 @@ def run_inference(cfg, args, device):
     for bi, data in enumerate(loader):
         data = model.data_preprocessor(data, False)
         feats = model.extract_feat(data["inputs"])
-        pred_dict = head(feats)[-1]
-        recs = image_records(pred_dict, data["data_samples"], args.floor, args.max_per_image)
+        with ViewCapture(head) as cap:
+            pred_dict = head(feats)[-1]
+        recs = image_records(pred_dict, data["data_samples"], args.floor, args.max_per_image, cap.view)
         if bi < args.verify_batches:
             c, m = verify(head, pred_dict, recs, decoder, meta, top_k)
             checked, bad = checked + c, bad + m
@@ -974,8 +1071,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("config", nargs="?")
     ap.add_argument("checkpoint", nargs="?", default=None)
-    ap.add_argument("--mode", choices=["nms", "free", "both"], default="nms",
-                    help="which output to break down (the sweep always has both)")
+    ap.add_argument("--mode", choices=["nms", "free", "both"], default=None,
+                    help="which output to break down (the sweep always has both); default: the config's "
+                         "test_cfg.use_nms (free for the NMS-free BLR / HBLR / foveal configs)")
     ap.add_argument("--thr-nms", type=float, default=None, help="default: best F1@50 of the sweep")
     ap.add_argument("--thr-free", type=float, default=None, help="default: best F1@50 of the sweep")
     ap.add_argument("--split", choices=["test", "val"], default="test",
@@ -1040,6 +1138,11 @@ def main(argv=None):
         records = records[:args.max_images]
 
     tc = meta["test_cfg"]
+    if args.mode is None:
+        args.mode = "nms" if bool(tc.get("use_nms", True)) else "free"
+    second_view = meta.get("second_view")
+    if second_view in (None, "off") or not any("view" in r for r in records):
+        second_view = None
     cfg_thr = float(tc["conf_threshold"])
     nms_thres, top_k = float(tc["nms_thres"]), int(tc["nms_topk"])
     grid = set(np.round(np.arange(0.05, 0.951, 0.05), 2).tolist()) | {0.96, 0.97, 0.98, 0.99, cfg_thr}
@@ -1072,6 +1175,16 @@ def main(argv=None):
         f"{args.floor:g}): median {int(np.median(n_stored)) if n_stored else 0}, max {max(n_stored, default=0)}"
         + (f"; the highest unstored score is {exact_from:.3f}: rows of the sweep below it are approximate"
            if exact_from is not None and exact_from >= thresholds[0] else ""))
+    src = meta.get("score_source")
+    if src == "o2o":
+        say("  scores: o2o (cls_o2o, the head's NMS-free test path); the with-NMS columns run NMS on these "
+            "o2o scores, not on the o2m scores the head uses with use_nms=True")
+    elif src == "o2m":
+        say("  scores: o2m (cls_o2m, the head's test path with NMS); the without-NMS columns use these o2m "
+            "scores, not the o2o scores the head uses with use_nms=False")
+    if second_view:
+        say(f"  FovealLaneHead second view: {second_view}; each stored prediction carries the view its query's "
+            f"proposal came from (0 context, 1 {second_view}; view column of the CSVs)")
     say(f"  verify: {json.dumps(vinfo)}")
     say("")
 
@@ -1110,7 +1223,7 @@ def main(argv=None):
         if mode == modes[0]:
             dataset_lines(lanes, say, nms_thres)
             say("")
-        b = breakdown(lanes, fps, counts, mode, ops[mode], specs)
+        b = breakdown(lanes, fps, counts, mode, ops[mode], specs, second_view)
         k = [i for i, t in enumerate(thresholds) if abs(t - ops[mode]) < 1e-9]
         if k:
             sw = sweep[mode][k[0]]
