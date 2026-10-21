@@ -48,11 +48,17 @@ fovea_cfg.source "features": P is not made from the 2x image but from C's encode
 vanishing point onto P's stride-8 grid after the encoder, so there is no second backbone pass and the encoder sees C's
 tokens only. P keeps the geometry (a lane through v is a column of P: P's proposal head and the decoder's P offsets
 work in that frame) without the extra pixels).
+fovea_cfg.mode "ray": no second view; P is a tool for C. After the encoder, C's encoded stride-8 map is resampled onto
+P's stride-8 grid (as source "features"), where every lane through the vanishing point is a column whatever its slant.
+RayAggregation runs residual convolutions dilated along P's rows (the distance from v), i.e. along all those lanes at
+once; SCNN / RESA pass messages along the image's rows and columns, which follow a lane only when it is near vertical.
+The result is sampled back at C's stride-8 cells and added to C's map (its output convolution starts at zero, so the
+head starts as "off" with the vanishing-point head); proposals, decoder, seg and losses read that map as in "off".
 Logs: vp_err_px (vp_err_y_px: the row, polar), vp_gt_frac, fovea_share (F's share of the last lane step's
 curve-attention weight), prop_recall (GT lanes with a selected peak within radius_cells of their centre cell, in their
 view; prop_recall_fov: of the lanes centred in the window), prop_fovea_frac (queries from F), win_lane_frac (GT lanes
 whose centre is in the window), cov0 / iou0 (HBLRHead). In polar mode the F logs are P's (the window = P's angle
-range)."""
+range). ray_share (mode "ray"): the size of the added aggregation relative to C's stride-8 map (RMS ratio)."""
 import contextlib
 import math
 
@@ -432,6 +438,35 @@ class FovealStep(nn.Module):
         return n[2](h + self.drop(self.ffn(h)))
 
 
+class RayAggregation(nn.Module):
+    """Aggregation along the rays from the vanishing point (fovea_cfg.mode "ray") on P's stride-8 map
+    [B, D, hp, wp]: residual bottleneck blocks (1 x 1 to channels, a kernel x angle_kernel convolution dilated along
+    P's rows only, 1 x 1 back to D), then a 1 x 1 output convolution that starts at zero. A column of P is a ray from
+    v, so its rows follow every lane through v; the dilations let a cell reach the whole column."""
+
+    def __init__(self, dim, channels, kernel, dilations, angle_kernel):
+        super().__init__()
+        self.blocks = nn.ModuleList([nn.Sequential(
+            nn.Conv2d(dim, channels, 1), nn.GroupNorm(32, channels), nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, (kernel, angle_kernel), padding=(d * (kernel // 2), angle_kernel // 2),
+                      dilation=(d, 1)),
+            nn.GroupNorm(32, channels), nn.ReLU(inplace=True),
+            nn.Conv2d(channels, dim, 1)) for d in dilations])
+        self.out = nn.Conv2d(dim, dim, 1)
+
+    def reset_parameters(self):
+        for m in self.blocks.modules():
+            if isinstance(m, (nn.Conv2d, nn.GroupNorm)):
+                m.reset_parameters()
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, p):
+        for block in self.blocks:
+            p = p + block(p)
+        return self.out(p)
+
+
 class ProposalHead(nn.Module):
     """Dense lane proposals on one view's stride-8 map: a centre heatmap logit and 8 regression channels (bottom x,
     bottom y gap, top x, top y gap, then per inner control point: along the chord, across it)."""
@@ -539,7 +574,7 @@ class FovealLaneNet(SingleStageDetector):
         c = tuple(self.backbone(ctx))
         view = head.place_window(c, batch_data_samples if self.training else None)
         f = None
-        if head.fovea_mode != "off" and not head.polar_features:     # P from features: made in the head
+        if head.fovea_mode not in ("off", "ray") and not head.polar_features:   # P from features: in the head
             fov = head.crop_fovea(batch_inputs, view["origin"])
             bn = _running_bn(self.backbone) if head.fovea_bn == "context" else contextlib.nullcontext()
             with bn:
@@ -568,22 +603,24 @@ class FovealLaneHead(HBLRHead):
     assign_cfg / loss_cfg / target_adapter / test_score / test_cfg (as BLRHead; loss_cfg.cp_loss_weight only with
     dec_cfg.cp_loss; assign_cfg.o2m None: o2o only, no cls_o2m, the scoring self-attention without the o2m score,
     loss_cfg.o2m_cls_weight / o2m_reg_weight unused).
-    fovea_cfg: mode ("window" | "off" | "full" | "polar"), window_w (400) / window_h (80) / window_top (0) in context
-    px (2x each must be a multiple of 32; not in polar mode), p_gt (0.5, training windows placed on the GT vanishing
-    column), jitter_px (40, uniform jitter of that GT column), bn ("context": F is normalized with the backbone's
-    running statistics, which only C updates, so training and test treat F alike; "batch": plain training-mode
-    BatchNorm on F too). Polar mode only (POLAR_KEYS): polar_w (800) / polar_h (256), P's size in px (multiples of
-    32); theta_deg ((-10, 190), P's angle range around the vanishing point, 90 = straight down); r0_px (24, P's rows
-    are linear in log(r + r0); a row then spans about 0.3 px next to the vanishing point, close to the 2x image's
-    0.5 px, and 5 px near the bottom corners); supersample ((2, 4), bilinear samples of the 2x image per P pixel
-    along a row and a column, averaged); jitter_y_px (10, uniform jitter of the GT row; p_gt and jitter_px as for
-    the window, P is centred on the GT vanishing point); source ("image": P resampled from the 2x image and passed
-    through the backbone, its 3 levels joining the encoder; "features": P's stride-8 map (polar_h / 8 x polar_w / 8)
-    resampled from C's encoded stride-8 map after the encoder, supersample points per P cell, averaged; no second
-    backbone pass, no P tokens in the encoder, bn unused; P's map feeds P's proposal head and the decoder's curve
-    attention as one more map).
+    fovea_cfg: mode ("window" | "off" | "full" | "polar" | "ray"), window_w (400) / window_h (80) / window_top (0) in
+    context px (2x each must be a multiple of 32; not in polar or ray mode), p_gt (0.5, training windows placed on the
+    GT vanishing column), jitter_px (40, uniform jitter of that GT column), bn ("context": F is normalized with the
+    backbone's running statistics, which only C updates, so training and test treat F alike; "batch": plain
+    training-mode BatchNorm on F too). Polar mode only (POLAR_KEYS): polar_w (800) / polar_h (256), P's size in px
+    (multiples of 32); theta_deg ((-10, 190), P's angle range around the vanishing point, 90 = straight down); r0_px
+    (24, P's rows are linear in log(r + r0); a row then spans about 0.3 px next to the vanishing point, close to the 2x
+    image's 0.5 px, and 5 px near the bottom corners); supersample ((2, 4), bilinear samples of the 2x image per P pixel
+    along a row and a column, averaged); jitter_y_px (10, uniform jitter of the GT row; p_gt and jitter_px as for the
+    window, P is centred on the GT vanishing point); source ("image": P resampled from the 2x image and passed through
+    the backbone, its 3 levels joining the encoder; "features": P's stride-8 map (polar_h / 8 x polar_w / 8) resampled
+    from C's encoded stride-8 map after the encoder, supersample points per P cell, averaged; no second backbone pass,
+    no P tokens in the encoder, bn unused; P's map feeds P's proposal head and the decoder's curve attention as one more
+    map). Mode "ray": POLAR_KEYS other than source set P's geometry (P is C's encoded stride-8 map resampled, as with
+    source "features"); window keys and bn unused. ray_cfg (mode "ray" only): channels (64, multiple of 32), kernel (5,
+    along P's rows), dilations ((1, 3, 9): one block each, along P's rows), angle_kernel (3, across P's columns).
     vp_cfg: channels (128), loss_weight (1.0), beta (0.05; smooth-L1 on the error / (img_w / 2), plus the row error /
-    (img_h / 2) in polar mode), in every mode.
+    (img_h / 2) in polar and ray modes), in every mode.
     enc_cfg: num_layers (3), num_heads (8), num_points (4), ffn_dim (1024), dropout (0.0), checkpoint (False:
     recompute each layer in the backward pass to save memory), extra_level (False: a fourth, stride-64 level per
     view, a 3 x 3 stride-2 conv on C5 + GroupNorm as Deformable DETR's extra level; its cells are not square, e.g.
@@ -601,9 +638,9 @@ class FovealLaneHead(HBLRHead):
 
     def __init__(self, in_channels=(128, 256, 512), num_queries=16, dim=256, num_points=72, img_w=800, img_h=320,
                  seg_num_classes=2, curve_cfg=None, hier_cfg=None, fovea_cfg=None, vp_cfg=None, enc_cfg=None,
-                 prop_cfg=None, dec_cfg=None, assign_cfg=None, loss_cfg=None, target_adapter=None, test_score=None,
-                 train_cfg=None, test_cfg=None, init_cfg=None):
-        fc, vc, ec, pc, dc = (dict(c or {}) for c in (fovea_cfg, vp_cfg, enc_cfg, prop_cfg, dec_cfg))
+                 prop_cfg=None, dec_cfg=None, ray_cfg=None, assign_cfg=None, loss_cfg=None, target_adapter=None,
+                 test_score=None, train_cfg=None, test_cfg=None, init_cfg=None):
+        fc, vc, ec, pc, dc, rc = (dict(c or {}) for c in (fovea_cfg, vp_cfg, enc_cfg, prop_cfg, dec_cfg, ray_cfg))
         polar_cfg = {k: fc.pop(k) for k in POLAR_KEYS if k in fc}
         for name, cfg, known in (
                 ("fovea_cfg", fc, {"mode", "window_w", "window_h", "window_top", "p_gt", "jitter_px", "bn"}),
@@ -614,7 +651,8 @@ class FovealLaneHead(HBLRHead):
                                   "iou_weight"}),
                 ("dec_cfg", dc, {"num_iters", "self_attn", "num_heads", "ffn_dim", "dropout", "curve_points",
                                  "deform_heads", "deform_points", "step_scale", "cp_loss", "num_neighbors",
-                                 "dist_scale", "max_dist", "layer_loss"})):
+                                 "dist_scale", "max_dist", "layer_loss"}),
+                ("ray_cfg", rc, {"channels", "kernel", "dilations", "angle_kernel"})):
             if set(cfg) - known:
                 raise ValueError(f"FovealLaneHead {name}: unknown keys {sorted(set(cfg) - known)}")
         cc = dict(curve_cfg or {})
@@ -659,9 +697,13 @@ class FovealLaneHead(HBLRHead):
 
         # views
         self.fovea_mode = str(fc.get("mode", "window"))
-        if self.fovea_mode not in ("window", "off", "full", "polar"):
-            raise ValueError("FovealLaneHead fovea_cfg.mode must be 'window', 'off', 'full' or 'polar'")
-        unused = sorted(set(fc) & {"window_w", "window_h", "window_top"} if self.fovea_mode == "polar" else polar_cfg)
+        if self.fovea_mode not in ("window", "off", "full", "polar", "ray"):
+            raise ValueError("FovealLaneHead fovea_cfg.mode must be 'window', 'off', 'full', 'polar' or 'ray'")
+        self.ray = self.fovea_mode == "ray"
+        self.vp_point = self.fovea_mode in ("polar", "ray")         # P's geometry around the vanishing point
+        unused = sorted(set(fc) & {"window_w", "window_h", "window_top"} if self.vp_point else polar_cfg)
+        if self.ray and "source" in polar_cfg:
+            unused.append("source")
         if unused:
             raise ValueError(f"FovealLaneHead fovea_cfg: {unused} unused in mode '{self.fovea_mode}'")
         self.fovea_bn = str(fc.get("bn", "context"))
@@ -670,14 +712,14 @@ class FovealLaneHead(HBLRHead):
             raise ValueError("FovealLaneHead fovea_cfg.bn must be 'context' or 'batch'")
         if self.fovea_mode == "full":
             self.win_w, self.win_h, self.win_top = float(self.img_w), float(self.img_h), 0.0
-        elif self.fovea_mode == "polar":                   # win_w / win_h: P's size (px)
+        elif self.vp_point:                               # win_w / win_h: P's size (px)
             self.win_w, self.win_h = float(polar_cfg.get("polar_w", 800)), float(polar_cfg.get("polar_h", 256))
             self.win_top = 0.0
             self.polar_theta = tuple(float(a) for a in polar_cfg.get("theta_deg", (-10.0, 190.0)))
             self.polar_r0 = float(polar_cfg.get("r0_px", 24.0))
             self.polar_ss = tuple(int(k) for k in polar_cfg.get("supersample", (2, 4)))
             self.jitter_y_px = float(polar_cfg.get("jitter_y_px", 10.0))
-            self.polar_source = str(polar_cfg.get("source", "image"))
+            self.polar_source = str(polar_cfg.get("source", "features" if self.ray else "image"))
             if self.polar_source not in ("image", "features"):
                 raise ValueError("FovealLaneHead fovea_cfg.source must be 'image' or 'features'")
             if self.win_w % 32 or self.win_h % 32 or len(self.polar_theta) != 2 or len(self.polar_ss) != 2 or \
@@ -688,13 +730,13 @@ class FovealLaneHead(HBLRHead):
         else:
             self.win_w, self.win_h = float(fc.get("window_w", 400)), float(fc.get("window_h", 80))
             self.win_top = float(fc.get("window_top", 0))
-        if self.fovea_mode != "polar" and ((2 * self.win_w) % 32 or (2 * self.win_h) % 32 or self.win_w > self.img_w
+        if not self.vp_point and ((2 * self.win_w) % 32 or (2 * self.win_h) % 32 or self.win_w > self.img_w
                                            or self.win_top + self.win_h > self.img_h or self.win_top % 0.5):
             raise ValueError("FovealLaneHead fovea_cfg: 2 x window_w and 2 x window_h must be multiples of 32 and the "
                              "window must fit in the crop")
         self.p_gt = float(fc.get("p_gt", 0.5))
         self.jitter_px = float(fc.get("jitter_px", 40.0))
-        views = 1 if self.fovea_mode == "off" else 2
+        views = 1 if self.fovea_mode in ("off", "ray") else 2
         self.polar_features = self.fovea_mode == "polar" and self.polar_source == "features"
         enc_views = 1 if self.polar_features else views    # P from features: not in the encoder
         self.extra_level = bool(ec.get("extra_level", False))
@@ -721,9 +763,23 @@ class FovealLaneHead(HBLRHead):
         self.enc_checkpoint = bool(ec.get("checkpoint", False))
 
         # vanishing column (point, in polar mode)
-        vp_cls = VanishingPointHead if self.fovea_mode == "polar" else VanishingColumnHead
+        vp_cls = VanishingPointHead if self.vp_point else VanishingColumnHead
         self.vp_head = vp_cls(in_channels[-1], int(vc.get("channels", 128)))
         self.vp_weight, self.vp_beta = float(vc.get("loss_weight", 1.0)), float(vc.get("beta", 0.05))
+
+        # aggregation along the rays from the vanishing point (mode "ray")
+        if rc and not self.ray:
+            raise ValueError("FovealLaneHead ray_cfg is used by fovea_cfg.mode 'ray' only")
+        self.ray_agg = None
+        if self.ray:
+            ray_c, ray_k = int(rc.get("channels", 64)), int(rc.get("kernel", 5))
+            ray_ka = int(rc.get("angle_kernel", 3))
+            ray_d = tuple(int(d) for d in rc.get("dilations", (1, 3, 9)))
+            if ray_c % 32 or ray_k % 2 == 0 or ray_ka % 2 == 0 or not ray_d or min(ray_d) < 1:
+                raise ValueError("FovealLaneHead ray_cfg: channels a multiple of 32, odd kernel and angle_kernel, "
+                                 "dilations >= 1")
+            self.ray_agg = RayAggregation(dim, ray_c, ray_k, ray_d, ray_ka)
+        self.last_ray_share = None
 
         # proposals
         self.prop = dict(sigma=float(pc.get("sigma_cells", 2.0)), radius=int(pc.get("radius_cells", 2)),
@@ -772,6 +828,8 @@ class FovealLaneHead(HBLRHead):
             nn.init.trunc_normal_(p, std=0.02)
         for m in list(self.enc) + list(self.dec) + list(self.prop_heads) + [self.vp_head]:
             m.reset_parameters()
+        if self.ray_agg is not None:
+            self.ray_agg.reset_parameters()
         if self.hier is not None:
             nn.init.trunc_normal_(self.seg_dec_pos, std=0.02)
             for m in self.seg_dec:
@@ -787,9 +845,10 @@ class FovealLaneHead(HBLRHead):
     # ------------------------------------------------------------------ views
     def place_window(self, c_feats, batch_data_samples=None):
         """The vanishing column from C5 and the window origin [B, 2] (context px; zeros for "off" / "full"). With
-        data samples (training), also the GT lanes and the GT vanishing column (NaN where undefined). Polar mode: the
-        vanishing point [B, 2] and its GT [B, 2]; the origin is P's centre, the point (clamped to the head's range)."""
-        polar = self.fovea_mode == "polar"
+        data samples (training), also the GT lanes and the GT vanishing column (NaN where undefined). Polar and ray
+        modes: the vanishing point [B, 2] and its GT [B, 2]; the origin is P's centre, the point (clamped to the head's
+        range)."""
+        polar = self.vp_point
         vp = self.vp_head(c_feats[-1], self.img_w, self.img_h) if polar else self.vp_head(c_feats[-1], self.img_w)
         batch_size, dev = vp.shape[0], vp.device
         out = dict(vp=vp, vp_gt=None, gts=None)
@@ -835,6 +894,31 @@ class FovealLaneHead(HBLRHead):
             return PolarFrame(self.img_w, self.img_h, self.win_w, self.win_h, self.polar_theta, self.polar_r0,
                               origin.float())
         return ViewFrame(self.img_w, self.img_h, self.win_w, self.win_h, origin.float() if second else None)
+
+    def _ray_frame(self, origin):
+        """Mode "ray": P's frame around the vanishing points origin [B, 2] (C's own frame stays the plain one)."""
+        return PolarFrame(self.img_w, self.img_h, self.win_w, self.win_h, self.polar_theta, self.polar_r0,
+                          origin.float())
+
+    def ray_aggregate(self, m, frame):
+        """Mode "ray": C's encoded stride-8 map m [B, D, h, w] + RayAggregation of its resampling onto P, sampled
+        back at m's cell centres (zero outside P's angle range). The resampling is normalized by the share of each P
+        cell's samples that fall in the crop, so P's cells on the crop's edges are not darkened by the zero padding."""
+        p = self.polar_map(m, frame)
+        with torch.no_grad():
+            cover = self.polar_map(m.new_ones(m.shape[0], 1, *m.shape[-2:]), frame)
+        p = self.ray_agg(torch.where(cover > 1e-3, p / cover.clamp_min(1e-3), torch.zeros_like(p)))
+        h, w = m.shape[-2:]
+        with torch.no_grad():
+            ys, xs = torch.meshgrid((torch.arange(h, device=m.device, dtype=torch.float32) + 0.5) * (self.img_h / h),
+                                    (torch.arange(w, device=m.device, dtype=torch.float32) + 0.5) * (self.img_w / w),
+                                    indexing="ij")
+            c = torch.stack([xs, ys], dim=-1)[None].expand(m.shape[0], -1, -1, -1)
+            g = frame.polar(c)[0] * c.new_tensor([2.0 / self.win_w, 2.0 / self.win_h]) - 1.0
+        back = F.grid_sample(p, g.to(p.dtype), mode="bilinear", padding_mode="zeros", align_corners=False)
+        with torch.no_grad():
+            self.last_ray_share = back.pow(2).mean().sqrt() / m.pow(2).mean().sqrt().clamp_min(1e-12)
+        return m + back
 
     def polar_image(self, x2, frame):
         """P [B, C, polar_h, polar_w]: the 2x image x2 (the context frame at 2x) sampled bilinearly at supersample
@@ -930,6 +1014,9 @@ class FovealLaneHead(HBLRHead):
         batch_size = x_tok.shape[0]
         fine = [x_tok[:, mp.start:mp.start + mp.n].transpose(1, 2).reshape(batch_size, self.dim, mp.h, mp.w)
                 for mp in maps if mp.level == 0]
+        if self.ray:                                    # C's stride-8 map + the aggregation along P's rays
+            fine[CTX] = self.ray_aggregate(fine[CTX], self._ray_frame(x["origin"]))
+            x_tok = torch.cat([fine[CTX].flatten(2).transpose(1, 2), x_tok[:, maps[0].n:]], dim=1)
         if self.polar_features:                         # P from C's encoded stride-8 map, after the encoder
             p_map = self.polar_map(fine[CTX], frame)
             hp, wp = p_map.shape[-2:]
@@ -1087,6 +1174,7 @@ class FovealLaneHead(HBLRHead):
         out["curve0"] = curve_points(cps0, self.t_out_2d).detach()
         out["prop"] = prop
         out["fovea_share"] = fovea_share
+        out["ray_share"] = self.last_ray_share if self.ray else None
         out["seg_map"] = fine[CTX]
         out["aux"] = aux
         return out
@@ -1188,6 +1276,8 @@ class FovealLaneHead(HBLRHead):
                 out["vp_err_px"] = (vp[ok] - vp_gt[ok]).detach().abs().mean()
         if outs.get("fovea_share") is not None:
             out["fovea_share"] = outs["fovea_share"]
+        if outs.get("ray_share") is not None:
+            out["ray_share"] = outs["ray_share"]
         return out
 
     def _prop_owner(self, layout, gt_flat, frame, views):
