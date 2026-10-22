@@ -31,7 +31,11 @@ Head, in order:
    encoding (dec_cfg.self_attn "full"; "relation" = HBLRHead's relation attention), dual-view curve attention at the
    current curve's points (C's maps at p, F's at 2 (p - o), F masked where the point is outside the window, one
    softmax over all points, maps and samples), FFN, update -> monotone step (curve_cfg frame "image", y_order
-   "monotone"). No GRU, no motion encoding; features are sampled at the new curve every step.
+   "monotone"). No GRU, no motion encoding; features are sampled at the new curve every step. The sampling offsets
+   and weights come from the query (+ the reference point's position encoding); dec_cfg.point_conditioned adds, per
+   reference point and map, two linear layers of the encoded feature at the reference point itself (BezierFormer
+   Sec. III.D: the attention follows what is under the curve, not only what the query remembers). Both start at zero,
+   so the head starts as without them.
 6. scoring as HBLRHead: o2m per query; o2o after one more self-attention over the converged lanes (keys and values
    carry the o2m score).
 Losses: HBLRHead's o2o / o2m matching and per-step LaneIoU + endpoint losses (no control-point loss unless
@@ -58,7 +62,9 @@ Logs: vp_err_px (vp_err_y_px: the row, polar), vp_gt_frac, fovea_share (F's shar
 curve-attention weight), prop_recall (GT lanes with a selected peak within radius_cells of their centre cell, in their
 view; prop_recall_fov: of the lanes centred in the window), prop_fovea_frac (queries from F), win_lane_frac (GT lanes
 whose centre is in the window), cov0 / iou0 (HBLRHead). In polar mode the F logs are P's (the window = P's angle
-range). ray_share (mode "ray"): the size of the added aggregation relative to C's stride-8 map (RMS ratio)."""
+range). ray_share (mode "ray"): the size of the added aggregation relative to C's stride-8 map (RMS ratio).
+pt_off_px (dec_cfg.point_conditioned): the mean |offset| the point-feature term adds on C's stride-8 map (px), over
+the decoder steps."""
 import contextlib
 import math
 
@@ -314,9 +320,11 @@ class CrossViewEncoderLayer(nn.Module):
 class DualCurveAttention(nn.Module):
     """Curve attention over both views: a query samples every map at num_points learned offsets (in the map's cells)
     around each of the S reference points of its current curve, with one softmax per head over all S x maps x points.
-    F's samples get no weight where the reference point is outside the window. The values are the encoder tokens."""
+    F's samples get no weight where the reference point is outside the window. The values are the encoder tokens.
+    point_conditioned: the offsets and weight logits for map m also get two linear layers (zero-initialized) of the
+    encoder tokens read on map m at the reference point itself."""
 
-    def __init__(self, dim, num_maps, num_heads, num_points):
+    def __init__(self, dim, num_maps, num_heads, num_points, point_conditioned=False):
         super().__init__()
         if dim % num_heads:
             raise ValueError("FovealLaneHead dec_cfg.deform_heads must divide dim")
@@ -326,7 +334,12 @@ class DualCurveAttention(nn.Module):
         self.offsets = nn.Linear(dim, self.heads * self.maps * self.points * 2)
         self.weights = nn.Linear(dim, self.heads * self.maps * self.points)
         self.out = nn.Linear(dim, dim)
+        self.pt_offsets = self.pt_weights = None
+        if point_conditioned:
+            self.pt_offsets = nn.ModuleList([nn.Linear(dim, self.heads * self.points * 2) for _ in range(self.maps)])
+            self.pt_weights = nn.ModuleList([nn.Linear(dim, self.heads * self.points) for _ in range(self.maps)])
         self.last_offset_px = None
+        self.last_point_px = None
         self.last_fovea_share = None
 
     def reset_parameters(self):
@@ -338,6 +351,26 @@ class DualCurveAttention(nn.Module):
         for lin in (self.value_proj, self.out):
             nn.init.xavier_uniform_(lin.weight)
             nn.init.zeros_(lin.bias)
+        if self.pt_offsets is not None:
+            for lin in list(self.pt_offsets) + list(self.pt_weights):
+                nn.init.zeros_(lin.weight)
+                nn.init.zeros_(lin.bias)
+
+    def _point_terms(self, ref, tokens, maps, frame):
+        """Offsets [B, N, S, H, M, K, 2] (cells) and weight logits [B, N, S, H, M, K] from the encoder tokens read on
+        each map at the reference points ref [B, N, S, 2] (context px) themselves."""
+        batch_size, num_q, S = ref.shape[:3]
+        dim = tokens.shape[-1]
+        ref = ref.float()
+        offs, logits = [], []
+        for m, mp in enumerate(maps):
+            v = tokens[:, mp.start:mp.start + mp.n].transpose(1, 2).reshape(batch_size, dim, mp.h, mp.w)
+            g = frame.sample_grid(ref, torch.zeros_like(ref), mp).reshape(batch_size, num_q * S, 1, 2)
+            f = F.grid_sample(v, g.to(v.dtype), mode="bilinear", padding_mode="zeros", align_corners=False)
+            f = f[..., 0].transpose(1, 2).reshape(batch_size, num_q, S, dim)                # [B, N, S, D]
+            offs.append(self.pt_offsets[m](f).float().view(batch_size, num_q, S, self.heads, self.points, 2))
+            logits.append(self.pt_weights[m](f).float().view(batch_size, num_q, S, self.heads, self.points))
+        return torch.stack(offs, dim=4), torch.stack(logits, dim=4)
 
     def forward(self, q, pos, ref, tokens, maps, frame):
         """q [B, N, D]; pos [S, D]; ref [B, N, S, 2] context px; tokens [B, T, D] -> [B, N, D]."""
@@ -346,6 +379,11 @@ class DualCurveAttention(nn.Module):
         qs = q[:, :, None, :] + pos[None, None]                                       # [B, N, S, D]
         off = self.offsets(qs).float().view(batch_size, num_q, S, H, M, K, 2)
         logit = self.weights(qs).float().view(batch_size, num_q, S, H, M, K)
+        pt_off = None
+        if self.pt_offsets is not None:
+            pt_off, pt_logit = self._point_terms(ref, tokens, maps, frame)
+            off = off + pt_off
+            logit = logit + pt_logit
         is_f = torch.tensor([mp.view == FOV for mp in maps], device=q.device)
         if bool(is_f.any()):
             outside = ~frame.inside(ref.float())                                       # [B, N, S]
@@ -363,6 +401,7 @@ class DualCurveAttention(nn.Module):
         with torch.no_grad():
             self.last_fovea_share = w[..., is_f, :].sum(dim=(-1, -2, -3)).mean() if bool(is_f.any()) else None
             self.last_offset_px = (off[..., 0, :, :].abs().mean() * maps[0].cell)
+            self.last_point_px = (pt_off[..., 0, :, :].abs().mean() * maps[0].cell) if pt_off is not None else None
         return self.out(a.to(q.dtype))
 
 
@@ -405,10 +444,10 @@ class PlainLaneSA(nn.Module):
 class FovealStep(nn.Module):
     """One decoder step: self-attention (plain or relation), dual-view curve attention, FFN."""
 
-    def __init__(self, dim, sa, num_maps, deform_heads, deform_points, ffn_dim, dropout):
+    def __init__(self, dim, sa, num_maps, deform_heads, deform_points, ffn_dim, dropout, point_conditioned=False):
         super().__init__()
         self.sa = sa
-        self.curve = DualCurveAttention(dim, num_maps, deform_heads, deform_points)
+        self.curve = DualCurveAttention(dim, num_maps, deform_heads, deform_points, point_conditioned)
         self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.ReLU(inplace=True), nn.Dropout(dropout),
                                  nn.Linear(ffn_dim, dim))
         self.norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(3)])
@@ -651,7 +690,7 @@ class FovealLaneHead(HBLRHead):
                                   "iou_weight"}),
                 ("dec_cfg", dc, {"num_iters", "self_attn", "num_heads", "ffn_dim", "dropout", "curve_points",
                                  "deform_heads", "deform_points", "step_scale", "cp_loss", "num_neighbors",
-                                 "dist_scale", "max_dist", "layer_loss"}),
+                                 "dist_scale", "max_dist", "layer_loss", "point_conditioned"}),
                 ("ray_cfg", rc, {"channels", "kernel", "dilations", "angle_kernel"})):
             if set(cfg) - known:
                 raise ValueError(f"FovealLaneHead {name}: unknown keys {sorted(set(cfg) - known)}")
@@ -802,7 +841,8 @@ class FovealLaneHead(HBLRHead):
                 return m
             return PlainLaneSA(dim, heads, points, self.img_w, self.img_h, drop)
 
-        deform = (dec_maps, int(dc.get("deform_heads", 8)), int(dc.get("deform_points", 4)), ffn, drop)
+        deform = (dec_maps, int(dc.get("deform_heads", 8)), int(dc.get("deform_points", 4)), ffn, drop,
+                  bool(dc.get("point_conditioned", False)))
         self.dec = nn.ModuleList([FovealStep(dim, sa(self.rel_points, int(dc.get("num_neighbors", 16))), *deform)
                                   for _ in range(self.num_iters)])
         self.dec_pos = nn.Parameter(torch.zeros(curve_pts, dim))
@@ -1175,6 +1215,8 @@ class FovealLaneHead(HBLRHead):
         out["prop"] = prop
         out["fovea_share"] = fovea_share
         out["ray_share"] = self.last_ray_share if self.ray else None
+        pt = [s.curve.last_point_px for s in self.dec]
+        out["pt_off_px"] = torch.stack(pt).mean() if all(p is not None for p in pt) else None
         out["seg_map"] = fine[CTX]
         out["aux"] = aux
         return out
@@ -1278,6 +1320,8 @@ class FovealLaneHead(HBLRHead):
             out["fovea_share"] = outs["fovea_share"]
         if outs.get("ray_share") is not None:
             out["ray_share"] = outs["ray_share"]
+        if outs.get("pt_off_px") is not None:
+            out["pt_off_px"] = outs["pt_off_px"]
         return out
 
     def _prop_owner(self, layout, gt_flat, frame, views):
