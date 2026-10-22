@@ -212,7 +212,7 @@ model = dict(
         conf_threshold=0.50,
         use_nms=False,
         as_lanes=True,
-        extend_bottom=True,
+        extend_bottom=False,
         nms_thres=15,
         nms_topk=16,                  # NMS-free: at most this many lanes per image
         # Lanes are decoded normalized within the crop (the context frame); CurvelanesMetric maps them back with

@@ -53,6 +53,17 @@ curve_cfg.y_order / frame / match_end_len (YSY, 2026-10-18; defaults keep the he
 - match_end_len: the matching cost's point term (assign_cfg point_weight) becomes the endpoint distance
   (mean of the two ends, px / (img_h - 1); the better direction with orientation_free) plus the length
   term |len_pred / len_gt - 1| (at most 1), as in BezierFormer's matching cost.
+- factorized_iou (YSY, 2026-10-22; clrbezierlane/extent_shape/extent_shape_design.md, idea B): a prediction's
+  lateral position and its extent are judged apart, along the GT lane (lane_iou_factorized). IoU_lat is the 2D
+  LaneIoU over the overlap only (the samples of either lane whose foot on the other lies inside it), IoU_ext the 1D
+  IoU of the two arc intervals along the GT (the prediction's ends projected on the GT, its end segments run on as
+  lines). Matching cost: 1 - IoU_lat x IoU_ext (1 - IoU_lat where IoU_lat <= 0) at lane_width_cost, in place of
+  1 - LaneIoU; the metric's mask IoU of a shifted, cut copy is about that product, while the whole-lane LaneIoU
+  charges every uncovered GT sample its distance to the prediction's end. Loss of every step's pairs:
+  (1 - IoU_lat) + extent_iou_weight (1.0) x (1 - IoU_ext) at lane_width, in place of 1 - LaneIoU; the lateral
+  term gets no pull from the part one lane lacks, and the extent term moves the ends along the GT. The endpoint /
+  length terms stay as configured (the B configs set point_weight 0 and end_loss_weight 0). Logs o2o_lat_iou /
+  o2o_ext_iou (last output, o2o pairs, at lane_width).
 
 pattern_cfg (None; needs frame "image" and y_order "monotone"; hier schedule "sequential" only): lanes as pose x
 pattern (clrbezierlane/pose_pattern_design.md, libs/clrbezier/pattern.py). A lane cubic is its pose (bottom and
@@ -116,6 +127,26 @@ def split_cubic(c, u):
     p012, p123 = p01 + u * (p12 - p01), p12 + u * (p23 - p12)
     p0123 = p012 + u * (p123 - p012)
     return torch.stack([p0, p01, p012, p0123], -2), torch.stack([p0123, p123, p23, p3], -2)
+
+
+def _blossom(c, u1, u2, u3):
+    """Polar form of cubic Beziers c [..., 4, 2] at parameters u1, u2, u3 (tensors [...] or floats) -> [..., 2]: the
+    de Casteljau levels taken at u1, u2, u3; blossom(t, t, t) is the curve point at t."""
+    q = list(c.unbind(-2))
+    for u in (u1, u2, u3):
+        u = u[..., None] if torch.is_tensor(u) else u
+        q = [a + u * (b - a) for a, b in zip(q[:-1], q[1:])]
+    return q[0]
+
+
+def subcurve(c, t0, t1):
+    """Control points [..., 4, 2] of cubic Beziers c [..., 4, 2] restricted to [t0, t1] (tensors [...] or floats; any
+    values, outside [0, 1] the curve is extended as its polynomial), exactly: blossoms (t0, t0, t0), (t0, t0, t1),
+    (t0, t1, t1), (t1, t1, t1). The sub-curve's point at u is c's at t0 + u (t1 - t0). On [t0, t1] inside [0, 1], a
+    cubic with y-monotone control points gives y-monotone control points (the derivative's blossoms are convex
+    combinations of its control points)."""
+    return torch.stack([_blossom(c, t0, t0, t0), _blossom(c, t0, t0, t1), _blossom(c, t0, t1, t1),
+                        _blossom(c, t1, t1, t1)], dim=-2)
 
 
 def subdivide_cubic(cps, num_pieces):
@@ -290,6 +321,75 @@ def lane_iou_2d(a, b, half_width, pairwise=False):
     return inter / union.clamp_min(1e-6)
 
 
+def _project_polyline(p, poly):
+    """Foot of points p [..., P, 2] on polylines poly [..., M, 2] (same leading dims), the first and the last
+    segment run on as straight lines -> distance [..., P], arc coordinate [..., P] (< 0 before the first point,
+    > length past the last) and the polyline's length [...]."""
+    s0, d = poly[..., :-1, :], poly[..., 1:, :] - poly[..., :-1, :]                    # [..., M-1, 2]
+    len2 = (d * d).sum(-1).clamp_min(1e-12)
+    rel = p[..., :, None, :] - s0[..., None, :, :]                                     # [..., P, M-1, 2]
+    t = (rel * d[..., None, :, :]).sum(-1) / len2[..., None, :]
+    lo = torch.zeros(t.shape[-1], dtype=t.dtype, device=t.device)
+    hi = torch.ones_like(lo)
+    lo[0], hi[-1] = -float("inf"), float("inf")
+    t = torch.maximum(torch.minimum(t, hi), lo)
+    diff = rel - t[..., None] * d[..., None, :, :]
+    dist, k = (diff * diff).sum(-1).add(1e-12).sqrt().min(-1)
+    seg = len2.sqrt()
+    cum = torch.cat([torch.zeros_like(seg[..., :1]), seg.cumsum(-1)], -1)               # [..., M]
+    idx = k[..., None]
+    s = (cum[..., None, :-1].expand_as(t).gather(-1, idx) + (t * seg[..., None, :]).gather(-1, idx)).squeeze(-1)
+    return dist, s, cum[..., -1]
+
+
+def lane_iou_factorized(a, b, half_width, pairwise=False):
+    """curve_cfg.factorized_iou: (IoU_lat, IoU_ext) of prediction polylines a [..., P, 2] against GT polylines
+    b [..., M, 2], in the same px space (module docstring). IoU_lat: lane_iou_2d over the overlap only (the
+    samples of either lane whose foot on the other lies inside it; the masks carry no gradient; 0 without
+    overlap). IoU_ext: 1D IoU of [min, max] of a's two ends projected on b (b's end segments run on as lines)
+    against [0, length of b]; its gradient moves a's ends along b. pairwise as lane_iou_2d."""
+    iou_lat, ext_inter, ext_union, _ = _factorized_parts(a, b, half_width, pairwise)
+    return iou_lat, ext_inter / ext_union.clamp_min(1e-6)
+
+
+def carrier_terms(a, b, half_width, pairwise=False):
+    """FovealLaneHead interval_cfg: (IoU_lat, coverage) of carrier polylines a [..., P, 2] against GT polylines
+    b [..., M, 2]: IoU_lat as lane_iou_factorized; coverage = the share of b's length inside a's ends projected on b.
+    A carrier that runs past the GT costs nothing; one that stops short loses coverage."""
+    iou_lat, ext_inter, _, len_b = _factorized_parts(a, b, half_width, pairwise)
+    return iou_lat, ext_inter / len_b.clamp_min(1e-6)
+
+
+def _factorized_parts(a, b, half_width, pairwise):
+    """lane_iou_factorized's IoU_lat, the extent intersection and union (along b) and b's length."""
+    if pairwise:
+        (batch_size, num_n, num_p), (num_g, num_m) = a.shape[:3], b.shape[1:3]
+        a = a[:, :, None].expand(batch_size, num_n, num_g, num_p, 2)
+        b = b[:, None].expand(batch_size, num_n, num_g, num_m, 2)
+    w = float(half_width)
+    d_a, s_a, len_b = _project_polyline(a, b)
+    d_b, s_b, len_a = _project_polyline(b, a)
+    with torch.no_grad():
+        eps = 1e-6
+        in_a = ((s_a > eps) & (s_a < len_b[..., None] - eps)).to(a.dtype)
+        in_b = ((s_b > eps) & (s_b < len_a[..., None] - eps)).to(a.dtype)
+    wa, wb = _arc_weights(a).detach() * in_a, _arc_weights(b).detach() * in_b
+    inter = (wa * (2 * w - d_a)).sum(-1) + (wb * (2 * w - d_b)).sum(-1)
+    union = (wa * (2 * w + d_a)).sum(-1) + (wb * (2 * w + d_b)).sum(-1)
+    iou_lat = inter / union.clamp_min(1e-6)
+    lo = torch.minimum(s_a[..., 0], s_a[..., -1])
+    hi = torch.maximum(s_a[..., 0], s_a[..., -1])
+    ext_inter = (torch.minimum(hi, len_b) - lo.clamp_min(0.0)).clamp_min(0.0)
+    ext_union = torch.maximum(hi, len_b) - lo.clamp_max(0.0)
+    return iou_lat, ext_inter, ext_union, len_b
+
+
+def factorized_cost_iou(iou_lat, iou_ext):
+    """The matching cost's IoU of curve_cfg.factorized_iou: IoU_lat x IoU_ext, or IoU_lat where it is <= 0 (a
+    copy beside the lane is not made cheaper by a worse extent)."""
+    return torch.where(iou_lat > 0, iou_lat * iou_ext, iou_lat)
+
+
 # ------------------------------------------------------------------ GT polylines
 def gt_polyline(flat, img_w, img_h, num_points, min_len_px=8.0, step_px=1.0):
     """One annotated lane (flat [x0, y0, x1, y1, ...], network px, bottom -> top) -> its longest run
@@ -448,8 +548,8 @@ class HBLRHead(BLRHead):
     output samples per third of the lane, so 3 * 24 + 1 points per lane), rel_points (12, per lane in the
     relation attention), cost_points (25, per lane in the matching cost), end_loss_weight (0.05, px
     smooth-L1 on the start and end points), min_gt_len_px (8), orientation_free (False), frame ("lane" or
-    "image"), y_order (None, "monotone" or "penalty"), order_loss_weight (0.05), match_end_len (False): module
-    docstring.
+    "image"), y_order (None, "monotone" or "penalty"), order_loss_weight (0.05), match_end_len (False),
+    factorized_iou (False), extent_iou_weight (1.0): module docstring.
     The loss_cfg widths are reused:
     lane_width (loss) and lane_width_cost (matching), as half-widths in the iou_eval_shape space.
     hier_cfg: None, or segments (3), seg_iters (3, steps after the lane steps), seg_deform_points (12,
@@ -486,7 +586,8 @@ class HBLRHead(BLRHead):
             raise ValueError("HBLRHead: " + "; ".join(problems))
         cc = dict(curve_cfg or {})
         known = {"gt_points", "out_per_segment", "rel_points", "cost_points", "end_loss_weight", "min_gt_len_px",
-                 "orientation_free", "frame", "y_order", "order_loss_weight", "match_end_len"}
+                 "orientation_free", "frame", "y_order", "order_loss_weight", "match_end_len", "factorized_iou",
+                 "extent_iou_weight"}
         if set(cc) - known:
             raise ValueError(f"HBLRHead curve_cfg: unknown keys {sorted(set(cc) - known)}")
         if cc.get("frame", "lane") not in ("lane", "image"):
@@ -514,6 +615,9 @@ class HBLRHead(BLRHead):
         self.y_order = cc.get("y_order")
         self.order_loss_weight = float(cc.get("order_loss_weight", 0.05))
         self.match_end_len = bool(cc.get("match_end_len", False))
+        self.factorized_iou = bool(cc.get("factorized_iou", False))
+        self.extent_iou_weight = float(cc.get("extent_iou_weight", 1.0))
+        self.carrier_weight = 0.0                    # FovealLaneHead interval_cfg: the carrier loss (_pair_terms)
         self.register_buffer("px_scale", torch.tensor([float(self.img_w - 1), float(self.img_h - 1)]),
                              persistent=False)
         self.register_buffer("eval_scale", torch.tensor([float(self.iou_w), float(self.iou_h)]), persistent=False)
@@ -1089,7 +1193,11 @@ class HBLRHead(BLRHead):
         if layout.num:
             gt[layout.img, layout.slot] = gt_flat[:, sub_g].float()
         gt = gt * self.eval_scale
-        iou_cost = lane_iou_2d(a, gt, self.lane_width_cost * self.iou_w, pairwise=True)
+        if self.factorized_iou:
+            fact = lane_iou_factorized(a, gt, self.lane_width_cost * self.iou_w, pairwise=True)
+            iou_cost = factorized_cost_iou(*fact)
+        else:
+            iou_cost = lane_iou_2d(a, gt, self.lane_width_cost * self.iou_w, pairwise=True)
         iou_dyn = lane_iou_2d(a, gt, self.lane_width * self.iou_w, pairwise=True)
         point_cost = torch.zeros_like(iou_cost)
         if self.match_end_len:
@@ -1121,7 +1229,9 @@ class HBLRHead(BLRHead):
         step (jointly where both exist); rev_out (a list) receives the last output's reversed-pair share.
         pat_out (a list; pattern_cfg) receives the pattern smooth-L1 and cross-entropy [B] (averaged over the
         steps; lane outputs against the GT lane's pinned cubic, jointly with the endpoint for the direction;
-        segment outputs against the GT between their joints) and a dict of logs."""
+        segment outputs against the GT between their joints) and a dict of logs. outs["carriers"] (FovealLaneHead
+        interval_cfg): per output, the carrier polylines; carrier_weight x ((1 - IoU_lat) + (1 - coverage)) of the
+        carrier (carrier_terms) joins the LaneIoU term."""
         cnt = per_image_sum(torch.ones_like(b, dtype=torch.float), b, batch_size).clamp_min(1.0)
         g = gt_flat[j].float()
         g_eval, g_px = g * self.eval_scale, self._px(g)
@@ -1143,7 +1253,15 @@ class HBLRHead(BLRHead):
             logs = {}
         for k, (curve, c) in enumerate(zip(outs["curves"], outs["lane_cps"])):
             p = curve[b, n].float()
-            l_iou = 1.0 - lane_iou_2d(p * self.eval_scale, g_eval, self.lane_width * self.iou_w)
+            if self.factorized_iou:
+                i_lat, i_ext = lane_iou_factorized(p * self.eval_scale, g_eval, self.lane_width * self.iou_w)
+                l_iou = (1.0 - i_lat) + self.extent_iou_weight * (1.0 - i_ext)
+            else:
+                l_iou = 1.0 - lane_iou_2d(p * self.eval_scale, g_eval, self.lane_width * self.iou_w)
+            if outs.get("carriers") is not None and self.carrier_weight > 0:
+                c_lat, c_cov = carrier_terms(outs["carriers"][k][b, n].float() * self.eval_scale, g_eval,
+                                             self.lane_width * self.iou_w)
+                l_iou = l_iou + self.carrier_weight * ((1.0 - c_lat) + (1.0 - c_cov))
             iou = iou + per_image_sum(l_iou, b, batch_size) / cnt
             p_px = self._px(p)
             e = torch.stack([p_px[:, 0] - g_px[:, 0], p_px[:, -1] - g_px[:, -1]], dim=1)
@@ -1307,6 +1425,7 @@ class HBLRHead(BLRHead):
         iou_sum = end_sum = cp_sum = pat_l1_sum = pat_ce_sum = zero
         num_pos_o2o = num_pos_o2m = 0
         rev_o2o = []
+        fact_log = car_log = None
         pat_o2o = [] if self.pattern is not None else None
         if layout.num:
             gt_cps = fit_cubic_2d(gt_flat.float(), self.cp_fit_ridge)
@@ -1319,6 +1438,16 @@ class HBLRHead(BLRHead):
             iou, end, cp = self._pair_terms(outs, b_o, n_o, layout.flat_index(b_o, g_o), gt_flat, gt_cps, batch_size,
                                             rev_out=rev_o2o, pat_out=pat_o2o)
             iou_sum, end_sum, cp_sum = iou.sum(), end.sum(), cp.sum()
+            if self.factorized_iou and n_o.numel():
+                with torch.no_grad():
+                    fact_log = lane_iou_factorized(final[b_o, n_o].float() * self.eval_scale,
+                                                   gt_flat[layout.flat_index(b_o, g_o)].float() * self.eval_scale,
+                                                   self.lane_width * self.iou_w)
+            if outs.get("carriers") is not None and n_o.numel():
+                with torch.no_grad():
+                    car_log = carrier_terms(outs["carriers"][-1][b_o, n_o].detach().float() * self.eval_scale,
+                                            gt_flat[layout.flat_index(b_o, g_o)].float() * self.eval_scale,
+                                            self.lane_width * self.iou_w)
             if pat_o2o:
                 pat_l1_sum, pat_ce_sum = pat_o2o[0].sum(), pat_o2o[1].sum()
             if self.o2m_assigner is not None:
@@ -1374,6 +1503,12 @@ class HBLRHead(BLRHead):
                 diag["o2o_pos_prob"], diag["o2o_neg_prob"] = p[pos].mean(), p[~pos].mean()
             if self.orientation_free:
                 diag["end_rev_frac"] = rev_o2o[0].detach() if rev_o2o else torch.zeros((), device=dev)
+            if self.factorized_iou:
+                diag["o2o_lat_iou"], diag["o2o_ext_iou"] = ((fact_log[0].mean(), fact_log[1].mean()) if fact_log
+                                                            is not None else (torch.zeros((), device=dev),) * 2)
+            if outs.get("carriers") is not None:
+                diag["o2o_car_lat"], diag["o2o_car_cov"] = ((car_log[0].mean(), car_log[1].mean()) if car_log
+                                                            is not None else (torch.zeros((), device=dev),) * 2)
             if pat_o2o:
                 diag.update({k: v.detach() for k, v in pat_o2o[2].items()})
             if outs.get("curve0") is not None and layout.num:

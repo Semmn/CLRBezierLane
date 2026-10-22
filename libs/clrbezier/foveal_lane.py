@@ -64,7 +64,31 @@ view; prop_recall_fov: of the lanes centred in the window), prop_fovea_frac (que
 whose centre is in the window), cov0 / iou0 (HBLRHead). In polar mode the F logs are P's (the window = P's angle
 range). ray_share (mode "ray"): the size of the added aggregation relative to C's stride-8 map (RMS ratio).
 pt_off_px (dec_cfg.point_conditioned): the mean |offset| the point-feature term adds on C's stride-8 map (px), over
-the decoder steps."""
+the decoder steps.
+
+interval_cfg (idea C, clrbezierlane/interval/interval_design.md): a lane is an interval [t0, t1] on a carrier cubic.
+The decoder moves the carrier (the update above); the output, scored, matched and evaluated as before, is the carrier's
+exact sub-curve on [t0, t1] (hblrnet.subcurve), still a y-monotone cubic, so the test path is unchanged.
+- step 0: the carrier is the proposal's cubic extended by margin of its parameter range at each end (made monotone);
+  the interval starts at the proposal's ends.
+- curve attention reads the output's curve_points reference points as before plus one carrier point look (t1 - t0)
+  past each end (own position embeddings): the query sees what a lane cut short is missing. The lane self-attention
+  reads the output.
+- ends located along the carrier: C's proposal head also predicts two end heatmaps (the near end, the far end of the
+  GT lanes, bottom first; CenterNet focal loss, Gaussians of sigma_cells). After each step, each end reads its
+  heatmap's logits at end_points parameters t = c + sigma z, z in [-3, 3], on the new carrier: c = its last position,
+  sigma = prior_sigma x (t1 - t0), so the reach is a share of the lane, however long the carrier; samples outside the
+  image read the lowest logit inside. The end goes to the mean of t under softmax(logit - z^2 / 2), a Gaussian prior
+  around c: no end evidence -> no move; a peak in reach -> the end goes to it. t0, t1 stay in [0, 1], t1 >= t0 +
+  min_span. The decoder moves the ends only through the carrier (an end keeps its parameter); the localization has no
+  gradient (the heatmaps learn from their focal loss). Overfit runs where the query also shifted the ends, or where
+  the loss reached the heatmaps through the localization, trained clearly worse: the ends jumped between steps.
+- loss: the HBLRHead loss on the output (curve_cfg.factorized_iou: lateral on the overlap + extent along the GT) plus,
+  per matched pair and step, carrier_weight x ((1 - IoU_lat) + (1 - coverage)) of the carrier: lateral where it overlaps
+  the GT, and it must span the GT (running past it is free), so the interval can reach the GT's ends.
+Logs: loss_end_hm, int_span (mean t1 - t0 of the last step), end_snap (mean largest softmax weight of the end
+localization: about 0.05 without evidence, 1 = one sample), o2o_car_lat / o2o_car_cov (the last carrier of the o2o
+pairs)."""
 import contextlib
 import math
 
@@ -79,8 +103,8 @@ from torch.utils.checkpoint import checkpoint
 from .batched_loss import GTLayout, per_image_sum
 from .blrnet import _MLP, _deform_grid_bias, curve_points
 from .head import StagePredictions, _smooth_l1
-from .hblrnet import (HBLRHead, LaneRelationAttention2D, bottom_first, curve_code, lane_iou_2d, monotone_fix,
-                      pieces_of, piecewise_points, subdivide_cubic)
+from .hblrnet import (HBLRHead, LaneRelationAttention2D, _blossom, bottom_first, curve_code, lane_iou_2d,
+                      monotone_fix, pieces_of, piecewise_points, subcurve, subdivide_cubic)
 
 CTX, FOV = 0, 1                      # the context view and the second view (F, or P in polar mode)
 POLAR_KEYS = ("polar_w", "polar_h", "theta_deg", "r0_px", "supersample", "jitter_y_px", "source")
@@ -508,14 +532,16 @@ class RayAggregation(nn.Module):
 
 class ProposalHead(nn.Module):
     """Dense lane proposals on one view's stride-8 map: a centre heatmap logit and 8 regression channels (bottom x,
-    bottom y gap, top x, top y gap, then per inner control point: along the chord, across it)."""
+    bottom y gap, top x, top y gap, then per inner control point: along the chord, across it). ends (interval_cfg):
+    also the near-end and far-end heatmap logits, from the same trunk."""
 
-    def __init__(self, dim, channels):
+    def __init__(self, dim, channels, ends=False):
         super().__init__()
         self.trunk = nn.Sequential(nn.Conv2d(dim, channels, 3, padding=1), nn.ReLU(inplace=True),
                                    nn.Conv2d(channels, channels, 3, padding=1), nn.ReLU(inplace=True))
         self.hm = nn.Conv2d(channels, 1, 1)
         self.reg = nn.Conv2d(channels, 8, 1)
+        self.ends = nn.Conv2d(channels, 2, 1) if ends else None
 
     def reset_parameters(self):
         for m in self.trunk.modules():
@@ -525,9 +551,14 @@ class ProposalHead(nn.Module):
         nn.init.constant_(self.hm.bias, -math.log(9.0))              # CenterNet: every cell starts at 0.1
         nn.init.normal_(self.reg.weight, std=1.0e-2)
         nn.init.zeros_(self.reg.bias)
+        if self.ends is not None:
+            nn.init.normal_(self.ends.weight, std=1.0e-2)
+            nn.init.constant_(self.ends.bias, -math.log(9.0))
 
     def forward(self, m):
         t = self.trunk(m)
+        if self.ends is not None:
+            return self.hm(t).float(), self.reg(t).float(), self.ends(t).float()
         return self.hm(t).float(), self.reg(t).float()
 
 
@@ -677,9 +708,10 @@ class FovealLaneHead(HBLRHead):
 
     def __init__(self, in_channels=(128, 256, 512), num_queries=16, dim=256, num_points=72, img_w=800, img_h=320,
                  seg_num_classes=2, curve_cfg=None, hier_cfg=None, fovea_cfg=None, vp_cfg=None, enc_cfg=None,
-                 prop_cfg=None, dec_cfg=None, ray_cfg=None, assign_cfg=None, loss_cfg=None, target_adapter=None,
-                 test_score=None, train_cfg=None, test_cfg=None, init_cfg=None):
+                 prop_cfg=None, dec_cfg=None, ray_cfg=None, interval_cfg=None, assign_cfg=None, loss_cfg=None,
+                 target_adapter=None, test_score=None, train_cfg=None, test_cfg=None, init_cfg=None):
         fc, vc, ec, pc, dc, rc = (dict(c or {}) for c in (fovea_cfg, vp_cfg, enc_cfg, prop_cfg, dec_cfg, ray_cfg))
+        ic = None if interval_cfg is None else dict(interval_cfg)
         polar_cfg = {k: fc.pop(k) for k in POLAR_KEYS if k in fc}
         for name, cfg, known in (
                 ("fovea_cfg", fc, {"mode", "window_w", "window_h", "window_top", "p_gt", "jitter_px", "bn"}),
@@ -691,7 +723,9 @@ class FovealLaneHead(HBLRHead):
                 ("dec_cfg", dc, {"num_iters", "self_attn", "num_heads", "ffn_dim", "dropout", "curve_points",
                                  "deform_heads", "deform_points", "step_scale", "cp_loss", "num_neighbors",
                                  "dist_scale", "max_dist", "layer_loss", "point_conditioned"}),
-                ("ray_cfg", rc, {"channels", "kernel", "dilations", "angle_kernel"})):
+                ("ray_cfg", rc, {"channels", "kernel", "dilations", "angle_kernel"}),
+                ("interval_cfg", ic or {}, {"margin", "look", "end_points", "prior_sigma", "min_span", "sigma_cells",
+                                            "hm_weight", "carrier_weight"})):
             if set(cfg) - known:
                 raise ValueError(f"FovealLaneHead {name}: unknown keys {sorted(set(cfg) - known)}")
         cc = dict(curve_cfg or {})
@@ -733,6 +767,20 @@ class FovealLaneHead(HBLRHead):
         self.layer_loss = bool(dc.get("layer_loss", False))
         if self.layer_loss and self.hier is not None:
             raise ValueError("FovealLaneHead dec_cfg.layer_loss supervises lane steps only: set hier_cfg=None")
+        self.interval = None
+        if ic is not None:
+            self.interval = dict(margin=float(ic.get("margin", 0.25)), look=float(ic.get("look", 0.25)),
+                                 end_points=int(ic.get("end_points", 48)), prior_sigma=float(ic.get("prior_sigma", 0.1)),
+                                 min_span=float(ic.get("min_span", 0.02)), sigma=float(ic.get("sigma_cells", 1.5)),
+                                 hm_weight=float(ic.get("hm_weight", 1.0)))
+            iv = self.interval
+            if self.hier is not None:
+                raise ValueError("FovealLaneHead interval_cfg works on lane steps only: set hier_cfg=None")
+            if not (iv["margin"] >= 0 and iv["look"] >= 0 and iv["end_points"] >= 2 and iv["prior_sigma"] > 0
+                    and 0 < iv["min_span"] < 1 and iv["sigma"] > 0):
+                raise ValueError("FovealLaneHead interval_cfg: margin, look >= 0, end_points >= 2, prior_sigma > 0, "
+                                 "0 < min_span < 1, sigma_cells > 0")
+            self.carrier_weight = float(ic.get("carrier_weight", 1.0))
 
         # views
         self.fovea_mode = str(fc.get("mode", "window"))
@@ -824,7 +872,9 @@ class FovealLaneHead(HBLRHead):
         self.prop = dict(sigma=float(pc.get("sigma_cells", 2.0)), radius=int(pc.get("radius_cells", 2)),
                          scale_px=float(pc.get("scale_px", 100.0)), hm_weight=float(pc.get("hm_weight", 1.0)),
                          end_weight=float(pc.get("end_weight", 0.05)), iou_weight=float(pc.get("iou_weight", 1.0)))
-        self.prop_heads = nn.ModuleList([ProposalHead(dim, int(pc.get("channels", 64))) for _ in range(views)])
+        self.prop_heads = nn.ModuleList([ProposalHead(dim, int(pc.get("channels", 64)),
+                                                      ends=self.interval is not None and v == CTX)
+                                         for v in range(views)])
         self.query_token = nn.Parameter(torch.zeros(dim))
         self.tok_proj = nn.Linear(dim, dim)
         self.query_norm = nn.LayerNorm(dim)
@@ -857,6 +907,10 @@ class FovealLaneHead(HBLRHead):
                                         use_scores=self.cls_o2m is not None)
         self.seg_head = nn.Sequential(nn.Conv2d(dim, 64, 3, padding=1), nn.ReLU(inplace=True),
                                       nn.Conv2d(64, seg_num_classes, 1))
+        self.look_pos = None
+        if self.interval is not None:
+            self.look_pos = nn.Parameter(torch.zeros(2, dim))       # position embeddings of the two look points
+            self.register_buffer("z_end", torch.linspace(-3.0, 3.0, self.interval["end_points"]), persistent=False)
         self._reset_foveal()
 
     def _reset_foveal(self):
@@ -881,6 +935,8 @@ class FovealLaneHead(HBLRHead):
         for m in self.seg_head.modules():
             if isinstance(m, nn.Conv2d):
                 m.reset_parameters()
+        if self.look_pos is not None:
+            nn.init.trunc_normal_(self.look_pos, std=0.02)
 
     # ------------------------------------------------------------------ views
     def place_window(self, c_feats, batch_data_samples=None):
@@ -1115,10 +1171,14 @@ class FovealLaneHead(HBLRHead):
     def _proposals(self, fine, frame):
         """Dense maps of each view and the num_queries strongest 3 x 3 peaks of their union (C's peaks inside the
         window last) -> dict(hm, reg: per view [B, 1 | 8, h, w]; view [B, N]; cell [B, N] (index in its view);
-        cps [B, N, 4, 2] normalized, detached; tok [B, N, D])."""
+        cps [B, N, 4, 2] normalized, detached; tok [B, N, D]; end_hm: C's end heatmaps [B, 2, h, w] (interval_cfg) or
+        None)."""
         hms, regs, ranks, regs_f, cells, toks, scales = [], [], [], [], [], [], []
+        end_hm = None
         for v, (m, head) in enumerate(zip(fine, self.prop_heads)):
-            hm, reg = head(m)
+            hm, reg, *rest = head(m)
+            if rest:
+                end_hm = rest[0]
             hms.append(hm)
             regs.append(reg)
             h, w = hm.shape[-2:]
@@ -1149,7 +1209,7 @@ class FovealLaneHead(HBLRHead):
             with torch.no_grad():
                 c_pol = monotone_fix(fit_cubic(self._polar_decode(reg_q, cell_q, scale, frame)[2]))
             c_px = torch.where((view == FOV)[..., None, None], c_pol, c_px)
-        return dict(hm=hms, reg=regs, view=view, cell=cell, cps=self._norm(c_px).detach(), tok=take(toks))
+        return dict(hm=hms, reg=regs, view=view, cell=cell, cps=self._norm(c_px).detach(), tok=take(toks), end_hm=end_hm)
 
     # ------------------------------------------------------------------ forward
     def _forward(self, x):
@@ -1160,15 +1220,38 @@ class FovealLaneHead(HBLRHead):
         h = self.query_norm(self.query_token + self.geo_enc(curve_code(self._px(cps0), self.img_h - 1))
                             + self.tok_proj(prop["tok"]))
         cps = cps0
+        iv = self.interval
+        carriers, snaps = [], []
+        if iv is not None:                               # the proposal extended at both ends; the interval = its ends
+            m = iv["margin"]
+            carrier = monotone_fix(subcurve(cps0, -m, 1.0 + m))
+            t01 = cps0.new_tensor([m / (1.0 + 2.0 * m), (1.0 + m) / (1.0 + 2.0 * m)]).expand(batch_size, num_q, 2)
+            cps = subcurve(carrier, t01[..., 0], t01[..., 1])
         curves, cps_list, ends, step_off, step_w, hs_lane = [], [], [], [], [], []
+        pos = self.dec_pos
+        if iv is not None:
+            pos = torch.cat([self.look_pos[:1], self.dec_pos, self.look_pos[1:]])
         for step in self.dec:
-            ref = self._px(curve_points(cps, self.t_deform)).detach()
+            ref = curve_points(cps, self.t_deform)
+            if iv is not None:                           # + a carrier point past each end: what a short lane misses
+                span = t01[..., 1] - t01[..., 0]
+                t_look = torch.stack([t01[..., 0] - iv["look"] * span, t01[..., 1] + iv["look"] * span], dim=-1)
+                look = _blossom(carrier[:, :, None], t_look, t_look, t_look)                    # [B, N, 2, 2]
+                ref = torch.cat([look[:, :, :1], ref, look[:, :, 1:]], dim=2)
+            ref = self._px(ref).detach()
             rel = self._px(curve_points(cps, self.t_rel)).detach()
-            h = step(h, rel, self.dec_pos, ref, tokens, maps, frame)
+            h = step(h, rel, pos, ref, tokens, maps, frame)
             step_off.append(step.curve.last_offset_px)
             step_w.append(step.sa.last_self_weight)
             upd = self.update(h).view(batch_size, num_q, 4, 2).float() * self.step_scale
-            cps = self._norm(self._lane_step(self._px(cps), upd))
+            if iv is None:
+                cps = self._norm(self._lane_step(self._px(cps), upd))
+            else:
+                carrier = self._norm(self._lane_step(self._px(carrier), upd))
+                t01, snap = self._locate_ends(carrier, t01, prop["end_hm"], frame)
+                cps = subcurve(carrier, t01[..., 0], t01[..., 1])
+                carriers.append(curve_points(carrier, self.t_out_2d))
+                snaps.append(snap)
             curves.append(curve_points(cps, self.t_out_2d))
             cps_list.append(cps)
             ends.append(cps)
@@ -1180,7 +1263,8 @@ class FovealLaneHead(HBLRHead):
             for k in range(len(curves) - 1):
                 cls_o2m_k, cls_o2o_k = self._step_scores(hs_lane[k], curves[k])
                 aux.append(dict(cls_o2o=cls_o2o_k, cls_o2m=cls_o2m_k, curves=[curves[k]], cps=[cps_list[k]],
-                                lane_cps=[cps_list[k] if self.cp_loss else None]))
+                                lane_cps=[cps_list[k] if self.cp_loss else None],
+                                carriers=[carriers[k]] if carriers else None))
         num_lane_steps = len(curves)
         seg_move = None
         if self.hier is not None:
@@ -1219,7 +1303,37 @@ class FovealLaneHead(HBLRHead):
         out["pt_off_px"] = torch.stack(pt).mean() if all(p is not None for p in pt) else None
         out["seg_map"] = fine[CTX]
         out["aux"] = aux
+        out["carriers"] = carriers if iv is not None else None
+        if iv is not None:
+            out["int_span"] = (t01[..., 1] - t01[..., 0]).detach().mean()
+            out["end_snap"] = snaps[-1]
         return out
+
+    def _locate_ends(self, carrier, t01, end_hm, frame):
+        """interval_cfg: the interval [B, N, 2] (t0 near, t1 far) on the updated carriers [B, N, 4, 2] (normalized,
+        bottom first). Each end reads its heatmap's logits (end_hm [B, 2, h, w], C's map, border padding, no gradient)
+        on the carrier at t = c + sigma z, z in [-3, 3], c = its last position t01 [B, N, 2], sigma = prior_sigma x
+        (t1 - t0); samples outside the image read the lowest logit inside (no false peak at the image edge). The end
+        goes to the mean of t under softmax(logit - z^2 / 2): symmetric around c, so uniform logits leave it at c and a
+        peak in reach pulls it in -> (t01, the mean largest softmax weight)."""
+        iv = self.interval
+        num_k = self.z_end.numel()
+        span = (t01[..., 1] - t01[..., 0]).detach()
+        tk = t01[..., None] + (iv["prior_sigma"] * span)[..., None, None] * self.z_end           # [B, N, 2, K]
+        pts = self._px(_blossom(carrier[:, :, None], *(tk.flatten(-2),) * 3)).detach()        # [B, N, 2K, 2] px
+        with torch.no_grad():
+            e = F.grid_sample(end_hm, frame.grid(pts, CTX).to(end_hm.dtype), padding_mode="border",
+                              align_corners=False)                                            # [B, 2, N, 2K]
+            e = torch.stack([e[:, 0, :, :num_k], e[:, 1, :, num_k:]], dim=2)                   # [B, N, 2, K]
+            cw, ch = frame.ctx
+            outside = ((pts[..., 0] < 0) | (pts[..., 0] > cw) | (pts[..., 1] < 0) | (pts[..., 1] > ch)).view(e.shape)
+            low = e.masked_fill(outside, float("inf")).min(-1, keepdim=True).values
+            low = torch.where(torch.isfinite(low), low, torch.zeros_like(low))
+            w = torch.softmax(torch.where(outside, low, e).float() - 0.5 * self.z_end ** 2, dim=-1)
+        t = (w * tk).sum(-1).clamp(0.0, 1.0)
+        t0 = t[..., 0].clamp(max=1.0 - iv["min_span"])
+        t1 = torch.maximum(t[..., 1], t0 + iv["min_span"])
+        return torch.stack([t0, t1], dim=-1), w.max(-1).values.mean()
 
     def _step_scores(self, h, curve):
         """o2m and o2o logits of an earlier step's queries h [B, N, D] with its curves [B, N, T, 2], from the shared
@@ -1279,7 +1393,8 @@ class FovealLaneHead(HBLRHead):
         if self.seg_loss_weight > 0:
             seg_gt = self.target_adapter.extract_seg(batch_data_samples, dev, outs["seg"].shape[-2:])
         if self.layer_loss:
-            last = dict(outs, curves=outs["curves"][-1:], cps=outs["cps"][-1:], lane_cps=outs["lane_cps"][-1:])
+            last = dict(outs, curves=outs["curves"][-1:], cps=outs["cps"][-1:], lane_cps=outs["lane_cps"][-1:],
+                        carriers=outs["carriers"][-1:] if outs.get("carriers") else None)
             losses = self.loss_by_outputs_2d(last, gts, seg_gt)
             for k, a in enumerate(outs["aux"]):
                 step = dict(last, curve0=None, self_w=[], **a)
@@ -1322,7 +1437,32 @@ class FovealLaneHead(HBLRHead):
             out["ray_share"] = outs["ray_share"]
         if outs.get("pt_off_px") is not None:
             out["pt_off_px"] = outs["pt_off_px"]
+        if self.interval is not None:
+            out["loss_end_hm"] = self._end_loss(outs["prop"]["end_hm"], layout, gt_flat)
+            out["int_span"], out["end_snap"] = outs["int_span"], outs["end_snap"]
         return out
+
+    def _end_loss(self, end_hm, layout, gt_flat):
+        """interval_cfg: CenterNet focal loss of C's end heatmaps end_hm [B, 2, h, w] (near, far): Gaussians of
+        sigma_cells at the GT lanes' first and last points, bottom first."""
+        iv = self.interval
+        batch_size, _, hc, wc = end_hm.shape
+        target = end_hm.new_zeros(batch_size, 2, hc * wc)
+        if layout.num:
+            g_px = self._px(bottom_first(gt_flat.float()))
+            gx = torch.arange(wc, device=end_hm.device)
+            gy = torch.arange(hc, device=end_hm.device)
+            for c, pt in enumerate((g_px[:, 0], g_px[:, -1])):
+                ci = (pt[:, 0] / (self.img_w / wc)).floor().clamp(0, wc - 1)
+                cj = (pt[:, 1] / (self.img_h / hc)).floor().clamp(0, hc - 1)
+                d2 = (gx[None, None, :] - ci[:, None, None]) ** 2 + (gy[None, :, None] - cj[:, None, None]) ** 2
+                gauss = torch.exp(-d2.float() / (2.0 * iv["sigma"] ** 2)).flatten(1)
+                target[:, c] = target[:, c].scatter_reduce(0, layout.img[:, None].expand_as(gauss), gauss, "amax")
+        pos = target == 1.0
+        xl = end_hm.flatten(2)
+        l_pos = -F.logsigmoid(xl) * (1.0 - torch.sigmoid(xl)) ** 2
+        l_neg = -F.logsigmoid(-xl) * torch.sigmoid(xl) ** 2 * (1.0 - target) ** 4
+        return torch.where(pos, l_pos, l_neg).sum() / float(max(1, int(pos.sum()))) * iv["hm_weight"]
 
     def _prop_owner(self, layout, gt_flat, frame, views):
         """GT lanes in px, bottom first [G, M, 2], their centres (arc-length midpoints) [G, 2] and the view whose
