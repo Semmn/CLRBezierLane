@@ -3,5 +3,7 @@ from .head import CLRBezierHead, StagePredictions  # noqa: F401  (registers CLRB
 from .blrnet import BLRHead  # noqa: F401  (registers BLRHead)
 from .hblrnet import HBLRHead  # noqa: F401  (registers HBLRHead)
 from .foveal_lane import FovealLaneHead, FovealLaneNet  # noqa: F401  (registers both)
+from .bezierformer import BezierFormerHead, BezierFormerNet  # noqa: F401  (registers both)
 
-__all__ = ["CLRBezierHead", "StagePredictions", "BLRHead", "HBLRHead", "FovealLaneHead", "FovealLaneNet"]
+__all__ = ["CLRBezierHead", "StagePredictions", "BLRHead", "HBLRHead", "FovealLaneHead", "FovealLaneNet",
+           "BezierFormerHead", "BezierFormerNet"]
