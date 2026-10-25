@@ -28,7 +28,14 @@ DETR's defaults and listed in the design note.
    normalized coordinates, index-paired (Eq. 9; GT bottom -> top). Assignment: SimOTA with top-k = 1 on
    cost = L_reg + L_cls per pair, as YOLOX's dynamic_k_matching (each GT lane takes its cheapest query; a query
    several lanes took goes to the lane with the lowest cost for it, so a lane can stay unmatched). Each layer is
-   matched on its own outputs.
+   matched on its own outputs. loss_cfg.assign "hungarian" (not in the paper): one-to-one Hungarian matching on the
+   same cost, as DETR, so every lane gets exactly one query. With SimOTA top-1 and cls_cost "focal_diff" a confident
+   query is the cheapest query of its neighbour lanes too (its score term outweighs ~100 px of distance), those lanes
+   go unmatched and their own queries are trained as negatives. loss_cfg.cls_cost: the cost's L_cls. "focal" (as the paper: the focal loss
+   the query would take as this lane's positive) or "focal_diff" (default; Deformable DETR's matching cost, focal
+   positive - focal negative, which the first replica run used). With SimOTA top-1, "focal_diff" is the failure above:
+   its -focal negative makes a confident query up to ~1.4 cheaper for every lane, more than ~100 px of distance;
+   "focal" is at most a few tenths, so a lane's own query stays its cheapest.
 6. test (test_cfg.output): "rows" (default): the last layer's curve, bottom end first, through the official row
    layout (72 rows, blrnet.curve_to_rows) and CLRerHead's get_lanes / predictions_to_lanes, the same path and tools
    as every other run (the error breakdown and the threshold sweep read it); "points": out_points samples of the curve
@@ -92,6 +99,20 @@ def simota_top1(cost):
         mat[multi] = 0.0
         mat[multi, cost[multi].argmin(1)] = 1.0
     return torch.where(mat.sum(1) > 0, mat.argmax(1), torch.full_like(mat[:, 0], -1, dtype=torch.long))
+
+
+def hungarian(cost):
+    """One-to-one assignment on cost [N, G] (scipy's linear_sum_assignment, as DETR): every GT gets exactly one query
+    while N >= G. Returns the matched GT index of each query [N] (-1: none)."""
+    from scipy.optimize import linear_sum_assignment
+    match = torch.full((cost.shape[0],), -1, dtype=torch.long, device=cost.device)
+    if cost.numel():
+        q, g = linear_sum_assignment(cost.detach().float().cpu().numpy())
+        match[torch.as_tensor(q, device=cost.device)] = torch.as_tensor(g, device=cost.device)
+    return match
+
+
+ASSIGNERS = {"simota": simota_top1, "hungarian": hungarian}
 
 
 def focal_terms(logit, alpha, gamma):
@@ -233,7 +254,9 @@ class BezierFormerHead(BaseModule):
     dec_cfg: num_layers (6), sa_heads (8), ref_points (5), attn_heads (8), attn_samples (5), ffn_dim (1024),
     dropout (0.1), init_hidden (512, C_0's MLP width).
     loss_cfg: n_dis (200), width_px (10.0, e), cls_weight (1.0), loc_weight (1.0), len_weight (1.0), end_weight (1.0),
-    focal_alpha (0.25), focal_gamma (2.0), min_gt_len_px (8.0, shorter GT lanes are dropped).
+    focal_alpha (0.25), focal_gamma (2.0), min_gt_len_px (8.0, shorter GT lanes are dropped), assign ("simota": SimOTA
+    top-1 as the paper; "hungarian": one-to-one on the same cost), cls_cost ("focal_diff": focal positive - negative,
+    as Deformable DETR; "focal": the focal positive term alone, as the paper's cost = L_reg + L_cls).
     test_cfg: CLRerHead's (conf_threshold, use_nms, nms_thres, nms_topk, as_lanes, extend_bottom, ori_img_w / h,
     cut_height) plus output ("rows" | "points") and out_points (100, curve samples for "points")."""
 
@@ -246,7 +269,8 @@ class BezierFormerHead(BaseModule):
                 ("dec_cfg", dc, {"num_layers", "sa_heads", "ref_points", "attn_heads", "attn_samples", "ffn_dim",
                                  "dropout", "init_hidden"}),
                 ("loss_cfg", lc, {"n_dis", "width_px", "cls_weight", "loc_weight", "len_weight", "end_weight",
-                                  "focal_alpha", "focal_gamma", "min_gt_len_px"})):
+                                  "focal_alpha", "focal_gamma", "min_gt_len_px", "assign",
+                                  "cls_cost"})):
             if set(cfg) - known:
                 raise ValueError(f"BezierFormerHead {name}: unknown keys {sorted(set(cfg) - known)}")
         if dim % 32:
@@ -294,6 +318,12 @@ class BezierFormerHead(BaseModule):
         self.w_len, self.w_end = float(lc.get("len_weight", 1.0)), float(lc.get("end_weight", 1.0))
         self.alpha, self.gamma = float(lc.get("focal_alpha", 0.25)), float(lc.get("focal_gamma", 2.0))
         self.min_gt_len_px = float(lc.get("min_gt_len_px", 8.0))
+        self.assign = str(lc.get("assign", "simota"))
+        if self.assign not in ASSIGNERS:
+            raise ValueError(f"BezierFormerHead loss_cfg.assign must be one of {sorted(ASSIGNERS)}, got {self.assign!r}")
+        self.cls_cost = str(lc.get("cls_cost", "focal_diff"))
+        if self.cls_cost not in ("focal_diff", "focal"):
+            raise ValueError(f"BezierFormerHead loss_cfg.cls_cost must be 'focal_diff' or 'focal', got {self.cls_cost!r}")
         self.register_buffer("t_dis", torch.linspace(0.0, 1.0, self.n_dis), persistent=False)
         self._reset_parameters()
 
@@ -432,8 +462,8 @@ class BezierFormerHead(BaseModule):
                     continue
                 loc, ln, end, _ = self._reg_terms(pts[b:b + 1].float(), g[None], pairwise=True)
                 cost = (self.w_loc * loc + self.w_len * ln + self.w_end * end)[0] \
-                    + self.w_cls * (pos[b] - neg[b])[:, None]
-                match = simota_top1(cost)
+                    + self.w_cls * (pos[b] if self.cls_cost == "focal" else pos[b] - neg[b])[:, None]
+                match = ASSIGNERS[self.assign](cost)
                 q = torch.nonzero(match >= 0, as_tuple=False).squeeze(1)
                 target[b, q] = True
                 pairs_q.append((b, q))

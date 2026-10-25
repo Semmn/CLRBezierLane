@@ -40,7 +40,16 @@ The report has:
 5. recall@50, recall@75 and the miss reasons by GT lane attribute: slant,
    vertical extent, bend, distance to the nearest other GT lane, forks / merges,
    lanes per image, resolution, y-reversing lanes, lanes reaching above the crop;
-   false positives by predicted slant and extent.
+   false positives by predicted slant and extent;
+6. extent vs lateral position, measured along the GT lane in the metric's 224x224
+   space (works for slanted and flat lanes, unlike rows): for the mislocalized
+   misses and the IoU 0.5-0.75 hits, the share the GT extent alone (lateral error
+   kept) or the GT lateral position alone (extent error kept) would lift above the
+   IoU threshold, with F1 bounds; the extent error and lateral offset of hits,
+   low_score copies and mislocalized predictions by GT vertical extent; and for the
+   low_score misses, the prediction that outscored the copy (the rival): better
+   extent and worse lateral position, or the reverse? (columns arc_cov, arc_over,
+   end_bottom, end_top, lat_px, iou_ext, iou_lat and rival_* of gt_lanes.csv)
 
 GT attributes are measured in the network input (800x320 for the CurveLanes
 configs). The rows of a GT lane are its training target (the config's
@@ -447,6 +456,109 @@ def pair_metrics(ann, rowmap, st):
 
 
 # ----------------------------------------------------------------------------
+# extent vs lateral position along the GT lane (eval space, the metric's own lanes)
+# ----------------------------------------------------------------------------
+EXT_FIELDS = ["arc_cov", "arc_over", "end_bottom", "end_top", "lat_px", "iou_ext", "iou_lat"]
+EXT_CLASSES = ["extent", "lateral", "either", "neither"]
+
+
+def _eval_space(lane, ori_hw, ev):
+    """[n, 2] points of an original-pixel lane (list of {x, y}) resized as vega's calc_iou resizes it."""
+    pts = rc.resize_lane(lane, np.true_divide(ori_hw[1], ev["eval_width"]),
+                         np.true_divide(ori_hw[0], ev["eval_height"]))
+    return np.array([[p["x"], p["y"]] for p in pts], dtype=np.float64).reshape(-1, 2)
+
+
+def _distinct(pts, gap):
+    """Drop the points closer than gap to the last kept one (vega's spline needs distinct points)."""
+    keep = []
+    for k in range(len(pts)):
+        if not keep or np.hypot(*(pts[k] - pts[keep[-1]])) > gap:
+            keep.append(k)
+    return pts[keep]
+
+
+def gt_polyline(lane, ori_hw, ev):
+    """The GT lane as vega draws its mask (resize, spline, step 1 px), with its arc length; None if < 2 points."""
+    pts = rc.spline_interp(lane=rc.resize_lane(lane, np.true_divide(ori_hw[1], ev["eval_width"]),
+                                               np.true_divide(ori_hw[0], ev["eval_height"])), step_t=1)
+    poly = _distinct(np.array([[p["x"], p["y"]] for p in pts], dtype=np.float64).reshape(-1, 2), 1e-3)
+    if len(poly) < 2:
+        return None
+    return poly, np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(poly, axis=0), axis=1))])
+
+
+def _project(pts, poly, cum):
+    """Arc coordinate s and signed normal offset d of each point on the polyline; the first and last
+    segments run on as straight lines (s < 0 before the start, s > L past the end)."""
+    a, ab = poly[:-1], np.diff(poly, axis=0)
+    ln = np.linalg.norm(ab, axis=1)
+    t = np.einsum("mkc,kc->mk", pts[:, None] - a[None], ab) / (ln ** 2)[None]
+    lo, hi = np.zeros(len(ab)), np.ones(len(ab))
+    lo[0], hi[-1] = -INF, INF
+    t = np.clip(t, lo, hi)
+    foot = a[None] + t[..., None] * ab[None]
+    k = np.argmin(np.linalg.norm(pts[:, None] - foot, axis=2), axis=1)
+    i = np.arange(len(pts))
+    nrm = np.stack([-ab[:, 1], ab[:, 0]], 1) / ln[:, None]
+    return cum[k] + t[i, k] * ln[k], ((pts - foot[i, k]) * nrm[k]).sum(1)
+
+
+def _at(poly, cum, s):
+    """Points of the polyline at arc coordinates s (in [0, L]) and the unit normal there."""
+    k = np.clip(np.searchsorted(cum, s, side="right") - 1, 0, len(poly) - 2)
+    ab = poly[k + 1] - poly[k]
+    ln = np.linalg.norm(ab, axis=1)
+    return poly[k] + ((s - cum[k]) / ln)[:, None] * ab, np.stack([-ab[:, 1], ab[:, 0]], 1) / ln[:, None]
+
+
+def _iou_with(pts, gmask, ev):
+    pts = _distinct(pts, 0.5)
+    if len(pts) < 2:
+        return math.nan
+    m = rc.lane_mask([{"x": float(x), "y": float(y)} for x, y in pts], (ev["eval_height"], ev["eval_width"]), ev)
+    union = np.count_nonzero(m | gmask)
+    return np.count_nonzero(m & gmask) / union if union else math.nan
+
+
+def extent_lateral(gline, gmask, lane, ori_hw, ev):
+    """A GT lane and a prediction (the metric's lanes) measured along the GT lane in the eval space
+    (224 x 224 px), as a tuple in EXT_FIELDS order; NaN if unknown:
+      arc_cov / arc_over  share of the GT lane's arc length the prediction covers / runs past its ends
+      end_bottom / end_top  signed error at the GT's lower / upper end, eval px (+ stops short, - runs past)
+      lat_px   median |normal offset| of the prediction inside the GT arc, eval px
+      iou_ext  metric IoU of the prediction given the GT extent: cut at the GT ends, continued to them along
+               the GT lane at its own end offset (its lateral error kept, its extent error removed)
+      iou_lat  metric IoU given the GT lateral position: the GT lane over the arc the prediction covers,
+               the part past the GT ends as predicted (its extent error kept, its lateral error removed)."""
+    if gline is None or len(lane) < 2:
+        return (math.nan,) * 7
+    poly, cum = gline
+    L = cum[-1]
+    pts = _eval_space(lane, ori_hw, ev)
+    s, d = _project(pts, poly, cum)
+    o = np.argsort(s, kind="stable")
+    s, d, pts = s[o], d[o], pts[o]
+    inside = (s >= 0) & (s <= L)
+    if not inside.any() or L <= 0:
+        return (math.nan,) * 7
+    lo, hi = max(s[0], 0.0), min(s[-1], L)
+    cov = (hi - lo) / L
+    over = (max(-s[0], 0.0) + max(s[-1] - L, 0.0)) / L
+    e0, e1 = float(s[0]), float(L - s[-1])                 # at arc 0 and arc L
+    e_bot, e_top = (e0, e1) if poly[0, 1] >= poly[-1, 1] else (e1, e0)
+    lat = float(np.median(np.abs(d[inside])))
+    ends, _ = _at(poly, cum, np.array([lo, hi]))
+    mid = (cum > lo) & (cum < hi)
+    iou_lat = _iou_with(np.concatenate([pts[s < 0], ends[:1], poly[mid], ends[1:], pts[s > L]]), gmask, ev)
+    si, di, pi = s[inside], d[inside], pts[inside]
+    hp, hn = _at(poly, cum, cum[cum < si[0]])
+    tp, tn = _at(poly, cum, cum[cum > si[-1]])
+    iou_ext = _iou_with(np.concatenate([hp + hn * di[0], pi, tp + tn * di[-1]]), gmask, ev)
+    return cov, over, e_bot, e_top, lat, iou_ext, iou_lat
+
+
+# ----------------------------------------------------------------------------
 # one image (worker): everything threshold-independent, plus the sweep
 # ----------------------------------------------------------------------------
 _W = {}
@@ -467,13 +579,14 @@ def analyse_image(rec):
     ori_hw, offset = tuple(rec["ori_hw"]), int(rec["offset"])
     gt = [ln for ln in rc.read_lines_txt(gt_file(rec["filename"])) if len(ln) > 0]
     attrs, gt_rows = gt_geometry(gt, ori_hw, offset, st)
-    gt_masks = [rc.lane_mask([{"x": x, "y": y} for x, y in ln], ori_hw, st["eval"]) for ln in gt]
+    gt_dicts = [[{"x": x, "y": y} for x, y in ln] for ln in gt]
+    gt_masks = [rc.lane_mask(ln, ori_hw, st["eval"]) for ln in gt_dicts]
 
     rows, score = rec["rows"], rec["score"]
     n = len(score)
     valid = np.zeros(n, dtype=bool)
     pred_attr = np.zeros((n, 2), dtype=np.float64)
-    rowmaps, masks = [None] * n, []
+    rowmaps, masks, metric = [None] * n, [], [None] * n
     for i in range(n):
         pts = dec.points(rows[i])
         if pts is None:
@@ -482,6 +595,7 @@ def analyse_image(rec):
         if len(lane) == 0:                     # vega drops empty lanes
             continue
         valid[i] = True
+        metric[i] = lane
         masks.append(rc.lane_mask(lane, ori_hw, st["eval"]))
         rowmaps[i], pred_attr[i, 0], pred_attr[i, 1] = pred_geometry(pts, st)
     iou = np.zeros((len(gt), n), dtype=np.float64)
@@ -490,9 +604,14 @@ def analyse_image(rec):
         iou[:, vi] = rc.iou_matrix(gt_masks, masks)
     near, _ = kernel_pairs(rows, st["n_rows_m1"], st["img_w"], w["nms_thres"])
     anns = [annotated_rows(r, st["img_w"]) for r in gt_rows]
-    pairs = {}
+    pairs, pairs_x = {}, {}
+    glines = {}
     for g, p in zip(*np.nonzero(iou > NEAR)):
-        pairs[(int(g), int(p))] = pair_metrics(anns[g], rowmaps[p], st)
+        g, p = int(g), int(p)
+        pairs[(g, p)] = pair_metrics(anns[g], rowmaps[p], st)
+        if g not in glines:
+            glines[g] = gt_polyline(gt_dicts[g], ori_hw, st["eval"])
+        pairs_x[(g, p)] = extent_lateral(glines[g], gt_masks[g], metric[p], ori_hw, st["eval"])
 
     sweep = {}
     for mode in MODES:
@@ -504,7 +623,8 @@ def analyse_image(rec):
             h50[k], h75[k], nout[k] = int((m > HIT).sum()), int((m > TIGHT).sum()), len(out)
         sweep[mode] = (h50, h75, nout)
     return dict(filename=rec["filename"], n_gt=len(gt), attrs=attrs, iou=iou, valid=valid,
-                near=np.packbits(near, axis=1), n=n, pred_attr=pred_attr, pairs=pairs, sweep=sweep)
+                near=np.packbits(near, axis=1), n=n, pred_attr=pred_attr, pairs=pairs, pairs_x=pairs_x,
+                sweep=sweep)
 
 
 def unpack_near(c):
@@ -554,6 +674,13 @@ def evaluate_image(c, rec, thr, mode, ctx):
                 row["reason"] = "low_score"
                 src = cand[np.argmax(score[cand])]
                 row["score"] = float(score[src])
+                # the rival: the highest-scored prediction near this lane (IoU > 0.3, this lane its best GT),
+                # if it outscored the copy
+                riv = np.nonzero(valid & (iou[g] > NEAR) & (np.argmax(iou, axis=0) == g))[0]
+                riv = riv[np.argmax(score[riv])] if len(riv) else -1
+                if riv >= 0 and riv != src and score[riv] > score[src]:
+                    row["rival_ext"] = c.get("pairs_x", {}).get((g, int(riv)))
+                    row["rival_iou"] = float(iou[g, riv])
             else:
                 best_p, best = -1, 0.0
                 if valid.any():
@@ -571,6 +698,7 @@ def evaluate_image(c, rec, thr, mode, ctx):
                     row["reason"] = "absent"
         if src >= 0:
             row["pred"] = int(rec["idx"][src])
+            row["ext"] = c.get("pairs_x", {}).get((g, int(src)))
             if view is not None:
                 row["view"] = int(view[src])
         lanes.append(row)
@@ -635,6 +763,83 @@ def _v2(items):
     """Share of the items (lane / false-positive rows) whose prediction came from the second view (NaN if none)."""
     v = [it["view"] for it in items if "view" in it]
     return float(np.mean(np.asarray(v) == 1)) if v else math.nan
+
+
+def _has_ext(ln):
+    e = ln.get("ext")
+    return e is not None and not (math.isnan(e[5]) or math.isnan(e[6]))
+
+
+def _ext_class(ln, thr):
+    e, l = ln["ext"][5] > thr, ln["ext"][6] > thr
+    return "either" if e and l else "extent" if e else "lateral" if l else "neither"
+
+
+def extent_block(lanes, G, tp, tp75, n_out, spec):
+    """Extent vs lateral position: what the GT extent alone / the GT lateral position alone would do for the
+    mislocalized misses (IoU 0.5) and the loose hits (IoU 0.75), and the extent profile of the copies, by GT
+    vertical extent."""
+    bins = bin_order(spec, {})
+    mis_all = [ln for ln in lanes if ln["reason"] == "mislocalized"]
+    mis = [ln for ln in mis_all if _has_ext(ln)]
+    loose_all = [ln for ln in lanes if ln["hit50"] and not ln["hit75"]]
+    loose = [ln for ln in loose_all if _has_ext(ln)]
+
+    def split(sub, thr):
+        c = Counter(_ext_class(ln, thr) for ln in sub)
+        return dict(n=len(sub), **{k: (c[k] / len(sub) if sub else math.nan) for k in EXT_CLASSES})
+
+    def by_bin(sub, thr):
+        return [(b, split([ln for ln in sub if bin_label(spec, ln["extent"]) == b], thr)) for b in bins]
+
+    def f1(tp_, out_):
+        return 100 * prf(tp_, out_, G)[2]
+    oracles = []
+    for k, lab in ((5, "the GT extent"), (6, "the GT lateral position")):
+        fix = [ln for ln in mis if ln["ext"][k] > HIT]
+        in_out = sum(bool(ln.get("best_in_output")) for ln in fix)
+        fix75 = sum(ln["ext"][k] > TIGHT for ln in loose)
+        oracles.append(dict(label=lab, f1_50=f1(tp + len(fix), n_out + len(fix) - in_out),
+                            f1_50_out=f1(tp + in_out, n_out), f1_75=100 * prf(tp75 + fix75, n_out, G)[2]))
+    groups = [("hits > 0.75", lambda ln: ln["hit75"]),
+              ("hits 0.5-0.75", lambda ln: ln["hit50"] and not ln["hit75"]),
+              ("low_score", lambda ln: ln["reason"] == "low_score"),
+              ("mislocalized", lambda ln: ln["reason"] == "mislocalized")]
+
+    def profile(sub):
+        sub = [ln for ln in sub if ln.get("ext") is not None and not math.isnan(ln["ext"][0])]
+        if not sub:
+            return dict(n=0)
+        e = np.array([ln["ext"] for ln in sub], dtype=np.float64)
+        err = (e[:, 0] < EXTENT_COVERAGE) | (e[:, 1] > EXTENT_OVERSHOOT)
+        far = np.abs(e[:, 3]) > np.abs(e[:, 2])
+        return dict(n=len(sub), ext_err=float(err.mean()), lat=float(np.median(e[:, 4])),
+                    cov=float(np.median(e[:, 0])), over=float(np.median(e[:, 1])),
+                    far=float(far[err].mean()) if err.any() else math.nan)
+    prof = [(g, [(b, profile([ln for ln in lanes if sel(ln) and bin_label(spec, ln["extent"]) == b]))
+                 for b in bins] + [("all", profile([ln for ln in lanes if sel(ln)]))]) for g, sel in groups]
+
+    def rivals(sub):
+        """low_score misses whose copy a nearby prediction outscored: does the rival get the extent right and
+        the lateral position wrong (what an extent-heavy matching cost teaches the score)?"""
+        low = [ln for ln in sub if ln["reason"] == "low_score" and _has_ext(ln)]
+        rv = [ln for ln in low if ln.get("rival_ext") is not None and not math.isnan(ln["rival_ext"][0])]
+        if not rv:
+            return dict(n_low=len(low), n=0)
+        c = np.array([ln["ext"] for ln in rv], dtype=np.float64)
+        r = np.array([ln["rival_ext"] for ln in rv], dtype=np.float64)
+        ext_c, ext_r = (1 - c[:, 0]) + c[:, 1], (1 - r[:, 0]) + r[:, 1]
+        eb_, lw = ext_r < ext_c, r[:, 4] > c[:, 4]
+        return dict(n_low=len(low), n=len(rv), ext_better_lat_worse=float((eb_ & lw).mean()),
+                    ext_better_lat_better=float((eb_ & ~lw).mean()), ext_worse_lat_worse=float((~eb_ & lw).mean()),
+                    ext_worse_lat_better=float((~eb_ & ~lw).mean()),
+                    iou=float(np.median([ln["rival_iou"] for ln in rv])),
+                    ext_err=(float(np.median(ext_c)), float(np.median(ext_r))),
+                    lat=(float(np.median(c[:, 4])), float(np.median(r[:, 4]))))
+    riv = [(b, rivals([ln for ln in lanes if bin_label(spec, ln["extent"]) == b])) for b in bins]
+    return dict(mis=split(mis, HIT), mis_total=len(mis_all), mis_bins=by_bin(mis, HIT),
+                loose=split(loose, TIGHT), loose_total=len(loose_all), loose_bins=by_bin(loose, TIGHT),
+                oracles=oracles, profile=prof, rivals=riv + [("all", rivals(lanes))])
 
 
 def breakdown(lanes, fps, counts, mode, thr, specs, second_view=None):
@@ -714,6 +919,7 @@ def breakdown(lanes, fps, counts, mode, thr, specs, second_view=None):
                              twin_dist=_q(d).strip()))
         fp_tables[name] = dict(desc=desc, rows=rows)
     dups = [fp for fp in fps if fp["kind"] == "duplicate" and not math.isnan(fp["twin_dist"])]
+    ext_spec = [sp for nm, _, sp in specs if nm == "extent"][0]
     return dict(mode=mode, thr=thr, gt=G, out=n_out, tp50=tp, tp75=tp75, P=p, R=r, F1_50=f, F1_75=f75,
                 reasons={k: rc_[k] / max(G, 1) for k in FN_REASONS}, reason_counts=dict(rc_),
                 fp={k: fk[k] / max(n_out, 1) for k in FP_KINDS}, fp_counts=dict(fk),
@@ -724,6 +930,7 @@ def breakdown(lanes, fps, counts, mode, thr, specs, second_view=None):
                               if dups else math.nan,
                               near=float(np.mean([fp["twin_near"] for fp in dups])) if dups else math.nan),
                 oracles=oracles, loose=loose_stats, tables=tables, fp_tables=fp_tables,
+                extent_lateral=extent_block(lanes, G, tp, tp75, n_out, ext_spec),
                 views=(dict(second=second_view, hits=_v2([ln for ln in lanes if ln["reason"] == "hit"]),
                             low=_v2([ln for ln in lanes if ln["reason"] == "low_score"]), fp=_v2(fps))
                        if second_view else None))
@@ -767,6 +974,7 @@ def format_mode(b, cfg_thr, chosen, say, nms_thres):
         say(f"  {lab:34s} {_q(lo):>22} {_q(ti):>22}")
     say(f"  extent error (coverage < {EXTENT_COVERAGE:g} or beyond > {EXTENT_OVERSHOOT:g}): "
         f"{100 * ls['ext_loose']:.0f}% of IoU 0.5-0.75 hits, {100 * ls['ext_tight']:.0f}% of IoU > 0.75 hits")
+    format_extent(b, say)
     reasons = [k for k in FN_REASONS if not (b["mode"] == "free" and k in ("suppressed", "capped"))]
     for name, t in b["tables"].items():
         say("")
@@ -795,6 +1003,54 @@ def _pct(v):
     return "-" if v is None or math.isnan(v) else f"{100 * v:.1f}"
 
 
+def format_extent(b, say):
+    x = b["extent_lateral"]
+    say("extent vs lateral position, measured along the GT lane in the metric's 224x224 space: the prediction "
+        "given the GT extent alone (lateral error kept) or the GT lateral position alone (extent error kept)")
+
+    def split_line(lab, sp, total, thr):
+        say(f"  {lab} ({sp['n']} of {total} measured): above IoU {thr:g} with the GT extent alone "
+            f"{_pct(sp['extent'])}%, the GT lateral position alone {_pct(sp['lateral'])}%, either "
+            f"{_pct(sp['either'])}%, neither {_pct(sp['neither'])}%")
+
+    def bin_rows(rows):
+        say(f"    {'GT extent':>12} {'n':>6} {'extent':>7} {'lateral':>7} {'either':>7} {'neither':>7}")
+        for bn, sp in rows:
+            say(f"    {bn:>12} {sp['n']:6d} " + " ".join(f"{_pct(sp[k]):>7}" for k in EXT_CLASSES))
+    split_line("mislocalized misses", x["mis"], x["mis_total"], HIT)
+    bin_rows(x["mis_bins"])
+    split_line("hits at IoU 0.5-0.75", x["loose"], x["loose_total"], TIGHT)
+    bin_rows(x["loose_bins"])
+    say(f"  F1 if each lane above had ...  {'F1@50':>8} {'F1@50 (output only)':>20} {'F1@75':>8}   "
+        f"(from {100 * b['F1_50']:.2f} / {100 * b['F1_75']:.2f})")
+    for o in x["oracles"]:
+        say(f"    {o['label']:28s} {o['f1_50']:8.2f} {o['f1_50_out']:20.2f} {o['f1_75']:8.2f}")
+    say("    (F1@50: every mislocalized lane so fixed and scored above the threshold; output only: just those "
+        "whose prediction is already in the output; F1@75: the loose hits so fixed)")
+    say(f"  the copies by GT vertical extent: extent error % (arc coverage < {EXTENT_COVERAGE:g} or overshoot > "
+        f"{EXTENT_OVERSHOOT:g}) / median |lateral offset|, eval px / n; far = share of the extent errors "
+        f"larger at the GT's upper end")
+    bins = [bn for bn, _ in x["profile"][0][1]]
+    say(f"    {'':16s}" + "".join(f"{bn:>20}" for bn in bins) + f"{'far':>7}")
+    for g, rows in x["profile"]:
+        cells = [(f"{_pct(p['ext_err'])} / {p['lat']:.2f} / {p['n']}" if p["n"] else "-") for _, p in rows]
+        say(f"    {g:16s}" + "".join(f"{c:>20}" for c in cells) + f"{_pct(rows[-1][1].get('far', math.nan)):>7}")
+    say("  low_score misses whose copy (IoU > 0.5) a nearby prediction outscored (the rival: IoU > 0.3, this lane "
+        "its best GT): extent error = missing + overshoot share of the GT arc, lateral = median |offset|, eval px")
+    say(f"    {'GT extent':>12} {'low_sc':>7} {'rival':>6} | {'rival: ext better':>17} {'ext better':>10} "
+        f"{'ext worse':>10} {'ext worse':>10} | {'ext err copy/rival':>18} {'lateral copy/rival':>18} "
+        f"{'rival IoU':>9}")
+    say(f"    {'':12s} {'':7s} {'':6s} | {'lat worse':>17} {'lat better':>10} {'lat worse':>10} {'lat better':>10} |")
+    for bn, rv in x["rivals"]:
+        if not rv["n"]:
+            say(f"    {bn:>12} {rv['n_low']:7d} {0:6d} |")
+            continue
+        say(f"    {bn:>12} {rv['n_low']:7d} {rv['n']:6d} | {_pct(rv['ext_better_lat_worse']):>17} "
+            f"{_pct(rv['ext_better_lat_better']):>10} {_pct(rv['ext_worse_lat_worse']):>10} "
+            f"{_pct(rv['ext_worse_lat_better']):>10} | {rv['ext_err'][0]:8.2f} / {rv['ext_err'][1]:.2f}"
+            f"{'':4s}{rv['lat'][0]:8.2f} / {rv['lat'][1]:.2f}{'':4s} {rv['iou']:9.2f}")
+
+
 def dataset_lines(lanes, say, nms_thres):
     G = len(lanes)
     if not G:
@@ -811,7 +1067,7 @@ def write_csvs(out_dir, per_mode):
     gt_keys = ["mode", "image", "gt", "reason", "pred", "iou", "hit50", "hit75", "score", "best_iou",
                "best_in_output", "suppressor_is_hit", "coverage", "beyond", "dx", "normal",
                "slant", "extent", "bend", "nn_dist", "fork", "lanes", "resolution", "reversing",
-               "above_frac", "n_points", "view"]
+               "above_frac", "n_points", "view"] + EXT_FIELDS + ["rival_iou"] + ["rival_" + k for k in EXT_FIELDS]
     with open(osp.join(out_dir, "gt_lanes.csv"), "w", newline="") as f:
         wr = csv.DictWriter(f, fieldnames=gt_keys, extrasaction="ignore")
         wr.writeheader()
@@ -820,6 +1076,8 @@ def write_csvs(out_dir, per_mode):
                 row = dict(ln, mode=mode)
                 pair = ln.get("pair") or (math.nan,) * 4
                 row.update(coverage=pair[0], beyond=pair[1], dx=pair[2], normal=pair[3])
+                row.update(zip(EXT_FIELDS, ln.get("ext") or (math.nan,) * len(EXT_FIELDS)))
+                row.update(zip(["rival_" + k for k in EXT_FIELDS], ln.get("rival_ext") or (math.nan,) * len(EXT_FIELDS)))
                 wr.writerow({k: _fmt(row.get(k, "")) for k in gt_keys})
     fp_keys = ["mode", "image", "pred", "score", "kind", "best_iou", "slant", "extent", "twin_dist", "twin_near",
                "view"]
@@ -886,6 +1144,21 @@ def compare(paths, say):
         say("  false positives (% of output):")
         for k in FP_KINDS:
             line(f"    {k}", lambda b, k=k: f"{100 * b['fp'][k]:.2f}")
+        if all(r["modes"][mode].get("extent_lateral") for r in have):
+            def ext_get(b, *path):
+                v = b["extent_lateral"]
+                for k in path:
+                    v = v[k] if not isinstance(v, dict) else v.get(k)
+                    if v is None:
+                        return math.nan
+                return v
+            line("misloc fixed by GT extent / lateral", lambda b: (
+                f"{_pct(ext_get(b, 'mis', 'extent') + ext_get(b, 'mis', 'either'))} / "
+                f"{_pct(ext_get(b, 'mis', 'lateral') + ext_get(b, 'mis', 'either'))}"))
+            line("extent err %: hit75 / hit50 / low_sc", lambda b: " / ".join(
+                _pct(ext_get(b, "profile", g, 1, -1, 1, "ext_err")) for g in (0, 1, 2)))
+            line("low_sc rival: ext better, lat worse", lambda b: _pct(ext_get(b, "rivals", -1, 1,
+                                                                                 "ext_better_lat_worse")))
         if any(r["modes"][mode].get("views") for r in have):
             line("second view: % hits / low_sc / FP", lambda b: (
                 f"{_pct(b['views']['hits'])} / {_pct(b['views']['low'])} / {_pct(b['views']['fp'])}"
