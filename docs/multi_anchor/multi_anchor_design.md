@@ -170,6 +170,12 @@ point head adds a 1-layer MLP.
 - V needs a VP. On curves, crests or with < 2 lanes the VP is poor (no GT VP in some images). V must then fit with
   delta and the curvatures, which is what per-form supervision trains. The global profile cannot switch V off for
   those images only; a per-image profile is the natural next step if the profile is the limit.
+- V's ray is only as good as the VP relative to how far the far end is from it. A VP error e at distance r turns
+  the ray by about e / r, so with delta = 0 the near end moves by about e x L / r (e.g. 5 px x 300 / 50 = 30 px). V is
+  then a far-anchored line whose heading is regressed relative to a good, slant-normalized reference frame: an
+  anchor that does not have to be exact. delta must carry the rest. Logged as vp_err_px and form_v_delta_deg. In the
+  CPU overfit, V lagged S and B while the VP error was 5-12 px, and the profile moved V's near weight from 0.33 to
+  0.25.
 - If the near-miss error comes from the far part's angle and not from extrapolation, V inherits it. The
   measurements (far |d| 0.9 px) say the far part is right.
 - One run of about 1.5-2 days on one GPU (batch 16 on GPU 3, as YSY runs).
