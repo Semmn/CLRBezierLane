@@ -1456,7 +1456,7 @@ class FovealLaneHead(HBLRHead):
                 sign = torch.where((ray * (p0 - p3)).sum(-1) >= 0, 1.0, -1.0)     # towards the near end
                 r = ray.norm(dim=-1, keepdim=True)
                 back = (p0 - p3) / chord.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-                d0 = torch.where(r >= 1.0, ray * sign[..., None] / r.clamp_min(1e-6), back)   # step-0 ray direction
+                d0 = torch.where(r >= 1.0, ray / r.clamp_min(1e-6), back * sign[..., None])   # away from v
                 st[k] = dict(anchor=p3, delta=zero, log_len=log_len, c2=zero, c3=zero, sign=sign, d0=d0)
         return st
 

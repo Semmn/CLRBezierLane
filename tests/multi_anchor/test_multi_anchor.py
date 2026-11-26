@@ -239,6 +239,17 @@ check("e. V's reference ray: a 5 px VP error turns it by <= ~e / ray_min_px (30 
       float(turn[0]) < 10.5 and float(turn[1]) < 6.5 and not h0.requires_grad,
       f"turn {float(turn[0]):.1f} deg at 5 px, {float(turn[1]):.1f} deg at 50 px")
 
+sv = dict(st["V"])
+sv["sign"] = -torch.ones_like(sv["sign"])
+sv["d0"] = F.normalize(sv["anchor"] - vp[:, None], dim=-1)
+ok = []
+for r_ in (5.0, 15.0, 25.0, 60.0):
+    sv["anchor"] = vp[:, None] + r_ * sv["d0"]
+    hd = head._form_head("V", sv, vp)
+    ok.append(float((hd * -sv["d0"]).sum(-1).min()) > 0.999)
+check("e. sign -1 (near end towards v): the floor pushes the reference away from v, heading towards v at r = 5 .. 60",
+      all(ok), str(ok))
+
 print("4. fusion")
 curves, fused, ends = head._form_fuse(st, vp)
 check("a. at the start the profile is equal: fused = the mean of the forms",

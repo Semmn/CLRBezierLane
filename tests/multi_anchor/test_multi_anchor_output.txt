@@ -14,6 +14,7 @@ PASS  b. arc_resample of a zero-length polyline: its point, finite
 PASS  c. polyline_at: u = 0, 1 are the ends, u = 0.5 the middle point
 PASS  d. step 0: S starts at P0 along P1 - P0; V ends (far) at P3 on the ray from v, near end first; B = the cubic  (V off the ray 8.9e-08)
 PASS  e. V's reference ray: a 5 px VP error turns it by <= ~e / ray_min_px (30 px) even with the far end 5 px from v; no gradient from the ray to the anchor  (turn 8.6 deg at 5 px, 3.7 deg at 50 px)
+PASS  e. sign -1 (near end towards v): the floor pushes the reference away from v, heading towards v at r = 5 .. 60  ([True, True, True, True])
 4. fusion
 PASS  a. at the start the profile is equal: fused = the mean of the forms
 PASS  b. a profile on V gives V's curve
@@ -32,4 +33,4 @@ PASS  forms ('B',): the fused curve is B's, so the form loss = the plain loss of
 8. config errors
 PASS  bad multi_anchor_cfg / mode / cp_loss raise ValueError  ([True, True, True, True, True, True, True])
 
-25/25 passed
+26/26 passed
