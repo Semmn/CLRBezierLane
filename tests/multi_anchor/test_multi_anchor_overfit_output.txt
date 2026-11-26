@@ -1,0 +1,37 @@
+flat side lanes: slant [np.float64(4.7), np.float64(4.5)]
+/mnt/attach/project-files/clrbezierlane/multi_anchor/head_tests/test_multi_anchor_overfit.py:94: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:820.)
+  print(f"it {it:4d}  total {float(tot):.3f}  " + "  ".join(f"{k} {float(L[k]):.3f}" for k in keys if k in L)
+it    0  total 157.207  loss_cls 0.280  loss_iou 5.798  loss_form_iou 9.165  d0.loss_iou 5.802  d4.loss_iou 5.800  form_iou_S 1.498  form_iou_B 1.495  form_iou_V 1.589  form_w_S_near 0.333  form_w_B_near 0.333  form_w_V_near 0.333  form_w_V_far 0.333  loss_vp 0.113  vp_err_px 45.881  vp_err_y_px 6.970  prop_recall 0.400  (1 s)
+it   50  total 69.855  loss_cls 0.252  loss_iou 2.837  loss_form_iou 5.387  d0.loss_iou 2.861  d4.loss_iou 2.871  form_iou_S 0.789  form_iou_B 0.792  form_iou_V 1.113  form_w_S_near 0.336  form_w_B_near 0.336  form_w_V_near 0.327  form_w_V_far 0.324  loss_vp 0.009  vp_err_px 7.321  vp_err_y_px 2.826  prop_recall 0.900  (29 s)
+it  100  total 62.597  loss_cls 0.213  loss_iou 2.454  loss_form_iou 4.868  d0.loss_iou 3.228  d4.loss_iou 2.557  form_iou_S 0.712  form_iou_B 0.645  form_iou_V 1.077  form_w_S_near 0.342  form_w_B_near 0.342  form_w_V_near 0.316  form_w_V_far 0.321  loss_vp 0.012  vp_err_px 11.992  vp_err_y_px 1.561  prop_recall 1.000  (58 s)
+it  150  total 64.069  loss_cls 0.227  loss_iou 2.828  loss_form_iou 4.185  d0.loss_iou 3.184  d4.loss_iou 2.681  form_iou_S 0.568  form_iou_B 0.574  form_iou_V 0.950  form_w_S_near 0.350  form_w_B_near 0.351  form_w_V_near 0.299  form_w_V_far 0.319  loss_vp 0.007  vp_err_px 10.300  vp_err_y_px 0.678  prop_recall 1.000  (86 s)
+it  200  total 37.239  loss_cls 0.182  loss_iou 1.097  loss_form_iou 2.453  d0.loss_iou 2.320  d4.loss_iou 1.048  form_iou_S 0.409  form_iou_B 0.357  form_iou_V 0.460  form_w_S_near 0.357  form_w_B_near 0.357  form_w_V_near 0.286  form_w_V_far 0.317  loss_vp 0.011  vp_err_px 12.717  vp_err_y_px 1.743  prop_recall 1.000  (254 s)
+it  250  total 33.613  loss_cls 0.118  loss_iou 1.098  loss_form_iou 2.897  d0.loss_iou 2.027  d4.loss_iou 1.064  form_iou_S 0.485  form_iou_B 0.365  form_iou_V 0.599  form_w_S_near 0.364  form_w_B_near 0.364  form_w_V_near 0.273  form_w_V_far 0.318  loss_vp 0.005  vp_err_px 8.168  vp_err_y_px 1.621  prop_recall 1.000  (926 s)
+it  300  total 35.096  loss_cls 0.067  loss_iou 1.201  loss_form_iou 2.365  d0.loss_iou 2.212  d4.loss_iou 1.417  form_iou_S 0.354  form_iou_B 0.265  form_iou_V 0.564  form_w_S_near 0.368  form_w_B_near 0.368  form_w_V_near 0.264  form_w_V_far 0.319  loss_vp 0.007  vp_err_px 8.800  vp_err_y_px 1.993  prop_recall 1.000  (1300 s)
+it  350  total 26.883  loss_cls 0.087  loss_iou 0.920  loss_form_iou 1.984  d0.loss_iou 1.925  d4.loss_iou 1.114  form_iou_S 0.318  form_iou_B 0.249  form_iou_V 0.425  form_w_S_near 0.371  form_w_B_near 0.372  form_w_V_near 0.257  form_w_V_far 0.319  loss_vp 0.005  vp_err_px 7.117  vp_err_y_px 1.402  prop_recall 1.000  (1732 s)
+it  399  total 29.513  loss_cls 0.012  loss_iou 1.155  loss_form_iou 2.405  d0.loss_iou 1.961  d4.loss_iou 1.186  form_iou_S 0.455  form_iou_B 0.342  form_iou_V 0.405  form_w_S_near 0.375  form_w_B_near 0.376  form_w_V_near 0.250  form_w_V_far 0.321  loss_vp 0.003  vp_err_px 4.972  vp_err_y_px 1.082  prop_recall 1.000  (1763 s)
+PASS  total loss falls below 35% of its start  (160.60 -> 26.60)
+PASS  every step's LaneIoU and form loss falls below half its start (d0 .. d4, last)  (d0.loss_form_iou 9.17 -> 3.40, d0.loss_iou 5.80 -> 1.96, d1.loss_form_iou 9.17 -> 2.73, d1.loss_iou 5.80 -> 1.54, d2.loss_form_iou 9.17 -> 2.34, d2.loss_iou 5.80 -> 1.27, d3.loss_form_iou 9.17 -> 2.45, d3.loss_iou 5.80 -> 1.15, d4.loss_form_iou 9.17 -> 2.45, d4.loss_iou 5.80 -> 1.19, loss_form_iou 9.16 -> 2.40, loss_iou 5.80 -> 1.15)
+output fused:
+image 0: 5 lanes > 0.5; best LaneIoU per GT lane left 0.67, centre 0.73, right 0.82, flat side 0.87, far short 0.75
+image 1: 6 lanes > 0.5; best LaneIoU per GT lane left 0.64, centre 0.65, right 0.84, flat side 0.85, far short 0.76
+PASS  test path, fused: every GT lane found (score > 0.5, LaneIoU >= 0.5), incl. the flat side and the far lane
+PASS  test path, fused: at most one extra lane per image  ([0, 1])
+output S:
+image 0: 5 lanes > 0.5; best LaneIoU per GT lane left 0.64, centre 0.80, right 0.49, flat side 0.95, far short 0.79
+image 1: 6 lanes > 0.5; best LaneIoU per GT lane left 0.36, centre 0.37, right 0.62, flat side 0.80, far short 0.77
+FAIL  test path, S: every GT lane found (score > 0.5, LaneIoU >= 0.5), incl. the flat side and the far lane
+FAIL  test path, S: at most one extra lane per image  ([1, 3])
+output B:
+image 0: 5 lanes > 0.5; best LaneIoU per GT lane left 0.56, centre 0.69, right 0.78, flat side 0.70, far short 0.80
+image 1: 6 lanes > 0.5; best LaneIoU per GT lane left 0.57, centre 0.76, right 0.78, flat side 0.67, far short 0.73
+PASS  test path, B: every GT lane found (score > 0.5, LaneIoU >= 0.5), incl. the flat side and the far lane
+PASS  test path, B: at most one extra lane per image  ([0, 1])
+output V:
+image 0: 5 lanes > 0.5; best LaneIoU per GT lane left 0.77, centre 0.46, right 0.23, flat side 0.75, far short 0.50
+image 1: 6 lanes > 0.5; best LaneIoU per GT lane left 0.72, centre 0.51, right 0.53, flat side 0.62, far short 0.70
+FAIL  test path, V: every GT lane found (score > 0.5, LaneIoU >= 0.5), incl. the flat side and the far lane
+FAIL  test path, V: at most one extra lane per image  ([3, 1])
+
+6/10 passed

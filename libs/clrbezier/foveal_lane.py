@@ -88,7 +88,31 @@ exact sub-curve on [t0, t1] (hblrnet.subcurve), still a y-monotone cubic, so the
   the GT, and it must span the GT (running past it is free), so the interval can reach the GT's ends.
 Logs: loss_end_hm, int_span (mean t1 - t0 of the last step), end_snap (mean largest softmax weight of the end
 localization: about 0.05 without evidence, 1 = one sample), o2o_car_lat / o2o_car_cov (the last carrier of the o2o
-pairs)."""
+pairs).
+
+multi_anchor_cfg (clrbezierlane/multi_anchor/multi_anchor_design.md): one query carries its lane in up to three anchored
+forms, each refined on its own track through the lane steps, and the lane is their fusion along the lane.
+- "S" line anchor (CLRNet-style): pinned at the near end A with an absolute heading phi; "B": the endpoint cubic (the
+  update and monotone step above, unchanged); "V" polar anchor: pinned at the far end f, its heading delta relative to
+  the ray from the predicted vanishing point v through f. S and V are cubic graphs in their anchor's tangent frame,
+  p(s) = A + L s d + L (c2 s^2 + c3 s^3) n, s in [0, 1] away from the anchor, so d is the tangent at the anchor;
+  V with delta = c2 = c3 = 0 is the straight line through v.
+- step 0 from the proposal cubic (detached): B = the cubic; S = the line from P0 along P1 - P0 (length |P3 - P0|);
+  V = the ray through v and P3 (delta = 0, c = 0), its direction towards the near end fixed per lane at step 0.
+- each step: the decoder step as above on the fused curve's points; B moves by update(h); S and V by an MLP of
+  [h, the stride-8 encoder map read at s = read_s of the form's own curve next to its anchor, averaged]
+  -> (anchor px, angle x angle_scale rad, log L, c2, c3 x shape_scale).
+- fusion: each form resampled at num_out arc-length fractions u (0 near, 1 far); p(u) = sum_k w_k(u) p_k(u), w =
+  softmax over the forms of a learned profile (knots per form, linear in u; shared by all lanes and steps; starts
+  equal). The fused curve is the lane: matching, losses, scores, self-attention positions and output.
+- loss: + form_loss_weight x (LaneIoU + endpoint terms) of each form on the fused curve's o2o pairs, every step
+  (loss_form_iou, loss_form_end). V reads the vanishing point detached; with V, the vanishing-column head becomes the
+  point head (column + row) of the polar mode, with its loss.
+- output ("fused" | a form): the curve the test path outputs (one form's own curve to evaluate it alone; the scores
+  stay the fused model's).
+Logs: form_w_<k>_near / _mid / _far (the profile at u = 0, 0.5, 1), form_iou_<k> (1 - LaneIoU of form k on the last
+step's o2o pairs), form_v_delta_deg (mean |delta| of V's last step over all queries: how far V's heading departs from
+the vanishing-point ray; the ray is a reference frame, as accurate as vp_err over the far end's distance from v)."""
 import contextlib
 import math
 
@@ -272,6 +296,49 @@ def fit_cubic(q, eps=1e-6):
     p1 = torch.where(ok, (a22[..., None] * r1 - a12[..., None] * r2) / det, p0 + (p3 - p0) / 3.0)
     p2 = torch.where(ok, (a11[..., None] * r2 - a12[..., None] * r1) / det, p0 + 2.0 * (p3 - p0) / 3.0)
     return torch.stack([p0, p1, p2, p3], dim=-2)
+
+
+FORMS = ("S", "B", "V")
+
+
+def graph_points(anchor, head, length, c2, c3, s):
+    """Cubic graphs in their anchor's tangent frame: anchor [..., 2] px, head [..., 2] unit tangent at the anchor, length
+    / c2 / c3 [...], s [P] in [0, 1] -> p(s) = anchor + L s d + L (c2 s^2 + c3 s^3) n  [..., P, 2] (n = d rotated
+    +90 deg)."""
+    s = s.to(anchor.dtype)
+    nrm = torch.stack([-head[..., 1], head[..., 0]], dim=-1)
+    lat = c2[..., None] * s ** 2 + c3[..., None] * s ** 3                                  # [..., P]
+    return anchor[..., None, :] + length[..., None, None] * (s[:, None] * head[..., None, :]
+                                                             + lat[..., None] * nrm[..., None, :])
+
+
+def rotate(v, ang):
+    """Vectors v [..., 2] rotated by ang [...] rad (image axes)."""
+    c, s = torch.cos(ang), torch.sin(ang)
+    return torch.stack([c * v[..., 0] - s * v[..., 1], s * v[..., 0] + c * v[..., 1]], dim=-1)
+
+
+def arc_resample(pts, num, eps=1e-6):
+    """Polylines pts [..., P, 2] -> num points at uniform arc-length fractions [..., num, 2] (differentiable in the
+    points; zero-length polylines: their first point)."""
+    seg = (pts[..., 1:, :] - pts[..., :-1, :]).norm(dim=-1)
+    cum = torch.cat([seg.new_zeros(seg.shape[:-1] + (1,)), seg.cumsum(-1)], dim=-1)               # [..., P]
+    total = cum[..., -1:]
+    target = torch.linspace(0.0, 1.0, num, device=pts.device, dtype=pts.dtype) * total            # [..., num]
+    idx = torch.searchsorted(cum.detach().contiguous(), target.detach().contiguous()).clamp(1, pts.shape[-2] - 1)
+    c0, c1 = cum.gather(-1, idx - 1), cum.gather(-1, idx)
+    a = ((target - c0) / (c1 - c0).clamp_min(eps)).clamp(0.0, 1.0)[..., None]
+    gather = lambda i: pts.gather(-2, i[..., None].expand(*i.shape, 2))                          # noqa: E731
+    return gather(idx - 1) * (1.0 - a) + gather(idx) * a
+
+
+def polyline_at(pts, u):
+    """Points at fractions u [K] of the index range of polylines pts [..., P, 2] (uniform in arc length after
+    arc_resample) -> [..., K, 2]."""
+    x = u.to(pts.dtype) * (pts.shape[-2] - 1)
+    i0 = x.floor().long().clamp(0, pts.shape[-2] - 2)
+    a = (x - i0.to(x.dtype))[:, None]
+    return pts[..., i0, :] * (1.0 - a) + pts[..., i0 + 1, :] * a
 
 
 def _sample_maps(values, maps, grids, weights, heads):
@@ -709,9 +776,11 @@ class FovealLaneHead(HBLRHead):
     def __init__(self, in_channels=(128, 256, 512), num_queries=16, dim=256, num_points=72, img_w=800, img_h=320,
                  seg_num_classes=2, curve_cfg=None, hier_cfg=None, fovea_cfg=None, vp_cfg=None, enc_cfg=None,
                  prop_cfg=None, dec_cfg=None, ray_cfg=None, interval_cfg=None, assign_cfg=None, loss_cfg=None,
-                 target_adapter=None, test_score=None, train_cfg=None, test_cfg=None, init_cfg=None):
+                 target_adapter=None, test_score=None, train_cfg=None, test_cfg=None, init_cfg=None,
+                 multi_anchor_cfg=None):
         fc, vc, ec, pc, dc, rc = (dict(c or {}) for c in (fovea_cfg, vp_cfg, enc_cfg, prop_cfg, dec_cfg, ray_cfg))
         ic = None if interval_cfg is None else dict(interval_cfg)
+        mc = None if multi_anchor_cfg is None else dict(multi_anchor_cfg)
         polar_cfg = {k: fc.pop(k) for k in POLAR_KEYS if k in fc}
         for name, cfg, known in (
                 ("fovea_cfg", fc, {"mode", "window_w", "window_h", "window_top", "p_gt", "jitter_px", "bn"}),
@@ -725,7 +794,9 @@ class FovealLaneHead(HBLRHead):
                                  "dist_scale", "max_dist", "layer_loss", "point_conditioned"}),
                 ("ray_cfg", rc, {"channels", "kernel", "dilations", "angle_kernel"}),
                 ("interval_cfg", ic or {}, {"margin", "look", "end_points", "prior_sigma", "min_span", "sigma_cells",
-                                            "hm_weight", "carrier_weight"})):
+                                            "hm_weight", "carrier_weight"}),
+                ("multi_anchor_cfg", mc or {}, {"forms", "knots", "form_loss_weight", "mlp_dim", "read_s",
+                                                "angle_scale", "shape_scale", "output"})):
             if set(cfg) - known:
                 raise ValueError(f"FovealLaneHead {name}: unknown keys {sorted(set(cfg) - known)}")
         cc = dict(curve_cfg or {})
@@ -782,12 +853,36 @@ class FovealLaneHead(HBLRHead):
                                  "0 < min_span < 1, sigma_cells > 0")
             self.carrier_weight = float(ic.get("carrier_weight", 1.0))
 
+        self.forms = None                                 # multi_anchor_cfg
+        self.form_loss_weight = 0.0
+        if mc is not None:
+            self.forms = tuple(str(k) for k in mc.get("forms", FORMS))
+            self.form_knots = int(mc.get("knots", 8))
+            self.form_loss_weight = float(mc.get("form_loss_weight", 0.5))
+            self.form_mlp_dim = int(mc.get("mlp_dim", dim))
+            self.form_read_s = tuple(float(v) for v in mc.get("read_s", (0.0, 0.1, 0.2)))
+            self.form_angle_scale = float(mc.get("angle_scale", 0.05))
+            self.form_shape_scale = float(mc.get("shape_scale", 0.1))
+            self.form_output = str(mc.get("output", "fused"))
+            if (not self.forms or len(set(self.forms)) != len(self.forms) or set(self.forms) - set(FORMS)
+                    or self.form_knots < 2 or self.form_loss_weight < 0 or not self.form_read_s
+                    or min(self.form_read_s) < 0 or max(self.form_read_s) > 1 or self.form_angle_scale <= 0
+                    or self.form_shape_scale <= 0 or self.form_output not in ("fused",) + self.forms):
+                raise ValueError("FovealLaneHead multi_anchor_cfg: forms distinct of 'S', 'B', 'V'; knots >= 2; "
+                                 "form_loss_weight >= 0; read_s in [0, 1]; scales > 0; output 'fused' or a form")
+            if self.hier is not None or self.interval is not None or self.cp_loss:
+                raise ValueError("FovealLaneHead multi_anchor_cfg: needs hier_cfg=None, interval_cfg=None and "
+                                 "dec_cfg.cp_loss False")
+            if str(fc.get("mode", "window")) != "off":
+                raise ValueError("FovealLaneHead multi_anchor_cfg: needs fovea_cfg.mode 'off'")
+
         # views
         self.fovea_mode = str(fc.get("mode", "window"))
         if self.fovea_mode not in ("window", "off", "full", "polar", "ray"):
             raise ValueError("FovealLaneHead fovea_cfg.mode must be 'window', 'off', 'full', 'polar' or 'ray'")
         self.ray = self.fovea_mode == "ray"
         self.vp_point = self.fovea_mode in ("polar", "ray")         # P's geometry around the vanishing point
+        self.vp_2d = self.vp_point or (self.forms is not None and "V" in self.forms)   # the head predicts (x, y)
         unused = sorted(set(fc) & {"window_w", "window_h", "window_top"} if self.vp_point else polar_cfg)
         if self.ray and "source" in polar_cfg:
             unused.append("source")
@@ -850,7 +945,7 @@ class FovealLaneHead(HBLRHead):
         self.enc_checkpoint = bool(ec.get("checkpoint", False))
 
         # vanishing column (point, in polar mode)
-        vp_cls = VanishingPointHead if self.vp_point else VanishingColumnHead
+        vp_cls = VanishingPointHead if self.vp_2d else VanishingColumnHead
         self.vp_head = vp_cls(in_channels[-1], int(vc.get("channels", 128)))
         self.vp_weight, self.vp_beta = float(vc.get("loss_weight", 1.0)), float(vc.get("beta", 0.05))
 
@@ -912,6 +1007,26 @@ class FovealLaneHead(HBLRHead):
             self.look_pos = nn.Parameter(torch.zeros(2, dim))       # position embeddings of the two look points
             self.register_buffer("z_end", torch.linspace(-3.0, 3.0, self.interval["end_points"]), persistent=False)
         self._reset_foveal()
+        if self.forms is not None:                       # built after the rest: the other parameters draw as without
+            self._build_forms(dim)
+
+    def _build_forms(self, dim):
+        """multi_anchor_cfg modules: the fusion profile [K, knots] (zeros: equal weights) and, for S and V, the update
+        MLP of [h, local feature] (its last layer as update: normal std 1e-2, zero bias)."""
+        self.form_profile = nn.Parameter(torch.zeros(len(self.forms), self.form_knots))
+        self.form_mlp = nn.ModuleDict()
+        for k in self.forms:
+            if k == "B":
+                continue
+            mlp = nn.Sequential(nn.Linear(2 * dim, self.form_mlp_dim), nn.ReLU(inplace=True),
+                                nn.Linear(self.form_mlp_dim, 6))
+            nn.init.xavier_uniform_(mlp[0].weight)
+            nn.init.zeros_(mlp[0].bias)
+            nn.init.normal_(mlp[2].weight, std=1.0e-2)
+            nn.init.zeros_(mlp[2].bias)
+            self.form_mlp[k] = mlp
+        self.register_buffer("t_form_read", torch.tensor(self.form_read_s), persistent=False)
+        self.register_buffer("t_form_dense", torch.linspace(0.0, 1.0, 2 * self.num_out - 1), persistent=False)
 
     def _reset_foveal(self):
         for m in self.in_proj.modules():
@@ -945,14 +1060,15 @@ class FovealLaneHead(HBLRHead):
         modes: the vanishing point [B, 2] and its GT [B, 2]; the origin is P's centre, the point (clamped to the head's
         range)."""
         polar = self.vp_point
-        vp = self.vp_head(c_feats[-1], self.img_w, self.img_h) if polar else self.vp_head(c_feats[-1], self.img_w)
+        vp = (self.vp_head(c_feats[-1], self.img_w, self.img_h) if self.vp_2d
+              else self.vp_head(c_feats[-1], self.img_w))
         batch_size, dev = vp.shape[0], vp.device
         out = dict(vp=vp, vp_gt=None, gts=None)
         if batch_data_samples is not None:
             gts = self.extract_lanes_2d(batch_data_samples, dev)
             out["gts"] = gts
             v = [vanishing_point(self._px(g.double()).cpu().numpy(), self.img_h) for g in gts]
-            if polar:
+            if self.vp_2d:
                 out["vp_gt"] = torch.tensor([[math.nan, math.nan] if p is None else list(p) for p in v], device=dev)
             else:
                 out["vp_gt"] = torch.tensor([math.nan if p is None else p[0] for p in v], device=dev)
@@ -1219,6 +1335,8 @@ class FovealLaneHead(HBLRHead):
         cps0 = prop["cps"]
         h = self.query_norm(self.query_token + self.geo_enc(curve_code(self._px(cps0), self.img_h - 1))
                             + self.tok_proj(prop["tok"]))
+        if self.forms is not None:
+            return self._forward_forms(x, h, cps0, prop, tokens, maps, frame, fine)
         cps = cps0
         iv = self.interval
         carriers, snaps = [], []
@@ -1309,6 +1427,138 @@ class FovealLaneHead(HBLRHead):
             out["end_snap"] = snaps[-1]
         return out
 
+    # ------------------------------------------------------------------ multi-anchor forms
+    def _form_init(self, cps0, vp):
+        """Step-0 states (px) of the forms from the proposal cubics cps0 [B, N, 4, 2] (normalized, bottom first) and
+        the vanishing points vp [B, 2] (px): per form a dict (B: cps; S: anchor, phi, log_len, c2, c3; V: anchor,
+        delta, log_len, c2, c3, sign)."""
+        c = self._px(cps0.detach().float())
+        p0, p1, p3 = c[..., 0, :], c[..., 1, :], c[..., 3, :]
+        chord = p3 - p0
+        zero = chord.new_zeros(chord.shape[:-1])
+        log_len = chord.norm(dim=-1).clamp_min(1.0).log()
+        st = {}
+        for k in self.forms:
+            if k == "B":
+                st[k] = dict(cps=cps0)
+            elif k == "S":
+                t = p1 - p0
+                t = torch.where((t.norm(dim=-1, keepdim=True) > 1e-3), t, chord)
+                st[k] = dict(anchor=p0, phi=torch.atan2(t[..., 1], t[..., 0]), log_len=log_len, c2=zero, c3=zero)
+            else:
+                ray = p3 - vp.detach().float()[:, None, :]                       # from v through the far end
+                sign = torch.where((ray * (p0 - p3)).sum(-1) >= 0, 1.0, -1.0)     # towards the near end
+                st[k] = dict(anchor=p3, delta=zero, log_len=log_len, c2=zero, c3=zero, sign=sign)
+        return st
+
+    def _form_head(self, k, st, vp):
+        """Unit tangent [B, N, 2] at the anchor of form S or V."""
+        if k == "S":
+            return torch.stack([torch.cos(st["phi"]), torch.sin(st["phi"])], dim=-1)
+        ray = (st["anchor"] - vp.detach().float()[:, None, :]) * st["sign"][..., None]
+        ray = ray / ray.norm(dim=-1, keepdim=True).clamp_min(1.0)
+        return rotate(ray, st["delta"])
+
+    def _form_curve(self, k, st, vp, s):
+        """Points of form k at its parameters s [P] (px): B at the cubic's t; S from the near end; V from the far end,
+        returned near end first."""
+        if k == "B":
+            return self._px(curve_points(st["cps"], s))
+        pts = graph_points(st["anchor"], self._form_head(k, st, vp), st["log_len"].exp(), st["c2"], st["c3"], s)
+        return pts if k == "S" else pts.flip(-2)
+
+    def _form_weights(self, dtype):
+        """The fusion profile [K, num_out]: softmax over the forms of the knots interpolated linearly in u."""
+        a = F.interpolate(self.form_profile[None].float(), size=self.num_out, mode="linear", align_corners=True)[0]
+        return torch.softmax(a, dim=0).to(dtype)
+
+    def _form_step(self, k, st, h, vp, fine, frame):
+        """One update of form S or V: MLP of [h, the stride-8 map read at read_s next to its anchor] -> new state."""
+        head = self._form_head(k, st, vp)
+        pts = graph_points(st["anchor"], head, st["log_len"].exp(), st["c2"], st["c3"], self.t_form_read).detach()
+        fmap = fine[CTX]
+        g = F.grid_sample(fmap, frame.grid(pts, CTX).to(fmap.dtype), mode="bilinear", padding_mode="zeros",
+                          align_corners=False)                                                       # [B, D, N, R]
+        local = g.mean(-1).transpose(1, 2)                                                           # [B, N, D]
+        d = self.form_mlp[k](torch.cat([h, local.to(h.dtype)], dim=-1)).float()
+        new = dict(st)
+        new["anchor"] = st["anchor"] + d[..., :2] * self.step_scale
+        ang = "phi" if k == "S" else "delta"
+        new[ang] = st[ang] + d[..., 2] * self.form_angle_scale
+        new["log_len"] = st["log_len"] + d[..., 3] * self.form_shape_scale
+        new["c2"] = st["c2"] + d[..., 4] * self.form_shape_scale
+        new["c3"] = st["c3"] + d[..., 5] * self.form_shape_scale
+        return new
+
+    def _form_fuse(self, st, vp):
+        """Each form resampled at num_out arc-length fractions (near first) and the fused lane, normalized ->
+        (per-form curves [list of B, N, P, 2], fused [B, N, P, 2], the fused curve's pseudo control points
+        [B, N, 4, 2] whose end segments give the output's end tangents)."""
+        curves = [self._norm(arc_resample(self._form_curve(k, st[k], vp, self.t_form_dense), self.num_out))
+                  for k in self.forms]
+        w = self._form_weights(curves[0].dtype)
+        fused = sum(w[i][None, None, :, None] * c for i, c in enumerate(curves))
+        ends = torch.stack([fused[..., 0, :], fused[..., 1, :], fused[..., -2, :], fused[..., -1, :]], dim=-2)
+        return curves, fused, ends
+
+    def _forward_forms(self, x, h, cps0, prop, tokens, maps, frame, fine):
+        """The lane steps with multi_anchor_cfg (module docstring); the rest of _forward unchanged."""
+        batch_size, num_q = h.shape[:2]
+        vp = x["vp"]
+        st = self._form_init(cps0, vp)
+        _, fused, _ = self._form_fuse(st, vp)
+        curves, cps_list, ends, step_off, step_w, hs_lane, form_curves = [], [], [], [], [], [], []
+        for step in self.dec:
+            ref = self._px(polyline_at(fused, self.t_deform)).detach()
+            rel = self._px(polyline_at(fused, self.t_rel)).detach()
+            h = step(h, rel, self.dec_pos, ref, tokens, maps, frame)
+            step_off.append(step.curve.last_offset_px)
+            step_w.append(step.sa.last_self_weight)
+            new = {}
+            for k in self.forms:
+                if k == "B":
+                    upd = self.update(h).view(batch_size, num_q, 4, 2).float() * self.step_scale
+                    new[k] = dict(cps=self._norm(self._lane_step(self._px(st[k]["cps"]), upd)))
+                else:
+                    new[k] = self._form_step(k, st[k], h, vp, fine, frame)
+            st = new
+            fc, fused, e = self._form_fuse(st, vp)
+            curves.append(fused)
+            cps_list.append(e)
+            ends.append(e)
+            hs_lane.append(h)
+            form_curves.append(fc)
+        aux = None
+        if self.layer_loss and self.training:
+            aux = []
+            for k in range(len(curves) - 1):
+                cls_o2m_k, cls_o2o_k = self._step_scores(hs_lane[k], curves[k])
+                aux.append(dict(cls_o2o=cls_o2o_k, cls_o2m=cls_o2m_k, curves=[curves[k]], cps=[cps_list[k]],
+                                lane_cps=[None], carriers=None, form_curves=[form_curves[k]]))
+        n = len(curves)
+        out = self._finish(h, None, None, curves, cps_list, ends, [None] * n, n, step_off, step_w)
+        if not self.training and self.form_output != "fused":          # one form's curves, the fused lane's scores
+            i = self.forms.index(self.form_output)
+            out["curves"] = [fc[i] for fc in form_curves]
+            f_ends = [torch.stack([c[..., 0, :], c[..., 1, :], c[..., -2, :], c[..., -1, :]], dim=-2)
+                      for c in out["curves"]]
+            out["preds"] = [self._layout(*bottom_first(c, e)) if self.orientation_free else self._layout(c, e)
+                            for c, e in zip(out["curves"], f_ends)]
+        out["curve0"] = curve_points(cps0, self.t_out_2d).detach()
+        out["prop"] = prop
+        out["fovea_share"] = self.dec[-1].curve.last_fovea_share
+        out["ray_share"] = None
+        pt = [s_.curve.last_point_px for s_ in self.dec]
+        out["pt_off_px"] = torch.stack(pt).mean() if all(p is not None for p in pt) else None
+        out["seg_map"] = fine[CTX]
+        out["aux"] = aux
+        out["carriers"] = None
+        out["form_curves"] = form_curves
+        with torch.no_grad():
+            out["form_w"] = self._form_weights(torch.float32).detach()
+            out["form_v_delta_deg"] = (st["V"]["delta"].abs().mean() * (180.0 / math.pi) if "V" in st else None)
+        return out
+
     def _locate_ends(self, carrier, t01, end_hm, frame):
         """interval_cfg: the interval [B, N, 2] (t0 near, t1 far) on the updated carriers [B, N, 4, 2] (normalized,
         bottom first). Each end reads its heatmap's logits (end_hm [B, 2, h, w], C's map, border padding, no gradient)
@@ -1395,6 +1645,8 @@ class FovealLaneHead(HBLRHead):
         if self.layer_loss:
             last = dict(outs, curves=outs["curves"][-1:], cps=outs["cps"][-1:], lane_cps=outs["lane_cps"][-1:],
                         carriers=outs["carriers"][-1:] if outs.get("carriers") else None)
+            if outs.get("form_curves") is not None:
+                last["form_curves"] = outs["form_curves"][-1:]
             losses = self.loss_by_outputs_2d(last, gts, seg_gt)
             for k, a in enumerate(outs["aux"]):
                 step = dict(last, curve0=None, self_w=[], **a)
@@ -1403,6 +1655,13 @@ class FovealLaneHead(HBLRHead):
         else:
             losses = self.loss_by_outputs_2d(outs, gts, seg_gt)
         losses.update(self.foveal_losses(outs, x, gts))
+        if outs.get("form_w") is not None:
+            w = outs["form_w"]
+            for i, k in enumerate(self.forms):
+                for name, j in (("near", 0), ("mid", (w.shape[1] - 1) // 2), ("far", w.shape[1] - 1)):
+                    losses[f"form_w_{k}_{name}"] = w[i, j]
+            if outs.get("form_v_delta_deg") is not None:
+                losses["form_v_delta_deg"] = outs["form_v_delta_deg"]
         return losses
 
     def foveal_losses(self, outs, x, gts):

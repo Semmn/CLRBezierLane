@@ -1423,6 +1423,8 @@ class HBLRHead(BLRHead):
         tgt_o2m = torch.zeros_like(tgt_o2o)
         zero = outs["cls_o2o"].new_zeros(())
         iou_sum = end_sum = cp_sum = pat_l1_sum = pat_ce_sum = zero
+        form_iou_sum = form_end_sum = zero
+        form_log = {}
         num_pos_o2o = num_pos_o2m = 0
         rev_o2o = []
         fact_log = car_log = None
@@ -1438,6 +1440,14 @@ class HBLRHead(BLRHead):
             iou, end, cp = self._pair_terms(outs, b_o, n_o, layout.flat_index(b_o, g_o), gt_flat, gt_cps, batch_size,
                                             rev_out=rev_o2o, pat_out=pat_o2o)
             iou_sum, end_sum, cp_sum = iou.sum(), end.sum(), cp.sum()
+            if outs.get("form_curves") is not None:      # FovealLaneHead multi_anchor_cfg: each form on the same pairs
+                j_o = layout.flat_index(b_o, g_o)
+                for i, name in enumerate(self.forms):
+                    f_out = dict(curves=[fc[i] for fc in outs["form_curves"]],
+                                 lane_cps=[None] * len(outs["form_curves"]))
+                    f_iou, f_end, _ = self._pair_terms(f_out, b_o, n_o, j_o, gt_flat, gt_cps, batch_size)
+                    form_iou_sum, form_end_sum = form_iou_sum + f_iou.sum(), form_end_sum + f_end.sum()
+                    form_log[name] = f_iou.sum() / n_img
             if self.factorized_iou and n_o.numel():
                 with torch.no_grad():
                     fact_log = lane_iou_factorized(final[b_o, n_o].float() * self.eval_scale,
@@ -1471,6 +1481,9 @@ class HBLRHead(BLRHead):
                       loss_iou=iou_sum / n_img * self.iou_loss.loss_weight,
                       loss_end=end_sum / n_img * self.end_loss_weight,
                       loss_cp=cp_sum / n_img * self.cp_loss_weight)
+        if outs.get("form_curves") is not None:
+            losses["loss_form_iou"] = form_iou_sum / n_img * self.iou_loss.loss_weight * self.form_loss_weight
+            losses["loss_form_end"] = form_end_sum / n_img * self.end_loss_weight * self.form_loss_weight
         if self.pattern is not None:
             del losses["loss_cp"]
             losses["loss_pat"] = pat_l1_sum / n_img * self.pattern["l1_weight"]
@@ -1511,6 +1524,9 @@ class HBLRHead(BLRHead):
                                                             is not None else (torch.zeros((), device=dev),) * 2)
             if pat_o2o:
                 diag.update({k: v.detach() for k, v in pat_o2o[2].items()})
+            if outs.get("form_curves") is not None:
+                for name in self.forms:
+                    diag[f"form_iou_{name}"] = form_log[name].detach() if name in form_log else zero.detach()
             if outs.get("curve0") is not None and layout.num:
                 best = self._coverage(outs["curve0"], layout, gt_flat)
                 diag["cov0"], diag["iou0"] = (best >= 0.5).float().mean(), best.clamp_min(0.0).mean()
