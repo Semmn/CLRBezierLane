@@ -202,6 +202,7 @@ model = dict(
             read_s=(0.0, 0.1, 0.2),   # where S / V read the stride-8 map: their own curve next to the anchor
             angle_scale=0.05,         # rad per unit of the heading update (0.05)
             shape_scale=0.1,          # per unit of the log-length and curvature updates (0.1)
+            ray_min_px=30.0,          # V's reference ray from v through a point >= this far from v (30)
             output="fused",           # test output: "fused" | "S" | "B" | "V" (one form alone)
         ),
         assign_cfg=dict(
@@ -261,7 +262,7 @@ test_cfg = dict(type="TestLoop")
 # 16 images on 1 GPU per step, one step per update: 16 per update, as the pair's 4 x 4 GPUs. (Out of memory:
 # batch_size 8 with accumulative_counts 2; BN then sees 8.)
 train_dataloader = dict(batch_size=16)
-sync_bn = "torch"  # BN over the 4 GPUs' 16 images
+sync_bn = "torch"  # unused on 1 GPU (mmengine reverts it to BN over the 16 images)
 randomness = dict(seed=0, deterministic=True)
 optim_wrapper = dict(
     type="OptimWrapper",

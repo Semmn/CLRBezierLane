@@ -10,7 +10,8 @@ the switch-off comparison (both are the package libs.clrbezier).
 2. switch off: identical to ORIG_TREE (parameters, losses / logs, gradients, test output) for the pointcond, o2o,
    bfstyle, window (+ segment steps), polar and ray heads
 3. geometry: graph tangent at the anchor; arc-length resampling (ends kept, uniform spacing, gradients); the step-0
-   forms (S starts at P0 along P1 - P0, V is the ray through v and P3, near end first; B = the proposal cubic)
+   forms (S starts at P0 along P1 - P0, V is the ray through v and P3, near end first; B = the proposal cubic); V's
+   reference ray is bounded against VP error near v and carries no gradient to the anchor
 4. fusion: equal weights at the start (fused = mean of the forms); a profile on one form gives that form; output
    "V" puts V's own curve on the test path
 5. local readout: a change of the stride-8 map at S's anchor changes S's update and not V's (far end), and the
@@ -19,7 +20,7 @@ the switch-off comparison (both are the package libs.clrbezier).
    nonzero gradients; the lane losses do not reach the vanishing-point head (V reads v detached)
 7. form loss: loss_form_iou / loss_form_end scale with form_loss_weight (0 -> 0); with forms ("B",) the form loss is
    the plain loss of the same pairs (x weight, same IoU)
-8. config errors: unknown key, bad form, mode other than "off", interval / hier / cp_loss
+8. config errors: unknown key, bad form, forms without B, mode other than "off", interval / hier / cp_loss
 """
 import copy
 import os
@@ -227,6 +228,17 @@ check("d. step 0: S starts at P0 along P1 - P0; V ends (far) at P3 on the ray fr
       and torch.allclose(pts["B"], head._px(fl.curve_points(cps0, head.t_form_dense)), atol=1e-4),
       f"V off the ray {float(cross.max()):.1e}")
 
+sv = dict(st["V"])
+a_near = torch.tensor([[[392.0, 15.0], [430.0, 40.0]]], requires_grad=True)       # 5.4 px and 50 px from v
+sv["anchor"] = a_near
+h0 = head._form_head("V", sv, vp)
+h1 = head._form_head("V", sv, vp + torch.tensor([[5.0, 0.0]]))
+turn = torch.rad2deg(torch.acos((h0 * h1).sum(-1).clamp(-1, 1)))[0]
+check("e. V's reference ray: a 5 px VP error turns it by <= ~e / ray_min_px (30 px) even with the far end 5 px from v; "
+      "no gradient from the ray to the anchor",
+      float(turn[0]) < 10.5 and float(turn[1]) < 6.5 and not h0.requires_grad,
+      f"turn {float(turn[0]):.1f} deg at 5 px, {float(turn[1]):.1f} deg at 50 px")
+
 print("4. fusion")
 curves, fused, ends = head._form_fuse(st, vp)
 check("a. at the start the profile is equal: fused = the mean of the forms",
@@ -321,7 +333,8 @@ check("forms ('B',): the fused curve is B's, so the form loss = the plain loss o
 print("8. config errors")
 bad = [dict(multi_anchor_cfg=dict(foo=1)), dict(multi_anchor_cfg=dict(forms=("S", "X"))),
        dict(multi_anchor_cfg=dict(output="V", forms=("S", "B"))), dict(fovea_cfg=dict(mode="window")),
-       dict(dec_cfg=dict(cp_loss=True)), dict(multi_anchor_cfg=dict(knots=1))]
+       dict(dec_cfg=dict(cp_loss=True)), dict(multi_anchor_cfg=dict(knots=1)),
+       dict(multi_anchor_cfg=dict(forms=("S", "V"), output="fused"))]
 errs = []
 for over in bad:
     try:

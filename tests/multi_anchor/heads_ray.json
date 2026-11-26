@@ -1,0 +1,149 @@
+{
+ "bbox_head": {
+  "type": "FovealLaneHead",
+  "in_channels": [
+   128,
+   256,
+   512
+  ],
+  "num_queries": 16,
+  "dim": 256,
+  "num_points": 72,
+  "img_w": 800,
+  "img_h": 320,
+  "seg_num_classes": 2,
+  "fovea_cfg": {
+   "mode": "ray",
+   "polar_w": 800,
+   "polar_h": 256,
+   "theta_deg": [
+    -10.0,
+    190.0
+   ],
+   "r0_px": 24.0,
+   "supersample": [
+    2,
+    4
+   ],
+   "p_gt": 0.5,
+   "jitter_px": 20.0,
+   "jitter_y_px": 10.0
+  },
+  "vp_cfg": {
+   "channels": 128,
+   "loss_weight": 1.0,
+   "beta": 0.05
+  },
+  "enc_cfg": {
+   "num_layers": 3,
+   "num_heads": 8,
+   "num_points": 4,
+   "ffn_dim": 1024,
+   "dropout": 0.0,
+   "checkpoint": false,
+   "extra_level": true
+  },
+  "prop_cfg": {
+   "channels": 64,
+   "sigma_cells": 2.0,
+   "radius_cells": 2,
+   "scale_px": 100.0,
+   "hm_weight": 1.0,
+   "end_weight": 0.05,
+   "iou_weight": 1.0
+  },
+  "dec_cfg": {
+   "num_iters": 6,
+   "self_attn": "full",
+   "num_heads": 8,
+   "ffn_dim": 1024,
+   "dropout": 0.0,
+   "curve_points": 5,
+   "deform_heads": 8,
+   "deform_points": 8,
+   "step_scale": 1.0,
+   "cp_loss": false,
+   "num_neighbors": 16,
+   "dist_scale": 15.0,
+   "max_dist": 10.0,
+   "layer_loss": true
+  },
+  "ray_cfg": {
+   "channels": 64,
+   "kernel": 5,
+   "dilations": [
+    1,
+    3,
+    9
+   ],
+   "angle_kernel": 3
+  },
+  "curve_cfg": {
+   "gt_points": 48,
+   "out_per_segment": 24,
+   "rel_points": 12,
+   "cost_points": 25,
+   "end_loss_weight": 0.05,
+   "min_gt_len_px": 8.0,
+   "orientation_free": true,
+   "frame": "image",
+   "y_order": "monotone",
+   "match_end_len": true
+  },
+  "hier_cfg": null,
+  "assign_cfg": {
+   "o2o": {
+    "type": "HungarianLaneAssigner",
+    "cls_weight": 1.0,
+    "cls_cost_mode": "log",
+    "point_weight": 3.0,
+    "iou_weight": 3.0
+   },
+   "o2m": null
+  },
+  "loss_cfg": {
+   "cls_loss_weight": 2.0,
+   "focal_alpha": 0.25,
+   "focal_gamma": 2.0,
+   "iou_loss_weight": 4.0,
+   "point_loss_weight": 0.05,
+   "cp_loss_weight": 0.05,
+   "extent_loss_weight": 0.2,
+   "smooth_l1_beta": 1.0,
+   "o2m_cls_weight": 1.0,
+   "o2m_reg_weight": 0.5,
+   "iou_eval_shape": [
+    124,
+    224
+   ],
+   "lane_width": 0.011160714285714286,
+   "lane_width_cost": 0.044642857142857144,
+   "seg_loss_weight": 2.0,
+   "seg_bg_weight": 0.4,
+   "seg_ignore_label": 255,
+   "cp_fit_ridge": 0.01
+  },
+  "target_adapter": {
+   "lane_keys": [
+    "lanes"
+   ],
+   "seg_keys": [
+    "gt_masks"
+   ],
+   "start_y_convention": "image_y",
+   "length_unit": "count"
+  },
+  "test_score": null
+ },
+ "test_cfg": {
+  "conf_threshold": 0.5,
+  "use_nms": false,
+  "as_lanes": true,
+  "extend_bottom": true,
+  "nms_thres": 15,
+  "nms_topk": 16,
+  "ori_img_w": 1,
+  "ori_img_h": 1,
+  "cut_height": 0
+ }
+}
