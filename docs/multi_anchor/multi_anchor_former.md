@@ -11,16 +11,26 @@ The design should show what multiple anchors are worth, with everything else hel
 
 Code: `libs/clrbezier/multi_anchor.py` (MultiAnchorFormerHead, a subclass of BezierFormerHead). Config:
 `configs/clrbezier/curvelanes/multi_anchor_former_curvelanes_r18.py`. Pair:
-`bezierformer_replica_simota_focalcost_flip_curvelanes_r18.py`.
+`bezierformer_replica_simota_focalcost_curvelanes_r18.py`.
+
+Both configs use the standard CurveLanes pipeline (`dataset_curvelanes_clrbezier.py`). It is CondLaneNet's and
+CLRerNet's pipeline as published: augmentation at 800 x 320 and no horizontal flip. YSY switched to it on 2026-11-27.
+Before that, both used the 2x + flip file inherited from the foveal network: augmentation at 1600 x 640, pooled 2 x 2
+in the network. The replica's 84.91 (val, training-time threshold) comes from that older file, so it is not this
+pair.
+
+The pole is `pole_px = (398.8, 122.0)`: `static_pole.py`'s median over 4000 train images, 99.8% of which have a
+vanishing point.
 
 ## 1. What stays the replica's
 
-The config differs from the pair in four places only. A test checks this.
+The config differs from the pair in three places only. A test checks this.
 
 1. The head type.
 2. `anchor_cfg`.
 3. `cfg_name`.
-4. Batch 16 on one GPU.
+
+Both run 16 images on one GPU.
 
 Everything else is the replica's:
 

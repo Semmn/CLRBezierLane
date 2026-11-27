@@ -1,14 +1,15 @@
 # Multi-anchor BezierFormer (docs/multi_anchor/multi_anchor_former.md): the BezierFormer replica
-# (bezierformer_replica_simota_focalcost_flip_curvelanes_r18.py) whose queries carry each lane in three anchored forms,
+# (bezierformer_replica_simota_focalcost_curvelanes_r18.py) whose queries carry each lane in three anchored forms,
 # each refined on its own track through the 6 decoder layers as the replica refines C: S, CLRNet's line anchor (start
 # point + angle + x offsets); B, the replica's free Bezier control points (its own modules, unchanged); V, Polar
 # R-CNN's polar anchor (a line (theta, r) about one fixed global pole near the dataset's static vanishing point + x
 # offsets). The lane is their fusion along the lane (a learned profile over the arc-length fraction, shared by all
 # lanes, starting equal); matching, losses and output use it. Each form also gets the replica's regression loss on
 # the same pairs (form_loss_weight 0.5).
-# Pair: bezierformer_replica_simota_focalcost_flip_curvelanes_r18.py. Differences: the head type, anchor_cfg, cfg_name,
-# and 16 images on 1 GPU instead of 4 x 4 GPUs (the same 16 per update; BN sees the same 16).
-# Set anchor_cfg.pole_px from tools/clrbezier/static_pole.py before training.
+# Pair: bezierformer_replica_simota_focalcost_curvelanes_r18.py (the replica on the standard CurveLanes pipeline,
+# 800 x 320, no flip, 16 images on 1 GPU). Differences: the head type, anchor_cfg, cfg_name. (Until 2026-11-27 both
+# used the 2x + flip data file; YSY moved them to the standard pipeline.)
+# anchor_cfg.pole_px = tools/clrbezier/static_pole.py's median (YSY 2026-11-27).
 # Notes of the pair follow.
 # BezierFormer replica, SimOTA with the paper's cost (YSY 2026-10-25): the replica (bezierformer_replica_flip_curvelanes_r18.py)
 # with one change, loss_cfg.cls_cost = "focal": the matching cost's L_cls is the focal loss the query would take as
@@ -21,7 +22,7 @@
 # Needs bf_replica.patch, bf_hungarian.patch, then bf_clscost.patch.
 
 _base_ = [
-    "dataset_curvelanes_clrbezier_2x_flip.py",
+    "dataset_curvelanes_clrbezier.py",
     "../../_base_/default_runtime.py",
 ]
 
@@ -106,8 +107,8 @@ model = dict(
                                       # offsets go jagged under the Chamfer IoU loss, which has no per-row target)
             knots=8,                  # fusion profile knots per form along the lane, linear in between (8)
             form_loss_weight=0.5,     # x the regression loss (loc + len + end) of each form on the fused pairs (0.5)
-            pole_px=(399.5, 22.8),    # V's global pole (800 x 320 px): SET to static_pole.py's median (default = where
-                                      # the replica's fan of initial lines meets)
+            pole_px=(398.8, 122.0),   # V's global pole (800 x 320 px): static_pole.py's median over 4000 train images
+                                      # (99.8% with a vanishing point; quartiles x 346-452, y 65-151; YSY 2026-11-27)
             fuse_points=73,           # arc-length samples of each form and of the fused lane (73)
             output="fused",           # test output: "fused" | "S" | "B" | "V" (one form alone)
         ),
@@ -134,7 +135,7 @@ train_cfg = dict(type="EpochBasedTrainLoop", max_epochs=total_epochs, val_interv
 val_cfg = dict(type="ValLoop")
 test_cfg = dict(type="TestLoop")
 
-# 16 images on 1 GPU per step, one step per update: 16 per update, as the pair's 4 x 4 GPUs. (Out of memory:
+# 16 images on 1 GPU per step, one step per update: 16 per update, as the flip config's 4 x 4 GPUs. (Out of memory:
 # batch_size 8 with accumulative_counts 2; BN then sees 8.)
 train_dataloader = dict(batch_size=16)
 sync_bn = "torch"  # unused on 1 GPU (mmengine reverts it to BN over the 16 images)

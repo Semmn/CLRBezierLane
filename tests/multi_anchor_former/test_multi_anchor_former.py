@@ -2,8 +2,9 @@
 
     python test_multi_anchor_former.py TREE
 
-1. config: = the replica pair (bezierformer_replica_simota_focalcost_flip_curvelanes_r18.py) but the head type,
-   anchor_cfg, cfg_name and the batch (16 on 1 GPU)
+1. config: = the replica pair (bezierformer_replica_simota_focalcost_curvelanes_r18.py, standard CurveLanes pipeline)
+   but the head type, anchor_cfg, cfg_name; the pair = the flip replica config but the data file, cfg_name and the
+   batch (16 on 1 GPU)
 2. the replica inside: at the same seed every replica parameter is the replica's (B = its own C_0 MLP and update FFNs)
 3. geometry: S = CLRNet's line (start + angle) + x offsets; V = Polar R-CNN's normal form about the pole + x offsets;
    at the start all three forms are the replica's fan of lines; with the default pole every fan line passes it (r = 0)
@@ -66,7 +67,7 @@ def build(head, test_cfg, width=0.25, seed=0, **over):
 
 
 def batch(seed=5):
-    xin = torch.rand(2, 3, 640, 1600, generator=torch.Generator().manual_seed(seed))
+    xin = torch.rand(2, 3, 320, 800, generator=torch.Generator().manual_seed(seed))   # the standard pipeline's input
     return xin, [C.Sample(p) for p in C.synth_lanes(0, 2, vp_x=380.0)]
 
 
@@ -80,12 +81,16 @@ def run(net, xin, smp, seed=3, keys=None):
 
 print("1. config")
 new = read_cfg("multi_anchor_former_curvelanes_r18.py")
-pair = read_cfg("bezierformer_replica_simota_focalcost_flip_curvelanes_r18.py")
+pair = read_cfg("bezierformer_replica_simota_focalcost_curvelanes_r18.py")
+flip = read_cfg("bezierformer_replica_simota_focalcost_flip_curvelanes_r18.py")
 d = sorted(diff(pair, new))
-check("= the replica pair but the head type, anchor_cfg, cfg_name and train_dataloader.batch_size (16)",
-      d == ["cfg_name", "model.bbox_head.anchor_cfg", "model.bbox_head.type", "train_dataloader.batch_size"]
-      and new["model"]["bbox_head"]["type"] == "MultiAnchorFormerHead" and new["train_dataloader"]["batch_size"] == 16,
-      str(d))
+check("= the replica pair but the head type, anchor_cfg, cfg_name; both on the standard data file, 16 on 1 GPU",
+      d == ["cfg_name", "model.bbox_head.anchor_cfg", "model.bbox_head.type"]
+      and new["model"]["bbox_head"]["type"] == "MultiAnchorFormerHead" and new["train_dataloader"]["batch_size"] == 16
+      and new["_base_"][0] == "dataset_curvelanes_clrbezier.py", str(d))
+d2 = sorted(diff(flip, pair))
+check("the pair = the flip replica config but the data file (_base_), cfg_name and train_dataloader.batch_size",
+      d2 == ["_base_", "cfg_name", "train_dataloader.batch_size"], str(d2))
 HEAD, TCFG = new["model"]["bbox_head"], new["model"]["test_cfg"]
 PAIR_HEAD = pair["model"]["bbox_head"]
 
@@ -123,8 +128,9 @@ net.eval()
 with torch.no_grad():
     out = head._forward(net.extract_feat(xin))
 f0 = out["form_curves"][0]
-fan = head.fan_params("V")
-check("d. at the start all three forms are the replica's fan of lines; with the default pole every fan line passes it",
+fan = build(HEAD, TCFG, anchor_cfg=dict(pole_px=(399.5, 22.8))).bbox_head.fan_params("V")   # the code's default pole
+check("d. at the start all three forms are the replica's fan of lines (config pole); with the default pole every fan "
+      "line passes it",
       max(float((f0[i] - f0[1]).abs().max()) for i in range(3)) * w1 < 1e-3 and float(fan[:, 1].abs().max()) < 1e-4,
       f"form difference {max(float((f0[i] - f0[1]).abs().max()) for i in range(3)) * w1:.1e} px, |r| max "
       f"{float(fan[:, 1].abs().max()) * w1:.1e} px")
