@@ -176,6 +176,9 @@ point head adds a 1-layer MLP.
   anchor that does not have to be exact. delta must carry the rest. Logged as vp_err_px and form_v_delta_deg. In the
   CPU overfit, V lagged S and B while the VP error was 5-12 px, and the profile moved V's near weight from 0.33 to
   0.25.
+  Fix after review (PR #3): the ray is built from the detached far end, moved along the step-0 ray direction to at
+  least ray_min_px = 30 px from v. A 5 px VP error then turns it by at most about 10 deg, not 53 deg at r = 5. Logged
+  as form_v_r_med_px / form_v_r_p10_px.
 - If the near-miss error comes from the far part's angle and not from extrapolation, V inherits it. The
   measurements (far |d| 0.9 px) say the far part is right.
 - One run of about 1.5-2 days on one GPU (batch 16 on GPU 3, as YSY runs).

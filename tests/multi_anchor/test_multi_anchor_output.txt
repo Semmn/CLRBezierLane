@@ -13,6 +13,8 @@ PASS  b. arc_resample: ends kept, spacing uniform (rel. std < 1e-3), gradients r
 PASS  b. arc_resample of a zero-length polyline: its point, finite
 PASS  c. polyline_at: u = 0, 1 are the ends, u = 0.5 the middle point
 PASS  d. step 0: S starts at P0 along P1 - P0; V ends (far) at P3 on the ray from v, near end first; B = the cubic  (V off the ray 8.9e-08)
+PASS  e. V's reference ray: a 5 px VP error turns it by <= ~e / ray_min_px (30 px) even with the far end 5 px from v; no gradient from the ray to the anchor  (turn 8.6 deg at 5 px, 3.7 deg at 50 px)
+PASS  e. sign -1 (near end towards v): the floor pushes the reference away from v, heading towards v at r = 5 .. 60  ([True, True, True, True])
 4. fusion
 PASS  a. at the start the profile is equal: fused = the mean of the forms
 PASS  b. a profile on V gives V's curve
@@ -20,15 +22,15 @@ PASS  c. output 'V': the test path's curves are V's own (same scores); 'fused': 
 5. local readout
 PASS  a change of the map at S's anchor moves S's update and not V's; at V's anchor the reverse  ({'S anchor': {'S': 0.18988037109375, 'V': 0.0}, 'V anchor': {'S': 0.0, 'V': 0.29730224609375}})
 6. training
-PASS  width 0.25: finite losses, every parameter gets a gradient, the form MLPs and the profile nonzero  (72 losses / logs, no grad [], ['bbox_head.form_mlp.S.2.weight', 'bbox_head.form_mlp.V.2.weight', 'bbox_head.form_profile'])
+PASS  width 0.25: finite losses, every parameter gets a gradient, the form MLPs and the profile nonzero  (74 losses / logs, no grad [], ['bbox_head.form_mlp.S.2.weight', 'bbox_head.form_mlp.V.2.weight', 'bbox_head.form_profile'])
 PASS  width 0.25: test path finite, 16 lanes
-PASS  width 1.0: finite losses, every parameter gets a gradient, the form MLPs and the profile nonzero  (72 losses / logs, no grad [], ['bbox_head.form_mlp.S.2.weight', 'bbox_head.form_mlp.V.2.weight', 'bbox_head.form_profile'])
+PASS  width 1.0: finite losses, every parameter gets a gradient, the form MLPs and the profile nonzero  (74 losses / logs, no grad [], ['bbox_head.form_mlp.S.2.weight', 'bbox_head.form_mlp.V.2.weight', 'bbox_head.form_profile'])
 PASS  width 1.0: test path finite, 16 lanes
 PASS  the lane losses (fused, forms, scores, all steps) do not reach the vanishing-point head
 7. form loss
 PASS  loss_form_iou / loss_form_end scale with form_loss_weight (0 -> 0)  ({0.0: (0.0, 0.0), 0.5: (9.66028118133545, 6.781720161437988), 1.0: (19.3205623626709, 13.563440322875977)})
 PASS  forms ('B',): the fused curve is B's, so the form loss = the plain loss of the same pairs  (iou 6.83401 vs 6.83401)
 8. config errors
-PASS  bad multi_anchor_cfg / mode / cp_loss raise ValueError  ([True, True, True, True, True, True])
+PASS  bad multi_anchor_cfg / mode / cp_loss raise ValueError  ([True, True, True, True, True, True, True])
 
-24/24 passed
+26/26 passed

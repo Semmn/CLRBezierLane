@@ -99,6 +99,8 @@ forms, each refined on its own track through the lane steps, and the lane is the
   V with delta = c2 = c3 = 0 is the straight line through v.
 - step 0 from the proposal cubic (detached): B = the cubic; S = the line from P0 along P1 - P0 (length |P3 - P0|);
   V = the ray through v and P3 (delta = 0, c = 0), its direction towards the near end fixed per lane at step 0.
+  V's reference ray goes from v through its (detached) far end, moved along the step-0 ray direction to at least
+  ray_min_px (30) from v: a VP error e turns it by at most about e / ray_min_px, however close the far end is to v.
 - each step: the decoder step as above on the fused curve's points; B moves by update(h); S and V by an MLP of
   [h, the stride-8 encoder map read at s = read_s of the form's own curve next to its anchor, averaged]
   -> (anchor px, angle x angle_scale rad, log L, c2, c3 x shape_scale).
@@ -112,7 +114,8 @@ forms, each refined on its own track through the lane steps, and the lane is the
   stay the fused model's).
 Logs: form_w_<k>_near / _mid / _far (the profile at u = 0, 0.5, 1), form_iou_<k> (1 - LaneIoU of form k on the last
 step's o2o pairs), form_v_delta_deg (mean |delta| of V's last step over all queries: how far V's heading departs from
-the vanishing-point ray; the ray is a reference frame, as accurate as vp_err over the far end's distance from v)."""
+the vanishing-point ray; the ray is a reference frame, as accurate as vp_err over the far end's distance from v),
+form_v_r_med_px / form_v_r_p10_px (median / 10th percentile over all queries of that distance, last step)."""
 import contextlib
 import math
 
@@ -796,7 +799,7 @@ class FovealLaneHead(HBLRHead):
                 ("interval_cfg", ic or {}, {"margin", "look", "end_points", "prior_sigma", "min_span", "sigma_cells",
                                             "hm_weight", "carrier_weight"}),
                 ("multi_anchor_cfg", mc or {}, {"forms", "knots", "form_loss_weight", "mlp_dim", "read_s",
-                                                "angle_scale", "shape_scale", "output"})):
+                                                "angle_scale", "shape_scale", "output", "ray_min_px"})):
             if set(cfg) - known:
                 raise ValueError(f"FovealLaneHead {name}: unknown keys {sorted(set(cfg) - known)}")
         cc = dict(curve_cfg or {})
@@ -864,12 +867,15 @@ class FovealLaneHead(HBLRHead):
             self.form_angle_scale = float(mc.get("angle_scale", 0.05))
             self.form_shape_scale = float(mc.get("shape_scale", 0.1))
             self.form_output = str(mc.get("output", "fused"))
+            self.form_ray_min = float(mc.get("ray_min_px", 30.0))
             if (not self.forms or len(set(self.forms)) != len(self.forms) or set(self.forms) - set(FORMS)
                     or self.form_knots < 2 or self.form_loss_weight < 0 or not self.form_read_s
                     or min(self.form_read_s) < 0 or max(self.form_read_s) > 1 or self.form_angle_scale <= 0
-                    or self.form_shape_scale <= 0 or self.form_output not in ("fused",) + self.forms):
-                raise ValueError("FovealLaneHead multi_anchor_cfg: forms distinct of 'S', 'B', 'V'; knots >= 2; "
-                                 "form_loss_weight >= 0; read_s in [0, 1]; scales > 0; output 'fused' or a form")
+                    or self.form_shape_scale <= 0 or self.form_output not in ("fused",) + self.forms
+                    or "B" not in self.forms or self.form_ray_min < 0):
+                raise ValueError("FovealLaneHead multi_anchor_cfg: forms distinct of 'S', 'B', 'V' and including 'B' "
+                                 "(the update layer; DDP needs every parameter used); knots >= 2; form_loss_weight >= "
+                                 "0; read_s in [0, 1]; scales > 0; ray_min_px >= 0; output 'fused' or a form")
             if self.hier is not None or self.interval is not None or self.cp_loss:
                 raise ValueError("FovealLaneHead multi_anchor_cfg: needs hier_cfg=None, interval_cfg=None and "
                                  "dec_cfg.cp_loss False")
@@ -1448,15 +1454,22 @@ class FovealLaneHead(HBLRHead):
             else:
                 ray = p3 - vp.detach().float()[:, None, :]                       # from v through the far end
                 sign = torch.where((ray * (p0 - p3)).sum(-1) >= 0, 1.0, -1.0)     # towards the near end
-                st[k] = dict(anchor=p3, delta=zero, log_len=log_len, c2=zero, c3=zero, sign=sign)
+                r = ray.norm(dim=-1, keepdim=True)
+                back = (p0 - p3) / chord.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                d0 = torch.where(r >= 1.0, ray / r.clamp_min(1e-6), back * sign[..., None])   # away from v
+                st[k] = dict(anchor=p3, delta=zero, log_len=log_len, c2=zero, c3=zero, sign=sign, d0=d0)
         return st
 
     def _form_head(self, k, st, vp):
         """Unit tangent [B, N, 2] at the anchor of form S or V."""
         if k == "S":
             return torch.stack([torch.cos(st["phi"]), torch.sin(st["phi"])], dim=-1)
-        ray = (st["anchor"] - vp.detach().float()[:, None, :]) * st["sign"][..., None]
-        ray = ray / ray.norm(dim=-1, keepdim=True).clamp_min(1.0)
+        v = vp.detach().float()[:, None, :]
+        a = st["anchor"].detach()                        # the reference ray: not a function of the anchor's gradient
+        r = (a - v).norm(dim=-1, keepdim=True)
+        q = a + (self.form_ray_min - r).clamp_min(0.0) * st["d0"]    # >= ray_min_px from v: bounded VP-error lever
+        ray = (q - v) * st["sign"][..., None]
+        ray = ray / ray.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         return rotate(ray, st["delta"])
 
     def _form_curve(self, k, st, vp, s):
@@ -1557,6 +1570,9 @@ class FovealLaneHead(HBLRHead):
         with torch.no_grad():
             out["form_w"] = self._form_weights(torch.float32).detach()
             out["form_v_delta_deg"] = (st["V"]["delta"].abs().mean() * (180.0 / math.pi) if "V" in st else None)
+            if "V" in st:
+                r = (st["V"]["anchor"] - vp.detach().float()[:, None, :]).norm(dim=-1).flatten()
+                out["form_v_r_px"] = torch.stack([r.median(), torch.quantile(r, 0.1)])
         return out
 
     def _locate_ends(self, carrier, t01, end_hm, frame):
@@ -1662,6 +1678,7 @@ class FovealLaneHead(HBLRHead):
                     losses[f"form_w_{k}_{name}"] = w[i, j]
             if outs.get("form_v_delta_deg") is not None:
                 losses["form_v_delta_deg"] = outs["form_v_delta_deg"]
+                losses["form_v_r_med_px"], losses["form_v_r_p10_px"] = outs["form_v_r_px"][0], outs["form_v_r_px"][1]
         return losses
 
     def foveal_losses(self, outs, x, gts):
