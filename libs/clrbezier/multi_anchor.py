@@ -60,7 +60,7 @@ def _ends(pts):
 
 @MODELS.register_module()
 class MultiAnchorFormerHead(BezierFormerHead):
-    """The replica head with anchor_cfg (module docstring): forms (("S", "B", "V"), must include "B"), rows (36, x
+    """The replica head with anchor_cfg (module docstring): forms (("S", "B", "V"), must include "B"), rows (8, x
     offsets of S and V; see the module docstring), knots (8), form_loss_weight (0.5), pole_px ((399.5, 22.8): the replica's fan of initial
     lines meets there; set it to the measured static vanishing point), fuse_points (73), output ("fused")."""
 
