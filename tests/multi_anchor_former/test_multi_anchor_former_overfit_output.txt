@@ -1,0 +1,35 @@
+# 400 steps, seed 0, forms S,B,V, rows 8 (the config's defaults). Diagnosis runs (FORMS=..., ROWS=...) in docs/multi_anchor/multi_anchor_former.md sec. 7
+/home/user/clrbezierlane/tests/multi_anchor_former/test_multi_anchor_former_overfit.py:103: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:820.)
+  print(f"it {it:4d}  total {float(tot):.3f}  " + "  ".join(f"{k} {float(L[k]):.3f}" for k in keys if k in L)
+it    0  total 42.896  loss_cls 0.811  loss_loc 1.131  loss_form_loc 1.696  d0.loss_loc 1.151  ciou -0.131  form_ciou_S -0.131  form_ciou_B -0.131  form_ciou_V -0.131  match_frac 1.000  pos_prob 0.036  neg_prob 0.017  form_w_S_near 0.333  form_w_B_near 0.333  form_w_V_near 0.333  form_w_V_far 0.333  (2 s)
+it   50  total 17.523  loss_cls 0.092  loss_loc 0.670  loss_form_loc 1.161  d0.loss_loc 0.575  ciou 0.330  form_ciou_S 0.264  form_ciou_B 0.234  form_ciou_V 0.181  match_frac 1.000  pos_prob 0.559  neg_prob 0.226  form_w_S_near 0.330  form_w_B_near 0.344  form_w_V_near 0.326  form_w_V_far 0.335  (56 s)
+it  100  total 11.383  loss_cls 0.057  loss_loc 0.434  loss_form_loc 0.848  d0.loss_loc 0.451  ciou 0.566  form_ciou_S 0.407  form_ciou_B 0.569  form_ciou_V 0.329  match_frac 1.000  pos_prob 0.510  neg_prob 0.061  form_w_S_near 0.322  form_w_B_near 0.354  form_w_V_near 0.324  form_w_V_far 0.333  (111 s)
+it  150  total 5.418  loss_cls 0.031  loss_loc 0.254  loss_form_loc 0.474  d0.loss_loc 0.191  ciou 0.746  form_ciou_S 0.679  form_ciou_B 0.757  form_ciou_V 0.615  match_frac 1.000  pos_prob 0.710  neg_prob 0.046  form_w_S_near 0.321  form_w_B_near 0.356  form_w_V_near 0.323  form_w_V_far 0.328  (168 s)
+it  200  total 4.497  loss_cls 0.006  loss_loc 0.195  loss_form_loc 0.379  d0.loss_loc 0.173  ciou 0.805  form_ciou_S 0.723  form_ciou_B 0.748  form_ciou_V 0.772  match_frac 1.000  pos_prob 0.835  neg_prob 0.025  form_w_S_near 0.318  form_w_B_near 0.360  form_w_V_near 0.322  form_w_V_far 0.327  (222 s)
+it  250  total 4.753  loss_cls 0.045  loss_loc 0.189  loss_form_loc 0.344  d0.loss_loc 0.181  ciou 0.811  form_ciou_S 0.761  form_ciou_B 0.810  form_ciou_V 0.741  match_frac 1.000  pos_prob 0.855  neg_prob 0.043  form_w_S_near 0.322  form_w_B_near 0.357  form_w_V_near 0.321  form_w_V_far 0.326  (275 s)
+it  300  total 4.629  loss_cls 0.004  loss_loc 0.301  loss_form_loc 0.516  d0.loss_loc 0.156  ciou 0.699  form_ciou_S 0.665  form_ciou_B 0.778  form_ciou_V 0.524  match_frac 1.000  pos_prob 0.857  neg_prob 0.025  form_w_S_near 0.325  form_w_B_near 0.354  form_w_V_near 0.321  form_w_V_far 0.325  (327 s)
+it  350  total 4.195  loss_cls 0.043  loss_loc 0.174  loss_form_loc 0.381  d0.loss_loc 0.145  ciou 0.826  form_ciou_S 0.751  form_ciou_B 0.807  form_ciou_V 0.679  match_frac 1.000  pos_prob 0.790  neg_prob 0.039  form_w_S_near 0.325  form_w_B_near 0.354  form_w_V_near 0.322  form_w_V_far 0.324  (378 s)
+it  399  total 3.311  loss_cls 0.000  loss_loc 0.134  loss_form_loc 0.311  d0.loss_loc 0.133  ciou 0.866  form_ciou_S 0.773  form_ciou_B 0.830  form_ciou_V 0.774  match_frac 1.000  pos_prob 0.920  neg_prob 0.003  form_w_S_near 0.329  form_w_B_near 0.353  form_w_V_near 0.319  form_w_V_far 0.323  (428 s)
+PASS  total loss falls below 35% of its start  (42.05 -> 4.20)
+PASS  every layer's L_loc falls below half its start (d0 = C_0 .. d5, last)  (d0.loss_loc 1.15 -> 0.13, d1.loss_loc 1.02 -> 0.10, d2.loss_loc 1.19 -> 0.10, d3.loss_loc 1.11 -> 0.10, d4.loss_loc 1.14 -> 0.11, d5.loss_loc 1.15 -> 0.12, loss_loc 1.13 -> 0.13)
+PASS  every GT lane has a query at the end (match_frac 1)  (match_frac 1.00, ciou 0.866)
+output fused:
+image 0: 5 lanes > 0.5; best LaneIoU per GT lane left 0.87, centre 0.73, right 0.82, flat side 0.77, far short 0.77
+image 1: 5 lanes > 0.5; best LaneIoU per GT lane left 0.88, centre 0.86, right 0.82, flat side 0.80, far short 0.72
+PASS  test path (fused): every GT lane found (score > 0.5, LaneIoU >= 0.5), incl. the flat side and the far lane
+PASS  test path (fused): at most one extra lane per image  ([0, 0])
+output S:
+image 0: 5 lanes > 0.5; best LaneIoU per GT lane left 0.69, centre 0.62, right 0.67, flat side 0.52, far short 0.73
+image 1: 5 lanes > 0.5; best LaneIoU per GT lane left 0.75, centre 0.78, right 0.63, flat side 0.59, far short 0.68
+  S alone (reported): every lane found True, extra [0, 0]
+output B:
+image 0: 5 lanes > 0.5; best LaneIoU per GT lane left 0.87, centre 0.74, right 0.79, flat side 0.79, far short 0.61
+image 1: 5 lanes > 0.5; best LaneIoU per GT lane left 0.86, centre 0.81, right 0.74, flat side 0.75, far short 0.75
+  B alone (reported): every lane found True, extra [0, 0]
+output V:
+image 0: 5 lanes > 0.5; best LaneIoU per GT lane left 0.72, centre 0.72, right 0.69, flat side 0.62, far short 0.71
+image 1: 5 lanes > 0.5; best LaneIoU per GT lane left 0.69, centre 0.68, right 0.68, flat side 0.81, far short 0.55
+  V alone (reported): every lane found True, extra [0, 0]
+
+5/5 passed
