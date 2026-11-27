@@ -4,6 +4,7 @@ from .blrnet import BLRHead  # noqa: F401  (registers BLRHead)
 from .hblrnet import HBLRHead  # noqa: F401  (registers HBLRHead)
 from .foveal_lane import FovealLaneHead, FovealLaneNet  # noqa: F401  (registers both)
 from .bezierformer import BezierFormerHead, BezierFormerNet  # noqa: F401  (registers both)
+from .multi_anchor import MultiAnchorFormerHead  # noqa: F401  (registers it)
 
 __all__ = ["CLRBezierHead", "StagePredictions", "BLRHead", "HBLRHead", "FovealLaneHead", "FovealLaneNet",
-           "BezierFormerHead", "BezierFormerNet"]
+           "BezierFormerHead", "BezierFormerNet", "MultiAnchorFormerHead"]

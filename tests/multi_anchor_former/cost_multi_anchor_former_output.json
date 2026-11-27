@@ -1,0 +1,17 @@
+{
+ "replica (pair)": {
+  "gmacs": 21.106,
+  "cpu_ms": 360.4,
+  "params_M": 17.328
+ },
+ "multi_anchor_former": {
+  "gmacs": 21.114,
+  "cpu_ms": 342.3,
+  "params_M": 18.99
+ },
+ "delta": {
+  "gmacs": 0.008,
+  "cpu_ms": -18.1,
+  "params_M": 1.662
+ }
+}
